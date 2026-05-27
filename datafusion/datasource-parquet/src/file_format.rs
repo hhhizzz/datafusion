@@ -490,6 +490,7 @@ impl FileFormat for ParquetFormat {
             .cloned()
             .ok_or_else(|| internal_datafusion_err!("Expected ParquetSource"))?;
         source = source.with_table_parquet_options(self.options.clone());
+        source = source.with_diagnostic_file_label(diagnostic_file_label(&conf));
 
         // Use the CachedParquetFileReaderFactory
         let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
@@ -549,6 +550,17 @@ impl FileFormat for ParquetFormat {
                 .with_table_parquet_options(self.options.clone()),
         )
     }
+}
+
+fn diagnostic_file_label(conf: &FileScanConfig) -> Option<Arc<str>> {
+    let first_file = conf
+        .file_groups
+        .iter()
+        .find_map(|group| group.iter().next())?;
+    let location = first_file.object_meta.location.as_ref();
+    let file_name = location.rsplit('/').next().unwrap_or(location);
+    let label = file_name.strip_suffix(".parquet").unwrap_or(file_name);
+    (!label.is_empty()).then(|| Arc::<str>::from(label))
 }
 
 #[cfg(feature = "parquet_encryption")]

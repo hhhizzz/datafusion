@@ -64,6 +64,9 @@ use object_store::ObjectStore;
 #[cfg(feature = "parquet_encryption")]
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
+const ROW_FILTER_DISABLE_LABELS_ENV: &str =
+    "DATAFUSION_PARQUET_ROW_FILTER_DISABLE_LABELS";
+
 /// Execution plan for reading one or more Parquet files.
 ///
 /// ```text
@@ -299,6 +302,9 @@ pub struct ParquetSource {
     /// Sort order driving `PreparedAccessPlan::reorder_by_statistics`
     /// in the opener.
     sort_order_for_reorder: Option<LexOrdering>,
+    /// Diagnostic label used by benchmark oracle runs to disable row-level
+    /// filtering for a selected scan while preserving metadata pruning.
+    diagnostic_file_label: Option<Arc<str>>,
 }
 
 impl ParquetSource {
@@ -325,6 +331,7 @@ impl ParquetSource {
             encryption_factory: None,
             reverse_row_groups: false,
             sort_order_for_reorder: None,
+            diagnostic_file_label: None,
         }
     }
 
@@ -345,6 +352,14 @@ impl ParquetSource {
     /// read the footer.
     pub fn with_metadata_size_hint(mut self, metadata_size_hint: usize) -> Self {
         self.metadata_size_hint = Some(metadata_size_hint);
+        self
+    }
+
+    pub(crate) fn with_diagnostic_file_label(
+        mut self,
+        diagnostic_file_label: Option<Arc<str>>,
+    ) -> Self {
+        self.diagnostic_file_label = diagnostic_file_label;
         self
     }
 
@@ -837,7 +852,11 @@ impl FileSource for ParquetSource {
             None => conjunction(allowed_filters),
         };
         source.predicate = Some(predicate);
-        let pushdown_filters = pushdown_filters && !has_pruning_only_filters;
+        let row_filter_disabled_for_oracle =
+            row_filter_disabled_by_label_spec(self.diagnostic_file_label.as_deref());
+        let pushdown_filters = pushdown_filters
+            && !has_pruning_only_filters
+            && !row_filter_disabled_for_oracle;
         source = source.with_pushdown_filters(pushdown_filters);
         let source = Arc::new(source);
         // If pushdown_filters is false we tell our parents that they still have to handle the filters,
@@ -1029,6 +1048,37 @@ impl FileSource for ParquetSource {
     }
 }
 
+fn row_filter_disabled_by_label_spec(label: Option<&str>) -> bool {
+    std::env::var(ROW_FILTER_DISABLE_LABELS_ENV)
+        .ok()
+        .is_some_and(|spec| row_filter_disable_spec_matches(label, &spec))
+}
+
+fn row_filter_disable_spec_matches(label: Option<&str>, spec: &str) -> bool {
+    let Some(label) = label else {
+        return false;
+    };
+    let label = label.trim();
+    if label.is_empty() {
+        return false;
+    }
+
+    spec.split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            let token = token.strip_suffix(".parquet").unwrap_or(token);
+            let label_name = label
+                .rsplit('/')
+                .next()
+                .map(|name| name.strip_suffix(".parquet").unwrap_or(name));
+            token == "*"
+                || token.eq_ignore_ascii_case("all")
+                || token.eq_ignore_ascii_case(label)
+                || label_name.is_some_and(|name| token.eq_ignore_ascii_case(name))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1075,6 +1125,32 @@ mod tests {
             Operator::NotEq,
             lit(""),
         ))
+    }
+
+    #[test]
+    fn row_filter_disable_spec_matches_label_tokens() {
+        assert!(row_filter_disable_spec_matches(
+            Some("store_sales"),
+            "inventory,store_sales"
+        ));
+        assert!(row_filter_disable_spec_matches(
+            Some("tpcds_sf10/store_sales.parquet"),
+            "store_sales.parquet"
+        ));
+        assert!(row_filter_disable_spec_matches(
+            Some("store_sales"),
+            "store_sales.parquet"
+        ));
+        assert!(row_filter_disable_spec_matches(Some("catalog_sales"), "*"));
+        assert!(row_filter_disable_spec_matches(
+            Some("catalog_sales"),
+            "all"
+        ));
+        assert!(!row_filter_disable_spec_matches(
+            Some("store_sales"),
+            "web_sales"
+        ));
+        assert!(!row_filter_disable_spec_matches(None, "store_sales"));
     }
 
     #[test]

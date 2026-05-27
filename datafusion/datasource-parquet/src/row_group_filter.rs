@@ -535,7 +535,7 @@ mod tests {
     use datafusion_physical_expr::planner::logical2physical;
     use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
     use parquet::arrow::ArrowSchemaConverter;
-    use parquet::basic::LogicalType;
+    use parquet::basic::{DecimalType, LogicalType};
     use parquet::data_type::{ByteArray, FixedLenByteArray};
     use parquet::file::metadata::ColumnChunkMetaData;
     use parquet::{
@@ -955,10 +955,10 @@ mod tests {
         let schema =
             Arc::new(Schema::new(vec![Field::new("c1", Decimal128(9, 2), false)]));
         let field = PrimitiveTypeField::new("c1", PhysicalType::INT32)
-            .with_logical_type(LogicalType::Decimal {
+            .with_logical_type(LogicalType::Decimal(DecimalType {
                 scale: 2,
                 precision: 9,
-            })
+            }))
             .with_scale(2)
             .with_precision(9);
         let schema_descr = get_test_schema_descr(vec![field]);
@@ -1023,10 +1023,10 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("c1", Decimal128(9, 0), false)]));
 
         let field = PrimitiveTypeField::new("c1", PhysicalType::INT32)
-            .with_logical_type(LogicalType::Decimal {
+            .with_logical_type(LogicalType::Decimal(DecimalType {
                 scale: 0,
                 precision: 9,
-            })
+            }))
             .with_scale(0)
             .with_precision(9);
         let schema_descr = get_test_schema_descr(vec![field]);
@@ -1118,10 +1118,10 @@ mod tests {
             false,
         )]));
         let field = PrimitiveTypeField::new("c1", PhysicalType::INT64)
-            .with_logical_type(LogicalType::Decimal {
+            .with_logical_type(LogicalType::Decimal(DecimalType {
                 scale: 2,
                 precision: 18,
-            })
+            }))
             .with_scale(2)
             .with_precision(18);
         let schema_descr = get_test_schema_descr(vec![field]);
@@ -1176,10 +1176,10 @@ mod tests {
             false,
         )]));
         let field = PrimitiveTypeField::new("c1", PhysicalType::FIXED_LEN_BYTE_ARRAY)
-            .with_logical_type(LogicalType::Decimal {
+            .with_logical_type(LogicalType::Decimal(DecimalType {
                 scale: 2,
                 precision: 18,
-            })
+            }))
             .with_scale(2)
             .with_precision(18)
             .with_byte_len(16);
@@ -1254,10 +1254,10 @@ mod tests {
             false,
         )]));
         let field = PrimitiveTypeField::new("c1", PhysicalType::BYTE_ARRAY)
-            .with_logical_type(LogicalType::Decimal {
+            .with_logical_type(LogicalType::Decimal(DecimalType {
                 scale: 2,
                 precision: 18,
-            })
+            }))
             .with_scale(2)
             .with_precision(18)
             .with_byte_len(16);

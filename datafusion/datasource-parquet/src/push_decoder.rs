@@ -44,10 +44,11 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
 
 use datafusion_common::{DataFusionError, Result};
-use datafusion_physical_plan::metrics::{BaselineMetrics, Gauge};
+use datafusion_physical_plan::metrics::BaselineMetrics;
 
 use crate::access_plan::PreparedAccessPlan;
 use crate::decoder_projection::DecoderProjection;
+use crate::metrics::ParquetFileMetrics;
 
 /// Shared options applied to every [`ParquetPushDecoderBuilder`] in a file scan.
 ///
@@ -117,8 +118,7 @@ pub(crate) struct PushDecoderStreamState {
     /// per-batch transform applied by [`Self::project_batch`].
     pub(crate) decoder_projection: DecoderProjection,
     pub(crate) arrow_reader_metrics: ArrowReaderMetrics,
-    pub(crate) predicate_cache_inner_records: Gauge,
-    pub(crate) predicate_cache_records: Gauge,
+    pub(crate) file_metrics: ParquetFileMetrics,
     pub(crate) baseline_metrics: BaselineMetrics,
 }
 
@@ -195,6 +195,7 @@ impl PushDecoderStreamState {
                         self.decoder = next;
                         continue;
                     }
+                    self.copy_arrow_reader_metrics();
                     return None;
                 }
                 Err(e) => {
@@ -207,12 +208,8 @@ impl PushDecoderStreamState {
     /// Copies metrics from ArrowReaderMetrics (the metrics collected by the
     /// arrow-rs parquet reader) to the parquet file metrics for DataFusion
     fn copy_arrow_reader_metrics(&self) {
-        if let Some(v) = self.arrow_reader_metrics.records_read_from_inner() {
-            self.predicate_cache_inner_records.set(v);
-        }
-        if let Some(v) = self.arrow_reader_metrics.records_read_from_cache() {
-            self.predicate_cache_records.set(v);
-        }
+        self.file_metrics
+            .copy_arrow_reader_metrics(&self.arrow_reader_metrics);
     }
 
     fn project_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {

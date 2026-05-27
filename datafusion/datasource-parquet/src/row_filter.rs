@@ -84,7 +84,7 @@ use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor}
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::expressions::{Column, Literal};
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
-use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
+use datafusion_physical_expr::{DynamicFilterTracking, PhysicalExpr, split_conjunction};
 
 use datafusion_physical_plan::metrics;
 
@@ -186,6 +186,20 @@ pub(crate) struct FilterCandidate {
     required_bytes: usize,
     /// The resolved Parquet read plan (leaf indices + projected schema).
     read_plan: ParquetReadPlan,
+}
+
+fn row_filter_sort_key(
+    expr: &Arc<dyn PhysicalExpr>,
+    required_bytes: usize,
+) -> (u8, usize) {
+    let expression_cpu_class =
+        if DynamicFilterTracking::classify(expr).contains_dynamic_filter() {
+            1
+        } else {
+            0
+        };
+
+    (expression_cpu_class, required_bytes)
 }
 
 /// The result of resolving which Parquet leaf columns and Arrow schema fields
@@ -1045,7 +1059,8 @@ pub fn build_row_filter(
     }
 
     if reorder_predicates {
-        candidates.sort_unstable_by_key(|c| c.required_bytes);
+        candidates
+            .sort_unstable_by_key(|c| row_filter_sort_key(&c.expr, c.required_bytes));
     }
 
     // To avoid double-counting metrics when multiple predicates are used:
@@ -1176,7 +1191,22 @@ mod test {
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use tempfile::NamedTempFile;
 
-    use datafusion_physical_expr::expressions::Column as PhysicalColumn;
+    use datafusion_physical_expr::expressions::{
+        Column as PhysicalColumn, DynamicFilterPhysicalExpr, lit,
+    };
+
+    #[test]
+    fn row_filter_sort_key_prefers_static_predicates_before_dynamic() {
+        let static_expr = lit(true);
+        let dynamic_expr = Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true)))
+            as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            row_filter_sort_key(&static_expr, 1024)
+                < row_filter_sort_key(&dynamic_expr, 1),
+            "static predicates should run before dynamic predicates even when they read more bytes"
+        );
+    }
 
     // List predicates used by the decoder should be accepted for pushdown
     #[test]

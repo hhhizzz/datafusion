@@ -1217,11 +1217,6 @@ impl RowGroupsPrunedParquetOpen {
             (decoder, decoders, remaining_limit)
         };
 
-        let predicate_cache_inner_records =
-            prepared.file_metrics.predicate_cache_inner_records.clone();
-        let predicate_cache_records =
-            prepared.file_metrics.predicate_cache_records.clone();
-
         let files_ranges_pruned_statistics =
             prepared.file_metrics.files_ranges_pruned_statistics.clone();
         let stream = PushDecoderStreamState {
@@ -1231,8 +1226,7 @@ impl RowGroupsPrunedParquetOpen {
             reader: prepared.async_file_reader,
             decoder_projection,
             arrow_reader_metrics,
-            predicate_cache_inner_records,
-            predicate_cache_records,
+            file_metrics: prepared.file_metrics,
             baseline_metrics: prepared.baseline_metrics,
         }
         .into_stream();

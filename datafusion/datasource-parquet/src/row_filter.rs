@@ -74,7 +74,7 @@ use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter};
+use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateCost, RowFilter};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
@@ -125,6 +125,8 @@ pub(crate) struct DatafusionArrowPredicate {
     time: metrics::Time,
     /// Per-runtime-shape counters for diagnostics and ordering experiments.
     predicate_metrics: RowPushdownPredicateMetrics,
+    /// Coarse predicate CPU cost class for arrow-rs runtime cost decisions.
+    predicate_cost: ArrowPredicateCost,
 }
 
 impl DatafusionArrowPredicate {
@@ -136,6 +138,7 @@ impl DatafusionArrowPredicate {
         time: metrics::Time,
         predicate_metrics: RowPushdownPredicateMetrics,
     ) -> Result<Self> {
+        let predicate_cost = row_filter_predicate_cost(candidate.predicate_kind);
         let physical_expr =
             reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
 
@@ -146,6 +149,7 @@ impl DatafusionArrowPredicate {
             rows_matched,
             time,
             predicate_metrics,
+            predicate_cost,
         })
     }
 }
@@ -153,6 +157,10 @@ impl DatafusionArrowPredicate {
 impl ArrowPredicate for DatafusionArrowPredicate {
     fn projection(&self) -> &ProjectionMask {
         &self.projection_mask
+    }
+
+    fn cost(&self) -> ArrowPredicateCost {
+        self.predicate_cost
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
@@ -214,6 +222,18 @@ const SMALL_IN_LIST_MAX_VALUES: usize = 150;
 
 fn row_filter_predicate_kind(expr: &Arc<dyn PhysicalExpr>) -> RowPushdownPredicateKind {
     classify_expression_kind(expr)
+}
+
+fn row_filter_predicate_cost(kind: RowPushdownPredicateKind) -> ArrowPredicateCost {
+    match kind {
+        RowPushdownPredicateKind::HashLookup
+        | RowPushdownPredicateKind::PartitionedHashLookup
+        | RowPushdownPredicateKind::LargeInList
+        | RowPushdownPredicateKind::GenericDynamic => ArrowPredicateCost::Expensive,
+        RowPushdownPredicateKind::Static | RowPushdownPredicateKind::SmallInList => {
+            ArrowPredicateCost::Default
+        }
+    }
 }
 
 fn classify_expression_kind(expr: &Arc<dyn PhysicalExpr>) -> RowPushdownPredicateKind {
@@ -1340,6 +1360,22 @@ mod test {
     }
 
     #[test]
+    fn row_filter_predicate_cost_marks_expensive_runtime_filters() {
+        assert_eq!(
+            row_filter_predicate_cost(RowPushdownPredicateKind::SmallInList),
+            ArrowPredicateCost::Default
+        );
+        assert_eq!(
+            row_filter_predicate_cost(RowPushdownPredicateKind::HashLookup),
+            ArrowPredicateCost::Expensive
+        );
+        assert_eq!(
+            row_filter_predicate_cost(RowPushdownPredicateKind::PartitionedHashLookup),
+            ArrowPredicateCost::Expensive
+        );
+    }
+
+    #[test]
     fn datafusion_arrow_predicate_records_typed_metrics() {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let expr = col("a").gt(Expr::Literal(ScalarValue::Int32(Some(1)), None));
@@ -1372,6 +1408,7 @@ mod test {
         assert_eq!(predicate_metrics.input_rows.value(), 3);
         assert_eq!(predicate_metrics.rows_pruned.value(), 1);
         assert_eq!(predicate_metrics.rows_matched.value(), 2);
+        assert_eq!(row_filter.cost(), ArrowPredicateCost::Default);
     }
 
     // List predicates used by the decoder should be accepted for pushdown

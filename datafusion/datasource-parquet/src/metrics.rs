@@ -198,6 +198,14 @@ pub struct ParquetFileMetrics {
     pub row_pushdown_eval_time: Time,
     /// Per-predicate-kind row-level pushdown counters and timings.
     row_pushdown_predicate_metrics: RowPushdownPredicateMetricsByKind,
+    /// Row filter: unique Parquet leaf columns referenced by row-level predicates.
+    pub predicate_leaf_column_count: Gauge,
+    /// Row filter: unique Parquet leaf columns required by the output projection.
+    pub output_leaf_column_count: Gauge,
+    /// Row filter: predicate leaf columns that overlap with output projection leaves.
+    pub predicate_projected_column_overlap_count: Gauge,
+    /// Row filter: overlapping predicate/output leaves divided by predicate leaves.
+    pub predicate_projected_column_overlap_ratio: RatioMetrics,
     /// Total time spent evaluating row group-level statistics filters
     pub statistics_eval_time: Time,
     /// Total time spent evaluating row group Bloom Filters
@@ -383,6 +391,22 @@ impl ParquetFileMetrics {
             .subset_time("row_pushdown_eval_time", partition);
         let row_pushdown_predicate_metrics =
             RowPushdownPredicateMetricsByKind::new(builder.clone(), partition);
+        let predicate_leaf_column_count = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .gauge("predicate_leaf_column_count", partition);
+        let output_leaf_column_count = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .gauge("output_leaf_column_count", partition);
+        let predicate_projected_column_overlap_count = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .gauge("predicate_projected_column_overlap_count", partition);
+        let predicate_projected_column_overlap_ratio = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .ratio_metrics("predicate_projected_column_overlap_ratio", partition);
         let statistics_eval_time = builder
             .clone()
             .subset_time("statistics_eval_time", partition);
@@ -567,6 +591,10 @@ impl ParquetFileMetrics {
             pushdown_rows_matched,
             row_pushdown_eval_time,
             row_pushdown_predicate_metrics,
+            predicate_leaf_column_count,
+            output_leaf_column_count,
+            predicate_projected_column_overlap_count,
+            predicate_projected_column_overlap_ratio,
             page_index_rows_pruned,
             page_index_pages_pruned,
             statistics_eval_time,
@@ -768,6 +796,23 @@ impl ParquetFileMetrics {
         self.row_pushdown_predicate_metrics.get(kind)
     }
 
+    pub(crate) fn record_predicate_projection_overlap(
+        &self,
+        predicate_leaf_count: usize,
+        output_leaf_count: usize,
+        overlap_leaf_count: usize,
+    ) {
+        self.predicate_leaf_column_count.set(predicate_leaf_count);
+        self.output_leaf_column_count.set(output_leaf_count);
+        self.predicate_projected_column_overlap_count
+            .set(overlap_leaf_count);
+        set_ratio(
+            &self.predicate_projected_column_overlap_ratio,
+            overlap_leaf_count,
+            predicate_leaf_count,
+        );
+    }
+
     /// Record pages whose page-index pruning was skipped because the containing
     /// row group was fully matched by row-group statistics.
     ///
@@ -851,6 +896,10 @@ mod tests {
             "row_pushdown_hash_lookup_eval_time",
             "row_pushdown_partitioned_hash_lookup_eval_time",
             "row_pushdown_generic_dynamic_eval_time",
+            "predicate_leaf_column_count",
+            "output_leaf_column_count",
+            "predicate_projected_column_overlap_count",
+            "predicate_projected_column_overlap_ratio",
             "cost_model_observed_row_group_count",
             "cost_model_pushdown_row_group_count",
             "cost_model_post_filter_row_group_count",

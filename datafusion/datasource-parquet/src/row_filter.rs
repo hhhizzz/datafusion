@@ -1131,6 +1131,7 @@ pub fn build_row_filter(
     metadata: &ParquetMetaData,
     reorder_predicates: bool,
     file_metrics: &ParquetFileMetrics,
+    output_projection: Option<&ProjectionMask>,
 ) -> Result<Option<RowFilter>> {
     let rows_pruned = &file_metrics.pushdown_rows_pruned;
     let rows_matched = &file_metrics.pushdown_rows_matched;
@@ -1155,6 +1156,15 @@ pub fn build_row_filter(
     // no candidates
     if candidates.is_empty() {
         return Ok(None);
+    }
+
+    if let Some(output_projection) = output_projection {
+        record_predicate_projection_overlap(
+            &candidates,
+            output_projection,
+            metadata.file_metadata().schema_descr(),
+            file_metrics,
+        );
     }
 
     if reorder_predicates {
@@ -1199,6 +1209,53 @@ pub fn build_row_filter(
         .map(|filters| Some(RowFilter::new(filters)))
 }
 
+fn record_predicate_projection_overlap(
+    candidates: &[FilterCandidate],
+    output_projection: &ProjectionMask,
+    parquet_schema: &SchemaDescriptor,
+    file_metrics: &ParquetFileMetrics,
+) {
+    let mut predicate_projection = ProjectionMask::none(parquet_schema.num_columns());
+    for candidate in candidates {
+        predicate_projection.union(&candidate.read_plan.projection_mask);
+    }
+
+    let predicate_leaf_count = included_leaf_count(&predicate_projection, parquet_schema);
+    let output_leaf_count = included_leaf_count(output_projection, parquet_schema);
+    let overlap_leaf_count = projection_overlap_leaf_count(
+        &predicate_projection,
+        output_projection,
+        parquet_schema,
+    );
+
+    file_metrics.record_predicate_projection_overlap(
+        predicate_leaf_count,
+        output_leaf_count,
+        overlap_leaf_count,
+    );
+}
+
+fn included_leaf_count(
+    projection: &ProjectionMask,
+    parquet_schema: &SchemaDescriptor,
+) -> usize {
+    (0..parquet_schema.num_columns())
+        .filter(|leaf_idx| projection.leaf_included(*leaf_idx))
+        .count()
+}
+
+fn projection_overlap_leaf_count(
+    left: &ProjectionMask,
+    right: &ProjectionMask,
+    parquet_schema: &SchemaDescriptor,
+) -> usize {
+    (0..parquet_schema.num_columns())
+        .filter(|leaf_idx| {
+            left.leaf_included(*leaf_idx) && right.leaf_included(*leaf_idx)
+        })
+        .count()
+}
+
 /// Builds row filters for decoder runs.
 ///
 /// A [`RowFilter`] must be owned by a decoder, so scans split across multiple
@@ -1211,6 +1268,7 @@ pub(crate) struct RowFilterGenerator<'a> {
     file_metadata: &'a ParquetMetaData,
     reorder_predicates: bool,
     file_metrics: &'a ParquetFileMetrics,
+    output_projection: Option<&'a ProjectionMask>,
     first_row_filter: Option<RowFilter>,
 }
 
@@ -1221,6 +1279,7 @@ impl<'a> RowFilterGenerator<'a> {
         file_metadata: &'a ParquetMetaData,
         reorder_predicates: bool,
         file_metrics: &'a ParquetFileMetrics,
+        output_projection: Option<&'a ProjectionMask>,
     ) -> Self {
         let mut generator = Self {
             predicate,
@@ -1228,6 +1287,7 @@ impl<'a> RowFilterGenerator<'a> {
             file_metadata,
             reorder_predicates,
             file_metrics,
+            output_projection,
             first_row_filter: None,
         };
         generator.first_row_filter = generator.build();
@@ -1250,6 +1310,7 @@ impl<'a> RowFilterGenerator<'a> {
             self.file_metadata,
             self.reorder_predicates,
             self.file_metrics,
+            self.output_projection,
         ) {
             Ok(Some(filter)) => Some(filter),
             Ok(None) => None,
@@ -1372,6 +1433,59 @@ mod test {
         assert_eq!(
             row_filter_predicate_cost(RowPushdownPredicateKind::PartitionedHashLookup),
             ArrowPredicateCost::Expensive
+        );
+    }
+
+    #[test]
+    fn build_row_filter_records_predicate_projection_overlap() {
+        let testdata = datafusion_common::test_util::parquet_test_data();
+        let file = std::fs::File::open(format!("{testdata}/alltypes_plain.parquet"))
+            .expect("opening file");
+        let parquet_reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).expect("creating reader");
+        let metadata = parquet_reader_builder.metadata().clone();
+        let file_schema = parquet_reader_builder.schema().clone();
+        let parquet_schema = metadata.file_metadata().schema_descr();
+        let metrics = ExecutionPlanMetricsSet::new();
+        let file_metrics = ParquetFileMetrics::new(0, "alltypes_plain.parquet", &metrics);
+        let output_projection =
+            ProjectionMask::columns(parquet_schema, ["int_col", "double_col"]);
+
+        let expr = col("int_col")
+            .gt(Expr::Literal(ScalarValue::Int32(Some(1)), None))
+            .and(
+                col("bool_col").eq(Expr::Literal(ScalarValue::Boolean(Some(true)), None)),
+            );
+        let expr = logical2physical(&expr, &file_schema);
+
+        build_row_filter(
+            &expr,
+            &file_schema,
+            &metadata,
+            false,
+            &file_metrics,
+            Some(&output_projection),
+        )
+        .expect("building row filter")
+        .expect("row filter should be built");
+
+        assert_eq!(file_metrics.predicate_leaf_column_count.value(), 2);
+        assert_eq!(file_metrics.output_leaf_column_count.value(), 2);
+        assert_eq!(
+            file_metrics
+                .predicate_projected_column_overlap_count
+                .value(),
+            1
+        );
+        assert_eq!(
+            file_metrics.predicate_projected_column_overlap_ratio.part(),
+            1
+        );
+        assert_eq!(
+            file_metrics
+                .predicate_projected_column_overlap_ratio
+                .total(),
+            2
         );
     }
 
@@ -1673,7 +1787,7 @@ mod test {
             ParquetFileMetrics::new(0, &format!("{func_name}.parquet"), &metrics);
 
         let row_filter =
-            build_row_filter(&expr, &file_schema, &metadata, false, &file_metrics)
+            build_row_filter(&expr, &file_schema, &metadata, false, &file_metrics, None)
                 .expect("building row filter")
                 .expect("row filter should exist");
 
@@ -2251,7 +2365,7 @@ mod test {
         let file_metrics = ParquetFileMetrics::new(0, "struct_e2e.parquet", &metrics);
 
         let row_filter =
-            build_row_filter(&expr, &file_schema, &metadata, false, &file_metrics)
+            build_row_filter(&expr, &file_schema, &metadata, false, &file_metrics, None)
                 .expect("building row filter")
                 .expect("row filter should exist");
 

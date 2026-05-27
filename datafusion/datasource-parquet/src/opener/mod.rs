@@ -1169,6 +1169,7 @@ impl RowGroupsPrunedParquetOpen {
                 file_metadata.as_ref(),
                 prepared.reorder_predicates,
                 &prepared.file_metrics,
+                Some(decoder_projection.projection_mask()),
             );
 
             // Split into consecutive runs of row groups that share the same filter

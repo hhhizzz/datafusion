@@ -112,6 +112,12 @@ pub struct ParquetFileMetrics {
     pub row_selection_selected_run_count: Gauge,
     /// Row selection: skipped runs recorded in planned selections.
     pub row_selection_skipped_run_count: Gauge,
+    /// Row selection: output pages touched by cost-model observations.
+    pub row_selection_output_pages_touched: Gauge,
+    /// Row selection: output pages available to cost-model observations.
+    pub row_selection_output_pages_total: Gauge,
+    /// Row selection: touched output pages divided by total output pages.
+    pub row_selection_output_page_touch_ratio: RatioMetrics,
     /// Row selection: selected runs divided by selected rows.
     pub row_selection_fragmentation_ratio: RatioMetrics,
     /// Row selection: plans materialized with masks.
@@ -146,6 +152,8 @@ pub struct ParquetFileMetrics {
     pub cost_model_pushdown_still_preferred_count: Gauge,
     /// Cost model: high-selectivity no-pruning triggers.
     pub cost_model_high_selectivity_no_pruning_count: Gauge,
+    /// Cost model: low-selectivity high page-touch triggers.
+    pub cost_model_low_selectivity_high_page_touch_count: Gauge,
     /// Cost model: projected-predicate moderate-selectivity triggers.
     pub cost_model_projected_predicate_moderate_selectivity_count: Gauge,
     /// Cost model: fragmented moderate-selectivity triggers.
@@ -297,6 +305,18 @@ impl ParquetFileMetrics {
             .clone()
             .with_category(MetricCategory::Rows)
             .gauge("row_selection_skipped_run_count", partition);
+        let row_selection_output_pages_touched = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .gauge("row_selection_output_pages_touched", partition);
+        let row_selection_output_pages_total = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .gauge("row_selection_output_pages_total", partition);
+        let row_selection_output_page_touch_ratio = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .ratio_metrics("row_selection_output_page_touch_ratio", partition);
         let row_selection_fragmentation_ratio = builder
             .clone()
             .with_category(MetricCategory::Rows)
@@ -367,6 +387,11 @@ impl ParquetFileMetrics {
             .clone()
             .with_category(MetricCategory::Rows)
             .gauge("cost_model_high_selectivity_no_pruning_count", partition);
+        let cost_model_low_selectivity_high_page_touch_count =
+            builder.clone().with_category(MetricCategory::Rows).gauge(
+                "cost_model_low_selectivity_high_page_touch_count",
+                partition,
+            );
         let cost_model_projected_predicate_moderate_selectivity_count =
             builder.clone().with_category(MetricCategory::Rows).gauge(
                 "cost_model_projected_predicate_moderate_selectivity_count",
@@ -414,6 +439,9 @@ impl ParquetFileMetrics {
             row_selection_selector_count,
             row_selection_selected_run_count,
             row_selection_skipped_run_count,
+            row_selection_output_pages_touched,
+            row_selection_output_pages_total,
+            row_selection_output_page_touch_ratio,
             row_selection_fragmentation_ratio,
             row_selection_mask_plan_count,
             row_selection_selector_plan_count,
@@ -431,6 +459,7 @@ impl ParquetFileMetrics {
             cost_model_observation_incomplete_count,
             cost_model_pushdown_still_preferred_count,
             cost_model_high_selectivity_no_pruning_count,
+            cost_model_low_selectivity_high_page_touch_count,
             cost_model_projected_predicate_moderate_selectivity_count,
             cost_model_fragmented_moderate_selectivity_count,
             cost_model_fragmented_high_selectivity_count,
@@ -477,6 +506,17 @@ impl ParquetFileMetrics {
             &self.row_selection_skipped_run_count,
             arrow_reader_metrics.row_selection_skipped_run_count(),
         );
+        let output_pages_touched =
+            arrow_reader_metrics.row_selection_output_pages_touched();
+        let output_pages_total = arrow_reader_metrics.row_selection_output_pages_total();
+        set_gauge(
+            &self.row_selection_output_pages_touched,
+            output_pages_touched,
+        );
+        set_gauge(&self.row_selection_output_pages_total, output_pages_total);
+        if let (Some(touched), Some(total)) = (output_pages_touched, output_pages_total) {
+            set_ratio(&self.row_selection_output_page_touch_ratio, touched, total);
+        }
         if let (Some(selected_runs), Some(selected)) = (selected_run_count, selected_rows)
         {
             set_ratio(
@@ -550,6 +590,10 @@ impl ParquetFileMetrics {
         set_gauge(
             &self.cost_model_high_selectivity_no_pruning_count,
             arrow_reader_metrics.cost_model_high_selectivity_no_pruning_count(),
+        );
+        set_gauge(
+            &self.cost_model_low_selectivity_high_page_touch_count,
+            arrow_reader_metrics.cost_model_low_selectivity_high_page_touch_count(),
         );
         set_gauge(
             &self.cost_model_projected_predicate_moderate_selectivity_count,
@@ -634,12 +678,16 @@ mod tests {
             "row_filter_selected_ratio",
             "row_selection_selected_run_count",
             "row_selection_skipped_run_count",
+            "row_selection_output_pages_touched",
+            "row_selection_output_pages_total",
+            "row_selection_output_page_touch_ratio",
             "row_selection_fragmentation_ratio",
             "row_selection_mask_plan_count",
             "row_selection_selector_plan_count",
             "cost_model_observed_row_group_count",
             "cost_model_pushdown_row_group_count",
             "cost_model_post_filter_row_group_count",
+            "cost_model_low_selectivity_high_page_touch_count",
             "cost_model_fragmented_high_selectivity_count",
             "predicate_cache_hit_ratio",
         ] {

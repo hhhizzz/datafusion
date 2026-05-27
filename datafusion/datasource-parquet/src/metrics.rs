@@ -23,6 +23,141 @@ use datafusion_physical_plan::metrics::{
 };
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 
+/// Runtime shape of a row-level predicate installed in the Parquet RowFilter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowPushdownPredicateKind {
+    Static,
+    SmallInList,
+    LargeInList,
+    HashLookup,
+    PartitionedHashLookup,
+    GenericDynamic,
+}
+
+impl RowPushdownPredicateKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::SmallInList => "small_in_list",
+            Self::LargeInList => "large_in_list",
+            Self::HashLookup => "hash_lookup",
+            Self::PartitionedHashLookup => "partitioned_hash_lookup",
+            Self::GenericDynamic => "generic_dynamic",
+        }
+    }
+
+    pub(crate) fn sort_rank(self) -> u8 {
+        match self {
+            Self::Static => 0,
+            Self::SmallInList => 1,
+            Self::LargeInList => 2,
+            Self::HashLookup => 3,
+            Self::PartitionedHashLookup => 4,
+            Self::GenericDynamic => 5,
+        }
+    }
+}
+
+/// Metrics for one runtime row-filter predicate kind.
+#[derive(Debug, Clone)]
+pub(crate) struct RowPushdownPredicateMetrics {
+    pub(crate) input_rows: Count,
+    pub(crate) rows_pruned: Count,
+    pub(crate) rows_matched: Count,
+    pub(crate) eval_time: Time,
+}
+
+impl RowPushdownPredicateMetrics {
+    fn new(
+        builder: MetricBuilder<'_>,
+        partition: usize,
+        kind: RowPushdownPredicateKind,
+    ) -> Self {
+        let builder = builder.with_new_label("predicate_kind", kind.label());
+        let input_rows = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .counter("row_pushdown_predicate_input_rows", partition);
+        let rows_pruned = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .counter("row_pushdown_predicate_pruned_rows", partition);
+        let rows_matched = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .counter("row_pushdown_predicate_matched_rows", partition);
+        let eval_time =
+            builder.subset_time("row_pushdown_predicate_eval_time", partition);
+
+        Self {
+            input_rows,
+            rows_pruned,
+            rows_matched,
+            eval_time,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RowPushdownPredicateMetricsByKind {
+    static_predicate: RowPushdownPredicateMetrics,
+    small_in_list: RowPushdownPredicateMetrics,
+    large_in_list: RowPushdownPredicateMetrics,
+    hash_lookup: RowPushdownPredicateMetrics,
+    partitioned_hash_lookup: RowPushdownPredicateMetrics,
+    generic_dynamic: RowPushdownPredicateMetrics,
+}
+
+impl RowPushdownPredicateMetricsByKind {
+    fn new(builder: MetricBuilder<'_>, partition: usize) -> Self {
+        Self {
+            static_predicate: RowPushdownPredicateMetrics::new(
+                builder.clone(),
+                partition,
+                RowPushdownPredicateKind::Static,
+            ),
+            small_in_list: RowPushdownPredicateMetrics::new(
+                builder.clone(),
+                partition,
+                RowPushdownPredicateKind::SmallInList,
+            ),
+            large_in_list: RowPushdownPredicateMetrics::new(
+                builder.clone(),
+                partition,
+                RowPushdownPredicateKind::LargeInList,
+            ),
+            hash_lookup: RowPushdownPredicateMetrics::new(
+                builder.clone(),
+                partition,
+                RowPushdownPredicateKind::HashLookup,
+            ),
+            partitioned_hash_lookup: RowPushdownPredicateMetrics::new(
+                builder.clone(),
+                partition,
+                RowPushdownPredicateKind::PartitionedHashLookup,
+            ),
+            generic_dynamic: RowPushdownPredicateMetrics::new(
+                builder,
+                partition,
+                RowPushdownPredicateKind::GenericDynamic,
+            ),
+        }
+    }
+
+    fn get(&self, kind: RowPushdownPredicateKind) -> RowPushdownPredicateMetrics {
+        match kind {
+            RowPushdownPredicateKind::Static => self.static_predicate.clone(),
+            RowPushdownPredicateKind::SmallInList => self.small_in_list.clone(),
+            RowPushdownPredicateKind::LargeInList => self.large_in_list.clone(),
+            RowPushdownPredicateKind::HashLookup => self.hash_lookup.clone(),
+            RowPushdownPredicateKind::PartitionedHashLookup => {
+                self.partitioned_hash_lookup.clone()
+            }
+            RowPushdownPredicateKind::GenericDynamic => self.generic_dynamic.clone(),
+        }
+    }
+}
+
 /// Stores metrics about the parquet execution for a particular parquet file.
 ///
 /// This component is a subject to **change** in near future and is exposed for low level integrations
@@ -62,6 +197,8 @@ pub struct ParquetFileMetrics {
     pub pushdown_rows_matched: Count,
     /// Total time spent evaluating row-level pushdown filters
     pub row_pushdown_eval_time: Time,
+    /// Per-predicate-kind row-level pushdown counters and timings.
+    row_pushdown_predicate_metrics: RowPushdownPredicateMetricsByKind,
     /// Total time spent evaluating row group-level statistics filters
     pub statistics_eval_time: Time,
     /// Total time spent evaluating row group Bloom Filters
@@ -243,6 +380,8 @@ impl ParquetFileMetrics {
         let row_pushdown_eval_time = builder
             .clone()
             .subset_time("row_pushdown_eval_time", partition);
+        let row_pushdown_predicate_metrics =
+            RowPushdownPredicateMetricsByKind::new(builder.clone(), partition);
         let statistics_eval_time = builder
             .clone()
             .subset_time("statistics_eval_time", partition);
@@ -421,6 +560,7 @@ impl ParquetFileMetrics {
             pushdown_rows_pruned,
             pushdown_rows_matched,
             row_pushdown_eval_time,
+            row_pushdown_predicate_metrics,
             page_index_rows_pruned,
             page_index_pages_pruned,
             statistics_eval_time,
@@ -608,6 +748,13 @@ impl ParquetFileMetrics {
             &self.cost_model_fragmented_high_selectivity_count,
             arrow_reader_metrics.cost_model_fragmented_high_selectivity_count(),
         );
+    }
+
+    pub(crate) fn row_pushdown_predicate_metrics(
+        &self,
+        kind: RowPushdownPredicateKind,
+    ) -> RowPushdownPredicateMetrics {
+        self.row_pushdown_predicate_metrics.get(kind)
     }
 
     /// Record pages whose page-index pruning was skipped because the containing

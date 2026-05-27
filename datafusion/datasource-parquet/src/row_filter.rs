@@ -78,14 +78,18 @@ use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
+use crate::metrics::{RowPushdownPredicateKind, RowPushdownPredicateMetrics};
 use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr::expressions::{Column, Literal};
+use datafusion_physical_expr::expressions::{
+    CaseExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
+};
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
-use datafusion_physical_expr::{DynamicFilterTracking, PhysicalExpr, split_conjunction};
+use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 
+use datafusion_physical_plan::joins::{HashExpr, HashTableLookupExpr};
 use datafusion_physical_plan::metrics;
 
 use super::ParquetFileMetrics;
@@ -119,6 +123,8 @@ pub(crate) struct DatafusionArrowPredicate {
     rows_matched: metrics::Count,
     /// how long was spent evaluating this predicate
     time: metrics::Time,
+    /// Per-runtime-shape counters for diagnostics and ordering experiments.
+    predicate_metrics: RowPushdownPredicateMetrics,
 }
 
 impl DatafusionArrowPredicate {
@@ -128,6 +134,7 @@ impl DatafusionArrowPredicate {
         rows_pruned: metrics::Count,
         rows_matched: metrics::Count,
         time: metrics::Time,
+        predicate_metrics: RowPushdownPredicateMetrics,
     ) -> Result<Self> {
         let physical_expr =
             reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
@@ -138,6 +145,7 @@ impl DatafusionArrowPredicate {
             rows_pruned,
             rows_matched,
             time,
+            predicate_metrics,
         })
     }
 }
@@ -150,6 +158,8 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
         // scoped timer updates on drop
         let mut timer = self.time.timer();
+        let mut predicate_timer = self.predicate_metrics.eval_time.timer();
+        self.predicate_metrics.input_rows.add(batch.num_rows());
 
         self.physical_expr
             .evaluate(&batch)
@@ -160,6 +170,9 @@ impl ArrowPredicate for DatafusionArrowPredicate {
                 let num_pruned = bool_arr.len() - num_matched;
                 self.rows_pruned.add(num_pruned);
                 self.rows_matched.add(num_matched);
+                self.predicate_metrics.rows_pruned.add(num_pruned);
+                self.predicate_metrics.rows_matched.add(num_matched);
+                predicate_timer.stop();
                 timer.stop();
                 Ok(bool_arr)
             })
@@ -186,20 +199,85 @@ pub(crate) struct FilterCandidate {
     required_bytes: usize,
     /// The resolved Parquet read plan (leaf indices + projected schema).
     read_plan: ParquetReadPlan,
+    /// Typed runtime shape used for ordering and diagnostics.
+    predicate_kind: RowPushdownPredicateKind,
 }
 
 fn row_filter_sort_key(
     expr: &Arc<dyn PhysicalExpr>,
     required_bytes: usize,
 ) -> (u8, usize) {
-    let expression_cpu_class =
-        if DynamicFilterTracking::classify(expr).contains_dynamic_filter() {
-            1
-        } else {
-            0
-        };
+    (row_filter_predicate_kind(expr).sort_rank(), required_bytes)
+}
 
-    (expression_cpu_class, required_bytes)
+const SMALL_IN_LIST_MAX_VALUES: usize = 150;
+
+fn row_filter_predicate_kind(expr: &Arc<dyn PhysicalExpr>) -> RowPushdownPredicateKind {
+    classify_expression_kind(expr)
+}
+
+fn classify_expression_kind(expr: &Arc<dyn PhysicalExpr>) -> RowPushdownPredicateKind {
+    if let Some(dynamic_filter) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
+        return dynamic_filter
+            .current()
+            .ok()
+            .map(|current| classify_expression_kind(&current))
+            .filter(|kind| *kind != RowPushdownPredicateKind::Static)
+            .unwrap_or(RowPushdownPredicateKind::GenericDynamic);
+    }
+
+    let own_kind = if let Some(case_expr) = expr.downcast_ref::<CaseExpr>() {
+        classify_case_expression_kind(case_expr)
+    } else if expr.downcast_ref::<HashTableLookupExpr>().is_some() {
+        RowPushdownPredicateKind::HashLookup
+    } else if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
+        if in_list.len() <= SMALL_IN_LIST_MAX_VALUES {
+            RowPushdownPredicateKind::SmallInList
+        } else {
+            RowPushdownPredicateKind::LargeInList
+        }
+    } else {
+        RowPushdownPredicateKind::Static
+    };
+
+    expr.children().into_iter().fold(own_kind, |kind, child| {
+        max_predicate_kind(kind, classify_expression_kind(child))
+    })
+}
+
+fn classify_case_expression_kind(case_expr: &CaseExpr) -> RowPushdownPredicateKind {
+    let has_repartition_hash_expr = case_expr
+        .expr()
+        .is_some_and(|expr| expr.downcast_ref::<HashExpr>().is_some());
+    let has_hash_lookup_branch = case_expr
+        .when_then_expr()
+        .iter()
+        .any(|(_, then_expr)| expression_contains_hash_lookup(then_expr));
+
+    if has_repartition_hash_expr && has_hash_lookup_branch {
+        RowPushdownPredicateKind::PartitionedHashLookup
+    } else {
+        RowPushdownPredicateKind::Static
+    }
+}
+
+fn expression_contains_hash_lookup(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.downcast_ref::<HashTableLookupExpr>().is_some()
+        || expr
+            .children()
+            .into_iter()
+            .any(expression_contains_hash_lookup)
+}
+
+fn max_predicate_kind(
+    left: RowPushdownPredicateKind,
+    right: RowPushdownPredicateKind,
+) -> RowPushdownPredicateKind {
+    if right.sort_rank() > left.sort_rank() {
+        right
+    } else {
+        left
+    }
 }
 
 /// The result of resolving which Parquet leaf columns and Arrow schema fields
@@ -250,6 +328,7 @@ impl FilterCandidateBuilder {
         Ok(
             build_parquet_read_plan(&self.expr, &self.file_schema, metadata)?.map(
                 |(read_plan, required_bytes)| FilterCandidate {
+                    predicate_kind: row_filter_predicate_kind(&self.expr),
                     expr: self.expr,
                     required_bytes,
                     read_plan,
@@ -1074,6 +1153,8 @@ pub fn build_row_filter(
         .enumerate()
         .map(|(idx, candidate)| {
             let is_last = idx == total_candidates - 1;
+            let predicate_metrics =
+                file_metrics.row_pushdown_predicate_metrics(candidate.predicate_kind);
 
             // All predicates share the pruned counter (cumulative)
             let predicate_rows_pruned = rows_pruned.clone();
@@ -1090,6 +1171,7 @@ pub fn build_row_filter(
                 predicate_rows_pruned,
                 predicate_rows_matched,
                 time.clone(),
+                predicate_metrics,
             )
             .map(|pred| Box::new(pred) as _)
         })
@@ -1195,6 +1277,14 @@ mod test {
         Column as PhysicalColumn, DynamicFilterPhysicalExpr, lit,
     };
 
+    fn test_predicate_metrics(
+        kind: RowPushdownPredicateKind,
+    ) -> RowPushdownPredicateMetrics {
+        let metrics = ExecutionPlanMetricsSet::new();
+        ParquetFileMetrics::new(0, "test.parquet", &metrics)
+            .row_pushdown_predicate_metrics(kind)
+    }
+
     #[test]
     fn row_filter_sort_key_prefers_static_predicates_before_dynamic() {
         let static_expr = lit(true);
@@ -1206,6 +1296,82 @@ mod test {
                 < row_filter_sort_key(&dynamic_expr, 1),
             "static predicates should run before dynamic predicates even when they read more bytes"
         );
+    }
+
+    #[test]
+    fn row_filter_predicate_kind_tracks_dynamic_in_list_size() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let col = Arc::new(PhysicalColumn::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&col)],
+            lit(true),
+        ));
+
+        let small_values = (0..SMALL_IN_LIST_MAX_VALUES)
+            .map(|value| lit(ScalarValue::Int32(Some(value as i32))))
+            .collect::<Vec<_>>();
+        let small_in_list = Arc::new(
+            InListExpr::try_new(Arc::clone(&col), small_values, false, &schema)
+                .expect("small in-list should build"),
+        ) as Arc<dyn PhysicalExpr>;
+        dynamic_filter
+            .update(small_in_list)
+            .expect("updating dynamic filter");
+        let dynamic_expr = Arc::clone(&dynamic_filter) as Arc<dyn PhysicalExpr>;
+        assert_eq!(
+            row_filter_predicate_kind(&dynamic_expr),
+            RowPushdownPredicateKind::SmallInList
+        );
+
+        let large_values = (0..=SMALL_IN_LIST_MAX_VALUES)
+            .map(|value| lit(ScalarValue::Int32(Some(value as i32))))
+            .collect::<Vec<_>>();
+        let large_in_list = Arc::new(
+            InListExpr::try_new(col, large_values, false, &schema)
+                .expect("large in-list should build"),
+        ) as Arc<dyn PhysicalExpr>;
+        dynamic_filter
+            .update(large_in_list)
+            .expect("updating dynamic filter");
+        assert_eq!(
+            row_filter_predicate_kind(&dynamic_expr),
+            RowPushdownPredicateKind::LargeInList
+        );
+    }
+
+    #[test]
+    fn datafusion_arrow_predicate_records_typed_metrics() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let expr = col("a").gt(Expr::Literal(ScalarValue::Int32(Some(1)), None));
+        let expr = logical2physical(&expr, &schema);
+        let candidate = FilterCandidate {
+            expr,
+            required_bytes: 0,
+            read_plan: ParquetReadPlan {
+                projection_mask: ProjectionMask::all(),
+                projected_schema: Arc::clone(&schema),
+            },
+            predicate_kind: RowPushdownPredicateKind::Static,
+        };
+        let predicate_metrics = test_predicate_metrics(RowPushdownPredicateKind::Static);
+        let mut row_filter = DatafusionArrowPredicate::try_new(
+            candidate,
+            Count::new(),
+            Count::new(),
+            Time::new(),
+            predicate_metrics.clone(),
+        )
+        .expect("creating row filter");
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![0, 2, 3]))])
+                .expect("creating batch");
+        let filtered = row_filter.evaluate(batch).expect("filter evaluation");
+
+        assert_eq!(filtered, BooleanArray::from(vec![false, true, true]));
+        assert_eq!(predicate_metrics.input_rows.value(), 3);
+        assert_eq!(predicate_metrics.rows_pruned.value(), 1);
+        assert_eq!(predicate_metrics.rows_matched.value(), 2);
     }
 
     // List predicates used by the decoder should be accepted for pushdown
@@ -1276,12 +1442,14 @@ mod test {
             .build(&metadata)
             .expect("building candidate")
             .expect("candidate expected");
+        let predicate_kind = candidate.predicate_kind;
 
         let mut row_filter = DatafusionArrowPredicate::try_new(
             candidate,
             Count::new(),
             Count::new(),
             Time::new(),
+            test_predicate_metrics(predicate_kind),
         )
         .expect("creating filter predicate");
 
@@ -1315,12 +1483,14 @@ mod test {
             .build(&metadata)
             .expect("building candidate")
             .expect("candidate expected");
+        let predicate_kind = candidate.predicate_kind;
 
         let mut row_filter = DatafusionArrowPredicate::try_new(
             candidate,
             Count::new(),
             Count::new(),
             Time::new(),
+            test_predicate_metrics(predicate_kind),
         )
         .expect("creating filter predicate");
 

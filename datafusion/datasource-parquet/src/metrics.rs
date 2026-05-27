@@ -35,14 +35,14 @@ pub(crate) enum RowPushdownPredicateKind {
 }
 
 impl RowPushdownPredicateKind {
-    pub(crate) fn label(self) -> &'static str {
+    fn metric_prefix(self) -> &'static str {
         match self {
-            Self::Static => "static",
-            Self::SmallInList => "small_in_list",
-            Self::LargeInList => "large_in_list",
-            Self::HashLookup => "hash_lookup",
-            Self::PartitionedHashLookup => "partitioned_hash_lookup",
-            Self::GenericDynamic => "generic_dynamic",
+            Self::Static => "row_pushdown_static",
+            Self::SmallInList => "row_pushdown_small_in_list",
+            Self::LargeInList => "row_pushdown_large_in_list",
+            Self::HashLookup => "row_pushdown_hash_lookup",
+            Self::PartitionedHashLookup => "row_pushdown_partitioned_hash_lookup",
+            Self::GenericDynamic => "row_pushdown_generic_dynamic",
         }
     }
 
@@ -73,21 +73,20 @@ impl RowPushdownPredicateMetrics {
         partition: usize,
         kind: RowPushdownPredicateKind,
     ) -> Self {
-        let builder = builder.with_new_label("predicate_kind", kind.label());
+        let prefix = kind.metric_prefix();
         let input_rows = builder
             .clone()
             .with_category(MetricCategory::Rows)
-            .counter("row_pushdown_predicate_input_rows", partition);
+            .counter(format!("{prefix}_input_rows"), partition);
         let rows_pruned = builder
             .clone()
             .with_category(MetricCategory::Rows)
-            .counter("row_pushdown_predicate_pruned_rows", partition);
+            .counter(format!("{prefix}_pruned_rows"), partition);
         let rows_matched = builder
             .clone()
             .with_category(MetricCategory::Rows)
-            .counter("row_pushdown_predicate_matched_rows", partition);
-        let eval_time =
-            builder.subset_time("row_pushdown_predicate_eval_time", partition);
+            .counter(format!("{prefix}_matched_rows"), partition);
+        let eval_time = builder.subset_time(format!("{prefix}_eval_time"), partition);
 
         Self {
             input_rows,
@@ -831,6 +830,15 @@ mod tests {
             "row_selection_fragmentation_ratio",
             "row_selection_mask_plan_count",
             "row_selection_selector_plan_count",
+            "row_pushdown_static_input_rows",
+            "row_pushdown_static_pruned_rows",
+            "row_pushdown_static_matched_rows",
+            "row_pushdown_static_eval_time",
+            "row_pushdown_small_in_list_eval_time",
+            "row_pushdown_large_in_list_eval_time",
+            "row_pushdown_hash_lookup_eval_time",
+            "row_pushdown_partitioned_hash_lookup_eval_time",
+            "row_pushdown_generic_dynamic_eval_time",
             "cost_model_observed_row_group_count",
             "cost_model_pushdown_row_group_count",
             "cost_model_post_filter_row_group_count",

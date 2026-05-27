@@ -71,6 +71,9 @@ pub struct DynamicFilterPhysicalExpr {
     remapped_children: Option<Vec<Arc<dyn PhysicalExpr>>>,
     /// The source of dynamic filters.
     inner: Arc<RwLock<Inner>>,
+    /// Cached remapped form of the current inner expression for this specific
+    /// `remapped_children` mapping.
+    remapped_current: Arc<RwLock<Option<RemappedCurrent>>>,
     /// Broadcasts filter state (updates and completion) to all waiters.
     state_watch: watch::Sender<FilterState>,
     /// For testing purposes track the data type and nullability to make sure they don't change.
@@ -78,6 +81,12 @@ pub struct DynamicFilterPhysicalExpr {
     /// But this can have overhead in production, so it's only included in our tests.
     data_type: Arc<RwLock<Option<DataType>>>,
     nullable: Arc<RwLock<Option<bool>>>,
+}
+
+#[derive(Debug, Clone)]
+struct RemappedCurrent {
+    generation: u64,
+    expr: Arc<dyn PhysicalExpr>,
 }
 
 /// Atomic internal state of a [`DynamicFilterPhysicalExpr`].
@@ -190,6 +199,7 @@ impl DynamicFilterPhysicalExpr {
             children,
             remapped_children: None, // Initially no remapped children
             inner: Arc::new(RwLock::new(Inner::new(inner))),
+            remapped_current: Arc::new(RwLock::new(None)),
             state_watch,
             data_type: Arc::new(RwLock::new(None)),
             nullable: Arc::new(RwLock::new(None)),
@@ -234,8 +244,28 @@ impl DynamicFilterPhysicalExpr {
     /// This will return the current expression with any children
     /// remapped to match calls to [`PhysicalExpr::with_new_children`].
     pub fn current(&self) -> Result<Arc<dyn PhysicalExpr>> {
-        let expr = Arc::clone(self.inner.read().expr());
-        Self::remap_children(&self.children, self.remapped_children.as_ref(), expr)
+        let current = self.inner.read();
+        let generation = current.generation;
+        let expr = Arc::clone(current.expr());
+        drop(current);
+
+        if self.remapped_children.is_none() {
+            return Ok(expr);
+        }
+
+        if let Some(cached) = self.remapped_current.read().as_ref()
+            && cached.generation == generation
+        {
+            return Ok(Arc::clone(&cached.expr));
+        }
+
+        let remapped =
+            Self::remap_children(&self.children, self.remapped_children.as_ref(), expr)?;
+        *self.remapped_current.write() = Some(RemappedCurrent {
+            generation,
+            expr: Arc::clone(&remapped),
+        });
+        Ok(remapped)
     }
 
     /// Update the current expression and notify all waiters.
@@ -432,6 +462,7 @@ impl DynamicFilterPhysicalExpr {
             children,
             remapped_children,
             inner: Arc::new(RwLock::new(inner)),
+            remapped_current: Arc::new(RwLock::new(None)),
             state_watch,
             data_type: Arc::new(RwLock::new(None)),
             nullable: Arc::new(RwLock::new(None)),
@@ -465,6 +496,7 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
             remapped_children: Some(children),
             // Note: expression_id is preserved
             inner: Arc::clone(&self.inner),
+            remapped_current: Arc::new(RwLock::new(None)),
             state_watch: self.state_watch.clone(),
             data_type: Arc::clone(&self.data_type),
             nullable: Arc::clone(&self.nullable),
@@ -917,6 +949,61 @@ mod test {
         assert!(
             arr_2.eq(&expected_2),
             "Expected b + d = [1010, 2020, 3030], got {arr_2:?}",
+        );
+    }
+
+    #[test]
+    fn test_remapped_current_reuses_expression_until_update() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+
+        let col_a = col("a", &schema).unwrap();
+        let col_b = col("b", &schema).unwrap();
+        let expr = Arc::new(BinaryExpr::new(
+            Arc::clone(&col_a),
+            datafusion_expr::Operator::Eq,
+            lit(42) as Arc<dyn PhysicalExpr>,
+        ));
+
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&col_a)],
+            expr as Arc<dyn PhysicalExpr>,
+        ));
+
+        let remapped = Arc::clone(&dynamic_filter)
+            .with_new_children(vec![Arc::clone(&col_b)])
+            .unwrap();
+        let remapped_filter = remapped
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .expect("remapped expression should remain a dynamic filter");
+
+        let first = remapped_filter.current().unwrap();
+        let second = remapped_filter.current().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "current() should reuse the remapped expression for the same generation"
+        );
+
+        let updated_expr = Arc::new(BinaryExpr::new(
+            Arc::clone(&col_a),
+            datafusion_expr::Operator::Eq,
+            lit(43) as Arc<dyn PhysicalExpr>,
+        ));
+        dynamic_filter
+            .update(updated_expr as Arc<dyn PhysicalExpr>)
+            .unwrap();
+
+        let after_update = remapped_filter.current().unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &after_update),
+            "current() should rebuild the remapped expression after an update"
+        );
+        let after_update_again = remapped_filter.current().unwrap();
+        assert!(
+            Arc::ptr_eq(&after_update, &after_update_again),
+            "current() should cache the rebuilt expression for the new generation"
         );
     }
 

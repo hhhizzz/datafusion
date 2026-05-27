@@ -39,7 +39,9 @@ use datafusion_common::config::TableParquetOptions;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_physical_expr::DynamicFilterTracking;
 use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{EquivalenceProperties, conjunction};
 use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
@@ -403,6 +405,51 @@ impl ParquetSource {
         self.table_parquet_options.global.pushdown_filters
     }
 
+    fn row_filter_can_skip_projected_columns(
+        &self,
+        filter: &Arc<dyn PhysicalExpr>,
+    ) -> bool {
+        if DynamicFilterTracking::classify(filter).contains_dynamic_filter() {
+            return true;
+        }
+
+        let projected_columns = self.projection.column_indices();
+        if projected_columns.is_empty() {
+            return true;
+        }
+
+        let filter_columns = collect_columns(filter);
+        projected_columns
+            .iter()
+            .any(|index| !filter_columns.iter().any(|column| column.index() == *index))
+    }
+
+    fn row_filter_set_can_skip_projected_columns(
+        &self,
+        filters: &[Arc<dyn PhysicalExpr>],
+    ) -> bool {
+        let projected_columns = self.projection.column_indices();
+        if projected_columns.is_empty()
+            || filters.iter().any(|filter| {
+                DynamicFilterTracking::classify(filter).contains_dynamic_filter()
+            })
+        {
+            return true;
+        }
+
+        let filter_columns = filters
+            .iter()
+            .flat_map(collect_columns)
+            .map(|column| column.index())
+            .collect_vec();
+
+        projected_columns.iter().any(|index| {
+            !filter_columns
+                .iter()
+                .any(|filter_index| filter_index == index)
+        })
+    }
+
     /// If true, the `RowFilter` made by `pushdown_filters` may try to
     /// minimize the cost of filter evaluation by reordering the
     /// predicate [`Expr`]s. If false, the predicates are applied in
@@ -740,31 +787,47 @@ impl FileSource for ParquetSource {
         let pushdown_filters = table_pushdown_enabled || config_pushdown_enabled;
 
         let mut source = self.clone();
-        let filters: Vec<PushedDownPredicate> = filters
+        let row_filter_set_can_skip_columns =
+            self.row_filter_set_can_skip_projected_columns(&filters);
+        let pushdown_filter_predicates: Vec<(PushedDownPredicate, bool)> = filters
             .into_iter()
             .map(|filter| {
                 if can_expr_be_pushed_down_with_schemas(&filter, table_schema) {
-                    PushedDownPredicate::supported(filter)
+                    let row_filter_can_skip_columns = row_filter_set_can_skip_columns
+                        && self.row_filter_can_skip_projected_columns(&filter);
+                    (
+                        if row_filter_can_skip_columns {
+                            PushedDownPredicate::supported(filter)
+                        } else {
+                            PushedDownPredicate::unsupported(filter)
+                        },
+                        true,
+                    )
                 } else {
-                    PushedDownPredicate::unsupported(filter)
+                    (PushedDownPredicate::unsupported(filter), false)
                 }
             })
             .collect();
-        if filters
+        if pushdown_filter_predicates
             .iter()
-            .all(|f| matches!(f.discriminant, PushedDown::No))
+            .all(|(_, can_prune)| !can_prune)
         {
             // No filters can be pushed down, so we can just return the remaining filters
             // and avoid replacing the source in the physical plan.
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                vec![PushedDown::No; filters.len()],
+                vec![PushedDown::No; pushdown_filter_predicates.len()],
             ));
         }
-        let allowed_filters = filters
+        let has_pruning_only_filters =
+            pushdown_filter_predicates
+                .iter()
+                .any(|(filter, can_prune)| {
+                    *can_prune && matches!(filter.discriminant, PushedDown::No)
+                });
+        let allowed_filters = pushdown_filter_predicates
             .iter()
-            .filter_map(|f| match f.discriminant {
-                PushedDown::Yes => Some(Arc::clone(&f.predicate)),
-                PushedDown::No => None,
+            .filter_map(|(filter, can_prune)| {
+                (*can_prune).then(|| Arc::clone(&filter.predicate))
             })
             .collect_vec();
         let predicate = match source.predicate {
@@ -774,18 +837,22 @@ impl FileSource for ParquetSource {
             None => conjunction(allowed_filters),
         };
         source.predicate = Some(predicate);
+        let pushdown_filters = pushdown_filters && !has_pruning_only_filters;
         source = source.with_pushdown_filters(pushdown_filters);
         let source = Arc::new(source);
         // If pushdown_filters is false we tell our parents that they still have to handle the filters,
         // even if we updated the predicate to include the filters (they will only be used for stats pruning).
         if !pushdown_filters {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                vec![PushedDown::No; filters.len()],
+                vec![PushedDown::No; pushdown_filter_predicates.len()],
             )
             .with_updated_node(source));
         }
         Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-            filters.iter().map(|f| f.discriminant).collect(),
+            pushdown_filter_predicates
+                .iter()
+                .map(|(filter, _)| filter.discriminant)
+                .collect(),
         )
         .with_updated_node(source))
     }
@@ -965,8 +1032,11 @@ impl FileSource for ParquetSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::Schema;
-    use datafusion_physical_expr::expressions::lit;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::{
+        BinaryExpr, Column, DynamicFilterPhysicalExpr, lit,
+    };
 
     #[test]
     #[expect(deprecated)]
@@ -977,6 +1047,166 @@ mod tests {
             ParquetSource::new(Arc::new(Schema::empty())).with_predicate(predicate);
         // same value. but filter() call Arc::clone internally
         assert_eq!(parquet_source.predicate(), parquet_source.filter().as_ref());
+    }
+
+    fn clickbench_search_phrase_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("SearchPhrase", DataType::Utf8, true),
+            Field::new("URL", DataType::Utf8, true),
+        ]))
+    }
+
+    fn search_phrase_not_empty_filter() -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("SearchPhrase", 0)),
+            Operator::NotEq,
+            lit(""),
+        ))
+    }
+
+    fn dynamic_search_phrase_filter() -> Arc<dyn PhysicalExpr> {
+        let column = Arc::new(Column::new("SearchPhrase", 0)) as Arc<dyn PhysicalExpr>;
+        Arc::new(DynamicFilterPhysicalExpr::new(vec![column], lit(true)))
+    }
+
+    fn url_not_empty_filter() -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("URL", 1)),
+            Operator::NotEq,
+            lit(""),
+        ))
+    }
+
+    #[test]
+    fn try_pushdown_filters_keeps_parent_filter_when_no_payload_columns_can_be_skipped() {
+        let schema = clickbench_search_phrase_schema();
+        let source = ParquetSource::new(Arc::clone(&schema));
+        let projection = ProjectionExprs::from_indices(&[0], &schema);
+        let source = source
+            .try_pushdown_projection(&projection)
+            .unwrap()
+            .unwrap();
+        let source = source
+            .downcast_ref::<ParquetSource>()
+            .expect("projected source is ParquetSource");
+
+        let mut config = ConfigOptions::default();
+        config.execution.parquet.pushdown_filters = true;
+
+        let result = source
+            .try_pushdown_filters(vec![search_phrase_not_empty_filter()], &config)
+            .unwrap();
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(matches!(result.filters[0], PushedDown::No));
+        let updated = result
+            .updated_node
+            .expect("predicate is still used for pruning");
+        let updated = updated
+            .downcast_ref::<ParquetSource>()
+            .expect("updated source is ParquetSource");
+        assert!(updated.filter().is_some());
+        assert!(!updated.pushdown_filters());
+    }
+
+    #[test]
+    fn try_pushdown_filters_keeps_dynamic_filter_on_row_filter_path() {
+        let schema = clickbench_search_phrase_schema();
+        let source = ParquetSource::new(Arc::clone(&schema));
+        let projection = ProjectionExprs::from_indices(&[0], &schema);
+        let source = source
+            .try_pushdown_projection(&projection)
+            .unwrap()
+            .unwrap();
+        let source = source
+            .downcast_ref::<ParquetSource>()
+            .expect("projected source is ParquetSource");
+
+        let mut config = ConfigOptions::default();
+        config.execution.parquet.pushdown_filters = true;
+
+        let result = source
+            .try_pushdown_filters(vec![dynamic_search_phrase_filter()], &config)
+            .unwrap();
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(matches!(result.filters[0], PushedDown::Yes));
+        let updated = result.updated_node.expect("source should be updated");
+        let updated = updated
+            .downcast_ref::<ParquetSource>()
+            .expect("updated source is ParquetSource");
+        assert!(updated.filter().is_some());
+        assert!(updated.pushdown_filters());
+    }
+
+    #[test]
+    fn try_pushdown_filters_pushes_when_payload_columns_can_be_skipped() {
+        let schema = clickbench_search_phrase_schema();
+        let source = ParquetSource::new(Arc::clone(&schema));
+        let projection = ProjectionExprs::from_indices(&[0, 1], &schema);
+        let source = source
+            .try_pushdown_projection(&projection)
+            .unwrap()
+            .unwrap();
+        let source = source
+            .downcast_ref::<ParquetSource>()
+            .expect("projected source is ParquetSource");
+
+        let mut config = ConfigOptions::default();
+        config.execution.parquet.pushdown_filters = true;
+
+        let result = source
+            .try_pushdown_filters(vec![search_phrase_not_empty_filter()], &config)
+            .unwrap();
+
+        assert_eq!(result.filters.len(), 1);
+        assert!(matches!(result.filters[0], PushedDown::Yes));
+        let updated = result.updated_node.expect("source should be updated");
+        let updated = updated
+            .downcast_ref::<ParquetSource>()
+            .expect("updated source is ParquetSource");
+        assert!(updated.filter().is_some());
+        assert!(updated.pushdown_filters());
+    }
+
+    #[test]
+    fn try_pushdown_filters_keeps_parent_filter_when_filter_set_covers_projection() {
+        let schema = clickbench_search_phrase_schema();
+        let source = ParquetSource::new(Arc::clone(&schema));
+        let projection = ProjectionExprs::from_indices(&[0, 1], &schema);
+        let source = source
+            .try_pushdown_projection(&projection)
+            .unwrap()
+            .unwrap();
+        let source = source
+            .downcast_ref::<ParquetSource>()
+            .expect("projected source is ParquetSource");
+
+        let mut config = ConfigOptions::default();
+        config.execution.parquet.pushdown_filters = true;
+
+        let result = source
+            .try_pushdown_filters(
+                vec![search_phrase_not_empty_filter(), url_not_empty_filter()],
+                &config,
+            )
+            .unwrap();
+
+        assert_eq!(result.filters.len(), 2);
+        assert!(
+            result
+                .filters
+                .iter()
+                .all(|filter| matches!(filter, PushedDown::No))
+        );
+        let updated = result
+            .updated_node
+            .expect("predicate is still used for pruning");
+        let updated = updated
+            .downcast_ref::<ParquetSource>()
+            .expect("updated source is ParquetSource");
+        assert!(updated.filter().is_some());
+        assert!(!updated.pushdown_filters());
     }
 
     #[test]
@@ -1173,7 +1403,7 @@ mod tests {
         let order = vec![PhysicalSortExpr {
             expr: Arc::new(BinaryExpr::new(
                 Arc::new(Column::new("a", 0)),
-                datafusion_expr::Operator::Plus,
+                Operator::Plus,
                 lit(1i32),
             )),
             options: SortOptions {

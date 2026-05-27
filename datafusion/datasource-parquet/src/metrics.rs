@@ -292,6 +292,8 @@ pub struct ParquetFileMetrics {
     pub cost_model_low_selectivity_high_page_touch_count: Gauge,
     /// Cost model: projected-predicate moderate-selectivity triggers.
     pub cost_model_projected_predicate_moderate_selectivity_count: Gauge,
+    /// Cost model: projected-predicate sparse-fragmented triggers.
+    pub cost_model_projected_predicate_sparse_fragmented_count: Gauge,
     /// Cost model: fragmented moderate-selectivity triggers.
     pub cost_model_fragmented_moderate_selectivity_count: Gauge,
     /// Cost model: fragmented high-selectivity triggers.
@@ -535,6 +537,11 @@ impl ParquetFileMetrics {
                 "cost_model_projected_predicate_moderate_selectivity_count",
                 partition,
             );
+        let cost_model_projected_predicate_sparse_fragmented_count =
+            builder.clone().with_category(MetricCategory::Rows).gauge(
+                "cost_model_projected_predicate_sparse_fragmented_count",
+                partition,
+            );
         let cost_model_fragmented_moderate_selectivity_count =
             builder.clone().with_category(MetricCategory::Rows).gauge(
                 "cost_model_fragmented_moderate_selectivity_count",
@@ -600,6 +607,7 @@ impl ParquetFileMetrics {
             cost_model_high_selectivity_no_pruning_count,
             cost_model_low_selectivity_high_page_touch_count,
             cost_model_projected_predicate_moderate_selectivity_count,
+            cost_model_projected_predicate_sparse_fragmented_count,
             cost_model_fragmented_moderate_selectivity_count,
             cost_model_fragmented_high_selectivity_count,
             predicate_cache_hit_ratio,
@@ -740,6 +748,10 @@ impl ParquetFileMetrics {
                 .cost_model_projected_predicate_moderate_selectivity_count(),
         );
         set_gauge(
+            &self.cost_model_projected_predicate_sparse_fragmented_count,
+            arrow_reader_metrics.cost_model_projected_predicate_sparse_fragmented_count(),
+        );
+        set_gauge(
             &self.cost_model_fragmented_moderate_selectivity_count,
             arrow_reader_metrics.cost_model_fragmented_moderate_selectivity_count(),
         );
@@ -843,6 +855,7 @@ mod tests {
             "cost_model_pushdown_row_group_count",
             "cost_model_post_filter_row_group_count",
             "cost_model_low_selectivity_high_page_touch_count",
+            "cost_model_projected_predicate_sparse_fragmented_count",
             "cost_model_fragmented_high_selectivity_count",
             "predicate_cache_hit_ratio",
         ] {

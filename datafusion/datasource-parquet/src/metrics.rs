@@ -206,6 +206,16 @@ pub struct ParquetFileMetrics {
     pub predicate_projected_column_overlap_count: Gauge,
     /// Row filter: overlapping predicate/output leaves divided by predicate leaves.
     pub predicate_projected_column_overlap_ratio: RatioMetrics,
+    /// Row filter: estimated compressed bytes for output projection leaves.
+    pub projected_payload_compressed_bytes: Gauge,
+    /// Row filter: estimated compressed bytes for output leaves not read by predicates.
+    pub deferred_projected_payload_compressed_bytes: Gauge,
+    /// Row filter: estimated compressed bytes for output leaves also read by predicates.
+    pub predicate_projected_overlap_compressed_bytes: Gauge,
+    /// Row filter: estimated projected output compressed bytes per file row.
+    pub projected_payload_bytes_per_row: Gauge,
+    /// Row filter: estimated deferred output compressed bytes per file row.
+    pub deferred_projected_payload_bytes_per_row: Gauge,
     /// Total time spent evaluating row group-level statistics filters
     pub statistics_eval_time: Time,
     /// Total time spent evaluating row group Bloom Filters
@@ -407,6 +417,26 @@ impl ParquetFileMetrics {
             .clone()
             .with_category(MetricCategory::Rows)
             .ratio_metrics("predicate_projected_column_overlap_ratio", partition);
+        let projected_payload_compressed_bytes = builder
+            .clone()
+            .with_category(MetricCategory::Bytes)
+            .gauge("projected_payload_compressed_bytes", partition);
+        let deferred_projected_payload_compressed_bytes = builder
+            .clone()
+            .with_category(MetricCategory::Bytes)
+            .gauge("deferred_projected_payload_compressed_bytes", partition);
+        let predicate_projected_overlap_compressed_bytes = builder
+            .clone()
+            .with_category(MetricCategory::Bytes)
+            .gauge("predicate_projected_overlap_compressed_bytes", partition);
+        let projected_payload_bytes_per_row = builder
+            .clone()
+            .with_category(MetricCategory::Bytes)
+            .gauge("projected_payload_bytes_per_row", partition);
+        let deferred_projected_payload_bytes_per_row = builder
+            .clone()
+            .with_category(MetricCategory::Bytes)
+            .gauge("deferred_projected_payload_bytes_per_row", partition);
         let statistics_eval_time = builder
             .clone()
             .subset_time("statistics_eval_time", partition);
@@ -595,6 +625,11 @@ impl ParquetFileMetrics {
             output_leaf_column_count,
             predicate_projected_column_overlap_count,
             predicate_projected_column_overlap_ratio,
+            projected_payload_compressed_bytes,
+            deferred_projected_payload_compressed_bytes,
+            predicate_projected_overlap_compressed_bytes,
+            projected_payload_bytes_per_row,
+            deferred_projected_payload_bytes_per_row,
             page_index_rows_pruned,
             page_index_pages_pruned,
             statistics_eval_time,
@@ -801,6 +836,10 @@ impl ParquetFileMetrics {
         predicate_leaf_count: usize,
         output_leaf_count: usize,
         overlap_leaf_count: usize,
+        projected_payload_compressed_bytes: usize,
+        deferred_projected_payload_compressed_bytes: usize,
+        predicate_projected_overlap_compressed_bytes: usize,
+        file_row_count: usize,
     ) {
         self.predicate_leaf_column_count.set(predicate_leaf_count);
         self.output_leaf_column_count.set(output_leaf_count);
@@ -811,6 +850,22 @@ impl ParquetFileMetrics {
             overlap_leaf_count,
             predicate_leaf_count,
         );
+        self.projected_payload_compressed_bytes
+            .set(projected_payload_compressed_bytes);
+        self.deferred_projected_payload_compressed_bytes
+            .set(deferred_projected_payload_compressed_bytes);
+        self.predicate_projected_overlap_compressed_bytes
+            .set(predicate_projected_overlap_compressed_bytes);
+        self.projected_payload_bytes_per_row
+            .set(estimated_bytes_per_row(
+                projected_payload_compressed_bytes,
+                file_row_count,
+            ));
+        self.deferred_projected_payload_bytes_per_row
+            .set(estimated_bytes_per_row(
+                deferred_projected_payload_compressed_bytes,
+                file_row_count,
+            ));
     }
 
     /// Record pages whose page-index pruning was skipped because the containing
@@ -847,6 +902,13 @@ fn set_gauge(gauge: &Gauge, value: Option<usize>) {
 fn set_ratio(ratio: &RatioMetrics, part: usize, total: usize) {
     ratio.set_part(part);
     ratio.set_total(total);
+}
+
+fn estimated_bytes_per_row(bytes: usize, rows: usize) -> usize {
+    if rows == 0 {
+        return 0;
+    }
+    bytes.div_ceil(rows)
 }
 
 #[cfg(test)]
@@ -900,6 +962,11 @@ mod tests {
             "output_leaf_column_count",
             "predicate_projected_column_overlap_count",
             "predicate_projected_column_overlap_ratio",
+            "projected_payload_compressed_bytes",
+            "deferred_projected_payload_compressed_bytes",
+            "predicate_projected_overlap_compressed_bytes",
+            "projected_payload_bytes_per_row",
+            "deferred_projected_payload_bytes_per_row",
             "cost_model_observed_row_group_count",
             "cost_model_pushdown_row_group_count",
             "cost_model_post_filter_row_group_count",

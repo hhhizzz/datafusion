@@ -1162,9 +1162,9 @@ pub fn build_row_filter(
         record_predicate_projection_overlap(
             &candidates,
             output_projection,
-            metadata.file_metadata().schema_descr(),
+            metadata,
             file_metrics,
-        );
+        )?;
     }
 
     if reorder_predicates {
@@ -1212,48 +1212,57 @@ pub fn build_row_filter(
 fn record_predicate_projection_overlap(
     candidates: &[FilterCandidate],
     output_projection: &ProjectionMask,
-    parquet_schema: &SchemaDescriptor,
+    metadata: &ParquetMetaData,
     file_metrics: &ParquetFileMetrics,
-) {
+) -> Result<()> {
+    let parquet_schema = metadata.file_metadata().schema_descr();
     let mut predicate_projection = ProjectionMask::none(parquet_schema.num_columns());
     for candidate in candidates {
         predicate_projection.union(&candidate.read_plan.projection_mask);
     }
 
-    let predicate_leaf_count = included_leaf_count(&predicate_projection, parquet_schema);
-    let output_leaf_count = included_leaf_count(output_projection, parquet_schema);
-    let overlap_leaf_count = projection_overlap_leaf_count(
-        &predicate_projection,
-        output_projection,
-        parquet_schema,
-    );
+    let predicate_leaf_indices =
+        included_leaf_indices(&predicate_projection, parquet_schema);
+    let output_leaf_indices = included_leaf_indices(output_projection, parquet_schema);
+    let overlap_leaf_indices = output_leaf_indices
+        .iter()
+        .copied()
+        .filter(|leaf_idx| predicate_projection.leaf_included(*leaf_idx))
+        .collect::<Vec<_>>();
+    let deferred_output_leaf_indices = output_leaf_indices
+        .iter()
+        .copied()
+        .filter(|leaf_idx| !predicate_projection.leaf_included(*leaf_idx))
+        .collect::<Vec<_>>();
+
+    let projected_payload_compressed_bytes =
+        size_of_columns(&output_leaf_indices, metadata)?;
+    let deferred_projected_payload_compressed_bytes =
+        size_of_columns(&deferred_output_leaf_indices, metadata)?;
+    let predicate_projected_overlap_compressed_bytes =
+        size_of_columns(&overlap_leaf_indices, metadata)?;
+    let file_row_count = metadata.file_metadata().num_rows().max(0) as usize;
 
     file_metrics.record_predicate_projection_overlap(
-        predicate_leaf_count,
-        output_leaf_count,
-        overlap_leaf_count,
+        predicate_leaf_indices.len(),
+        output_leaf_indices.len(),
+        overlap_leaf_indices.len(),
+        projected_payload_compressed_bytes,
+        deferred_projected_payload_compressed_bytes,
+        predicate_projected_overlap_compressed_bytes,
+        file_row_count,
     );
+
+    Ok(())
 }
 
-fn included_leaf_count(
+fn included_leaf_indices(
     projection: &ProjectionMask,
     parquet_schema: &SchemaDescriptor,
-) -> usize {
+) -> Vec<usize> {
     (0..parquet_schema.num_columns())
         .filter(|leaf_idx| projection.leaf_included(*leaf_idx))
-        .count()
-}
-
-fn projection_overlap_leaf_count(
-    left: &ProjectionMask,
-    right: &ProjectionMask,
-    parquet_schema: &SchemaDescriptor,
-) -> usize {
-    (0..parquet_schema.num_columns())
-        .filter(|leaf_idx| {
-            left.leaf_included(*leaf_idx) && right.leaf_included(*leaf_idx)
-        })
-        .count()
+        .collect()
 }
 
 /// Builds row filters for decoder runs.
@@ -1486,6 +1495,26 @@ mod test {
                 .predicate_projected_column_overlap_ratio
                 .total(),
             2
+        );
+        assert!(file_metrics.projected_payload_compressed_bytes.value() > 0);
+        assert!(
+            file_metrics
+                .deferred_projected_payload_compressed_bytes
+                .value()
+                > 0
+        );
+        assert!(
+            file_metrics
+                .predicate_projected_overlap_compressed_bytes
+                .value()
+                > 0
+        );
+        assert!(file_metrics.projected_payload_bytes_per_row.value() > 0);
+        assert!(
+            file_metrics
+                .deferred_projected_payload_bytes_per_row
+                .value()
+                > 0
         );
     }
 

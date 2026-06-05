@@ -16,6 +16,7 @@
 // under the License.
 
 //! ParquetSource implementation for reading parquet files
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -66,6 +67,8 @@ use parquet::encryption::decrypt::FileDecryptionProperties;
 
 const ROW_FILTER_DISABLE_LABELS_ENV: &str =
     "DATAFUSION_PARQUET_ROW_FILTER_DISABLE_LABELS";
+const ROW_FILTER_ADMISSION_RULES_ENV: &str =
+    "DATAFUSION_PARQUET_ROW_FILTER_ADMISSION_RULES";
 
 /// Execution plan for reading one or more Parquet files.
 ///
@@ -839,6 +842,25 @@ impl FileSource for ParquetSource {
                 .any(|(filter, can_prune)| {
                     *can_prune && matches!(filter.discriminant, PushedDown::No)
                 });
+        let row_filter_disabled_for_oracle =
+            row_filter_disabled_by_label_spec(self.diagnostic_file_label.as_deref());
+        let admission_mode = row_filter_admission_mode(
+            self.diagnostic_file_label.as_deref(),
+            &pushdown_filter_predicates,
+            table_schema,
+            &self.projection,
+            row_filter_set_can_skip_columns,
+            pushdown_filters,
+            has_pruning_only_filters,
+            row_filter_disabled_for_oracle,
+        );
+
+        if matches!(admission_mode, RowFilterAdmissionMode::ResidualOnly) {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                vec![PushedDown::No; pushdown_filter_predicates.len()],
+            ));
+        }
+
         let allowed_filters = pushdown_filter_predicates
             .iter()
             .filter_map(|(filter, can_prune)| {
@@ -852,11 +874,8 @@ impl FileSource for ParquetSource {
             None => conjunction(allowed_filters),
         };
         source.predicate = Some(predicate);
-        let row_filter_disabled_for_oracle =
-            row_filter_disabled_by_label_spec(self.diagnostic_file_label.as_deref());
-        let pushdown_filters = pushdown_filters
-            && !has_pruning_only_filters
-            && !row_filter_disabled_for_oracle;
+        let pushdown_filters =
+            matches!(admission_mode, RowFilterAdmissionMode::RowFilter);
         source = source.with_pushdown_filters(pushdown_filters);
         let source = Arc::new(source);
         // If pushdown_filters is false we tell our parents that they still have to handle the filters,
@@ -1079,6 +1098,217 @@ fn row_filter_disable_spec_matches(label: Option<&str>, spec: &str) -> bool {
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowFilterAdmissionMode {
+    RowFilter,
+    MetadataPruneOnly,
+    ResidualOnly,
+}
+
+fn row_filter_admission_mode(
+    label: Option<&str>,
+    predicates: &[(PushedDownPredicate, bool)],
+    table_schema: &arrow::datatypes::Schema,
+    projection: &ProjectionExprs,
+    row_filter_set_can_skip_projected_columns: bool,
+    pushdown_filters_enabled: bool,
+    has_pruning_only_filters: bool,
+    row_filter_disabled_for_oracle: bool,
+) -> RowFilterAdmissionMode {
+    let default_mode = if pushdown_filters_enabled
+        && !has_pruning_only_filters
+        && !row_filter_disabled_for_oracle
+    {
+        RowFilterAdmissionMode::RowFilter
+    } else {
+        RowFilterAdmissionMode::MetadataPruneOnly
+    };
+
+    let Some(requested_mode) = row_filter_admission_rule_mode_from_env(
+        label,
+        predicates,
+        table_schema,
+        projection,
+        row_filter_set_can_skip_projected_columns,
+    ) else {
+        return default_mode;
+    };
+
+    match requested_mode {
+        RowFilterAdmissionMode::RowFilter
+            if pushdown_filters_enabled && !has_pruning_only_filters =>
+        {
+            RowFilterAdmissionMode::RowFilter
+        }
+        RowFilterAdmissionMode::RowFilter => RowFilterAdmissionMode::MetadataPruneOnly,
+        other => other,
+    }
+}
+
+fn row_filter_admission_rule_mode_from_env(
+    label: Option<&str>,
+    predicates: &[(PushedDownPredicate, bool)],
+    table_schema: &arrow::datatypes::Schema,
+    projection: &ProjectionExprs,
+    row_filter_set_can_skip_projected_columns: bool,
+) -> Option<RowFilterAdmissionMode> {
+    std::env::var(ROW_FILTER_ADMISSION_RULES_ENV)
+        .ok()
+        .and_then(|spec| {
+            row_filter_admission_rule_mode_from_spec(
+                label,
+                predicates,
+                table_schema,
+                projection,
+                row_filter_set_can_skip_projected_columns,
+                &spec,
+            )
+        })
+}
+
+fn row_filter_admission_rule_mode_from_spec(
+    label: Option<&str>,
+    predicates: &[(PushedDownPredicate, bool)],
+    table_schema: &arrow::datatypes::Schema,
+    projection: &ProjectionExprs,
+    row_filter_set_can_skip_projected_columns: bool,
+    spec: &str,
+) -> Option<RowFilterAdmissionMode> {
+    let context = RowFilterAdmissionContext::new(
+        label,
+        predicates,
+        table_schema,
+        projection,
+        row_filter_set_can_skip_projected_columns,
+    );
+
+    spec.split(';')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .find_map(|rule| {
+            let (mode, conditions) = rule.split_once(':').unwrap_or((rule, ""));
+            let mode = row_filter_admission_mode_from_token(mode.trim())?;
+            row_filter_admission_conditions_match(&context, conditions).then_some(mode)
+        })
+}
+
+fn row_filter_admission_mode_from_token(token: &str) -> Option<RowFilterAdmissionMode> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "row_filter" | "rowfilter" | "row" | "enable" | "enabled" => {
+            Some(RowFilterAdmissionMode::RowFilter)
+        }
+        "metadata_prune_only" | "metadata" | "prune_only" | "pruning_only" => {
+            Some(RowFilterAdmissionMode::MetadataPruneOnly)
+        }
+        "residual_only" | "residual" | "parent_only" | "none" => {
+            Some(RowFilterAdmissionMode::ResidualOnly)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+struct RowFilterAdmissionContext<'a> {
+    label: Option<&'a str>,
+    contains_dynamic_filter: bool,
+    row_filter_set_can_skip_projected_columns: bool,
+    filter_columns: BTreeSet<String>,
+    projected_columns: BTreeSet<String>,
+}
+
+impl<'a> RowFilterAdmissionContext<'a> {
+    fn new(
+        label: Option<&'a str>,
+        predicates: &[(PushedDownPredicate, bool)],
+        table_schema: &arrow::datatypes::Schema,
+        projection: &ProjectionExprs,
+        row_filter_set_can_skip_projected_columns: bool,
+    ) -> Self {
+        let contains_dynamic_filter = predicates.iter().any(|(predicate, _)| {
+            DynamicFilterTracking::classify(&predicate.predicate)
+                .contains_dynamic_filter()
+        });
+        let filter_columns = predicates
+            .iter()
+            .flat_map(|(predicate, _)| collect_columns(&predicate.predicate))
+            .map(|column| column.name().to_owned())
+            .collect();
+        let projected_columns = projection
+            .column_indices()
+            .into_iter()
+            .filter_map(|index| table_schema.fields().get(index))
+            .map(|field| field.name().to_owned())
+            .collect();
+
+        Self {
+            label,
+            contains_dynamic_filter,
+            row_filter_set_can_skip_projected_columns,
+            filter_columns,
+            projected_columns,
+        }
+    }
+}
+
+fn row_filter_admission_conditions_match(
+    context: &RowFilterAdmissionContext<'_>,
+    conditions: &str,
+) -> bool {
+    conditions
+        .split(',')
+        .map(str::trim)
+        .filter(|condition| !condition.is_empty())
+        .all(|condition| row_filter_admission_condition_matches(context, condition))
+}
+
+fn row_filter_admission_condition_matches(
+    context: &RowFilterAdmissionContext<'_>,
+    condition: &str,
+) -> bool {
+    match condition.to_ascii_lowercase().as_str() {
+        "all" | "*" => true,
+        "dynamic" | "has_dynamic" => context.contains_dynamic_filter,
+        "static" | "no_dynamic" => !context.contains_dynamic_filter,
+        "skip_projected" | "can_skip_projected" => {
+            context.row_filter_set_can_skip_projected_columns
+        }
+        "covers_projection" | "cannot_skip_projected" => {
+            !context.row_filter_set_can_skip_projected_columns
+        }
+        _ => {
+            let Some((key, value)) = condition.split_once('=') else {
+                return false;
+            };
+            row_filter_admission_key_value_matches(context, key.trim(), value.trim())
+        }
+    }
+}
+
+fn row_filter_admission_key_value_matches(
+    context: &RowFilterAdmissionContext<'_>,
+    key: &str,
+    value: &str,
+) -> bool {
+    match key.to_ascii_lowercase().as_str() {
+        "label" | "table" | "file" => {
+            row_filter_disable_spec_matches(context.label, value)
+        }
+        "filter_col" | "filter_column" => {
+            set_contains_ignore_ascii_case(&context.filter_columns, value)
+        }
+        "projected_col" | "projected_column" | "output_col" | "output_column" => {
+            set_contains_ignore_ascii_case(&context.projected_columns, value)
+        }
+        _ => false,
+    }
+}
+
+fn set_contains_ignore_ascii_case(values: &BTreeSet<String>, target: &str) -> bool {
+    values
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(target))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1151,6 +1381,76 @@ mod tests {
             "web_sales"
         ));
         assert!(!row_filter_disable_spec_matches(None, "store_sales"));
+    }
+
+    fn supported_predicate(
+        predicate: Arc<dyn PhysicalExpr>,
+    ) -> (PushedDownPredicate, bool) {
+        (PushedDownPredicate::supported(predicate), true)
+    }
+
+    #[test]
+    fn row_filter_admission_rules_match_scan_shape() {
+        let schema = clickbench_search_phrase_schema();
+        let projection = ProjectionExprs::from_indices(&[0, 1], &schema);
+        let predicates = vec![supported_predicate(dynamic_search_phrase_filter())];
+
+        let mode = row_filter_admission_rule_mode_from_spec(
+            Some("catalog_sales"),
+            &predicates,
+            &schema,
+            &projection,
+            true,
+            "metadata_prune_only:label=catalog_sales,dynamic,filter_col=SearchPhrase,projected_col=URL",
+        );
+        assert_eq!(mode, Some(RowFilterAdmissionMode::MetadataPruneOnly));
+
+        let mode = row_filter_admission_rule_mode_from_spec(
+            Some("catalog_sales"),
+            &predicates,
+            &schema,
+            &projection,
+            true,
+            "metadata_prune_only:label=web_sales,dynamic;residual_only:label=catalog_sales,dynamic",
+        );
+        assert_eq!(mode, Some(RowFilterAdmissionMode::ResidualOnly));
+
+        let mode = row_filter_admission_rule_mode_from_spec(
+            Some("catalog_sales"),
+            &predicates,
+            &schema,
+            &projection,
+            true,
+            "metadata_prune_only:label=catalog_sales,static",
+        );
+        assert_eq!(mode, None);
+    }
+
+    #[test]
+    fn row_filter_admission_rules_match_projection_skip_shape() {
+        let schema = clickbench_search_phrase_schema();
+        let projection = ProjectionExprs::from_indices(&[0], &schema);
+        let predicates = vec![supported_predicate(url_not_empty_filter())];
+
+        let mode = row_filter_admission_rule_mode_from_spec(
+            Some("clickbench/hits.parquet"),
+            &predicates,
+            &schema,
+            &projection,
+            true,
+            "row_filter:label=hits,static,skip_projected,filter_col=URL",
+        );
+        assert_eq!(mode, Some(RowFilterAdmissionMode::RowFilter));
+
+        let mode = row_filter_admission_rule_mode_from_spec(
+            Some("clickbench/hits.parquet"),
+            &predicates,
+            &schema,
+            &projection,
+            false,
+            "metadata_prune_only:label=hits,covers_projection,filter_col=URL",
+        );
+        assert_eq!(mode, Some(RowFilterAdmissionMode::MetadataPruneOnly));
     }
 
     #[test]

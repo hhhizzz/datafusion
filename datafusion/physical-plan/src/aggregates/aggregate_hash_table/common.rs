@@ -182,6 +182,9 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
                 acc + state.group_values.size()
                     + state.batch_group_indices.allocated_size()
             }
+            AggregateHashTableState::OutputtingMaterialized(output) => {
+                output.memory_size()
+            }
             AggregateHashTableState::Done => 0,
         }
     }
@@ -301,7 +304,41 @@ pub(super) enum AggregateHashTableState {
     Building(AggregateHashTableBuffer),
     /// Emitting results directly from group keys and aggregate state.
     Outputting(AggregateHashTableBuffer),
+    /// Materialize output results once, then incrementally emit slices.
+    OutputtingMaterialized(MaterializedAggregateOutput),
     Done,
+}
+
+/// Fully evaluated aggregate output and the next row offset to emit.
+pub(super) struct MaterializedAggregateOutput {
+    batch: RecordBatch,
+    offset: usize,
+}
+
+impl MaterializedAggregateOutput {
+    pub(super) fn new(batch: RecordBatch) -> Self {
+        Self { batch, offset: 0 }
+    }
+
+    pub(super) fn next_batch(&mut self, batch_size: usize) -> Option<RecordBatch> {
+        debug_assert!(batch_size > 0);
+        if self.is_exhausted() {
+            return None;
+        }
+
+        let length = batch_size.min(self.batch.num_rows() - self.offset);
+        let batch = self.batch.slice(self.offset, length);
+        self.offset += length;
+        Some(batch)
+    }
+
+    pub(super) fn is_exhausted(&self) -> bool {
+        self.offset >= self.batch.num_rows()
+    }
+
+    pub(super) fn memory_size(&self) -> usize {
+        self.batch.get_array_memory_size()
+    }
 }
 
 impl HashAggregateAccumulator {

@@ -81,6 +81,11 @@ impl AggregateHashTable<FinalMarker> {
                 Ok(Some(batch))
             }
             AggregateHashTableState::Done => Ok(None),
+            AggregateHashTableState::OutputtingMaterialized(_) => {
+                internal_err!(
+                    "final aggregate output must not use materialized output state"
+                )
+            }
             AggregateHashTableState::Building(_) => {
                 internal_err!("next_output_batch must be called in the outputting state")
             }

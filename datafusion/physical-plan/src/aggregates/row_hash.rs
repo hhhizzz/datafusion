@@ -1034,7 +1034,7 @@ impl GroupedHashAggregateStream {
 
         let timer = self.group_by_metrics.emitting_time.timer();
         let mut output = self.group_values.emit(emit_to)?;
-        if let EmitTo::First(n) = emit_to {
+        if let EmitTo::First(n) | EmitTo::FirstBlock(n) = emit_to {
             self.group_ordering.remove_groups(n);
         }
 
@@ -1412,6 +1412,62 @@ mod tests {
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
     use datafusion_physical_expr::expressions::col;
+
+    #[tokio::test]
+    async fn test_emit_first_block_updates_group_ordering() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("group_col", DataType::Int32, false),
+            Field::new("value_col", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(Int64Array::from(vec![1, 1, 1, 1])),
+            ],
+        )?;
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(
+            Column::new("group_col", 0),
+        )
+            as _)])
+        .unwrap();
+        let exec =
+            TestMemoryExec::try_new(&[vec![batch.clone()]], Arc::clone(&schema), None)?
+                .try_with_sort_information(vec![ordering])?;
+        let exec = Arc::new(TestMemoryExec::update_cache(&Arc::new(exec)));
+
+        let aggregate_exec = AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::new_single(vec![(
+                col("group_col", &schema)?,
+                "group_col".to_string(),
+            )]),
+            vec![Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("value_col", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("count_value")
+                    .build()?,
+            )],
+            vec![None],
+            exec,
+            Arc::clone(&schema),
+        )?;
+        assert!(matches!(
+            aggregate_exec.input_order_mode(),
+            InputOrderMode::Sorted
+        ));
+
+        let task_ctx = Arc::new(TaskContext::default());
+        let mut stream = GroupedHashAggregateStream::new(&aggregate_exec, &task_ctx, 0)?;
+        stream.group_aggregate_batch(&batch)?;
+
+        assert_eq!(stream.group_ordering.emit_to(), Some(EmitTo::First(3)));
+        let emitted = stream.emit(EmitTo::FirstBlock(2), false)?.unwrap();
+        assert_eq!(emitted.num_rows(), 2);
+        assert_eq!(stream.group_ordering.emit_to(), Some(EmitTo::First(1)));
+
+        Ok(())
+    }
 
     // Migrated to PartialHashAggregateStream coverage in hash_aggregate.rs;
     // kept here for the legacy GroupedHashAggregateStream implementation.

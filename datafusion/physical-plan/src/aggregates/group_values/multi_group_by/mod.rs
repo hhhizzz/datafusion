@@ -102,6 +102,10 @@ pub trait GroupColumn: Send + Sync {
     /// Builds a new array from all of the stored rows
     fn build(self: Box<Self>) -> ArrayRef;
 
+    /// Builds a new array from `n` stored rows starting at `offset`, without
+    /// shifting the stored rows.
+    fn slice_n(&mut self, offset: usize, n: usize) -> ArrayRef;
+
     /// Builds a new array from the first `n` stored rows, shifting the
     /// remaining rows to the start of the builder
     fn take_n(&mut self, n: usize) -> ArrayRef;
@@ -215,6 +219,12 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     /// [`GroupValuesRows`]: crate::aggregates::group_values::GroupValuesRows
     group_values: Vec<Box<dyn GroupColumn>>,
 
+    /// Materialized group values retained while emitting `FirstBlock`s.
+    first_block_values: Option<Vec<ArrayRef>>,
+
+    /// Number of leading rows already emitted by `EmitTo::FirstBlock`.
+    first_block_emit_offset: usize,
+
     /// reused buffer to store hashes
     hashes_buffer: Vec<u64>,
 
@@ -281,6 +291,8 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             vectorized_operation_buffers: VectorizedOperationBuffers::default(),
             map_size: 0,
             group_values,
+            first_block_values: None,
+            first_block_emit_offset: 0,
             hashes_buffer: Default::default(),
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
         })
@@ -299,6 +311,124 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             v.push(make_group_column(f.as_ref())?);
         }
         Ok(v)
+    }
+
+    fn reset_after_first_block_drained(&mut self) -> Result<()> {
+        self.group_values = Self::build_group_columns(&self.schema)?;
+        self.first_block_values = None;
+        self.first_block_emit_offset = 0;
+        self.map.clear();
+
+        if !STREAMING {
+            self.group_index_lists.clear();
+            self.emit_group_index_list_buffer.clear();
+            self.vectorized_operation_buffers.clear();
+        }
+
+        Ok(())
+    }
+
+    fn compact_first_block_state(&mut self) -> Result<()> {
+        if let Some(values) = self.first_block_values.take() {
+            let offset = self.first_block_emit_offset;
+            let remaining_len = values.first().map(|v| v.len() - offset).unwrap_or(0);
+
+            self.group_values = Self::build_group_columns(&self.schema)?;
+            self.first_block_emit_offset = 0;
+            self.map.clear();
+
+            if !STREAMING {
+                self.group_index_lists.clear();
+                self.emit_group_index_list_buffer.clear();
+                self.vectorized_operation_buffers.clear();
+            }
+
+            if remaining_len > 0 {
+                let remaining = values
+                    .iter()
+                    .map(|v| v.slice(offset, remaining_len))
+                    .collect::<Vec<_>>();
+                let mut group_indexes = vec![];
+                self.intern(&remaining, &mut group_indexes)?;
+                assert_eq!(0, group_indexes[0]);
+            }
+
+            return Ok(());
+        }
+
+        let n = self.first_block_emit_offset;
+        if n == 0 {
+            return Ok(());
+        }
+
+        for group_value in &mut self.group_values {
+            let _ = group_value.take_n(n);
+        }
+        self.adjust_lookup_after_emit(n);
+        self.first_block_emit_offset = 0;
+        Ok(())
+    }
+
+    fn adjust_lookup_after_emit(&mut self, n: usize) {
+        let mut next_new_list_offset = 0;
+
+        self.map.retain(|(_exist_hash, group_idx_view)| {
+            // In non-streaming case, we need to check if the `group index view`
+            // is `inlined` or `non-inlined`
+            if !STREAMING && group_idx_view.is_non_inlined() {
+                // Non-inlined case
+                // We take `group_index_list` from `old_group_index_lists`
+
+                // list_offset is incrementally
+                self.emit_group_index_list_buffer.clear();
+                let list_offset = group_idx_view.value() as usize;
+                for group_index in self.group_index_lists[list_offset].iter() {
+                    if let Some(remaining) = group_index.checked_sub(n) {
+                        self.emit_group_index_list_buffer.push(remaining);
+                    }
+                }
+
+                // The possible results:
+                //   - `new_group_index_list` is empty, we should erase this bucket
+                //   - only one value in `new_group_index_list`, switch the `view` to `inlined`
+                //   - still multiple values in `new_group_index_list`, build and set the new `unlined view`
+                if self.emit_group_index_list_buffer.is_empty() {
+                    false
+                } else if self.emit_group_index_list_buffer.len() == 1 {
+                    let group_index = self.emit_group_index_list_buffer.first().unwrap();
+                    *group_idx_view = GroupIndexView::new_inlined(*group_index as u64);
+                    true
+                } else {
+                    let group_index_list =
+                        &mut self.group_index_lists[next_new_list_offset];
+                    group_index_list.clear();
+                    group_index_list.extend(self.emit_group_index_list_buffer.iter());
+                    *group_idx_view =
+                        GroupIndexView::new_non_inlined(next_new_list_offset as u64);
+                    next_new_list_offset += 1;
+                    true
+                }
+            } else {
+                // In `streaming case`, the `group index view` is ensured to be `inlined`
+                debug_assert!(!group_idx_view.is_non_inlined());
+
+                // Inlined case, we just decrement group index by n)
+                let group_index = group_idx_view.value() as usize;
+                match group_index.checked_sub(n) {
+                    // Group index was >= n, shift value down
+                    Some(sub) => {
+                        *group_idx_view = GroupIndexView::new_inlined(sub as u64);
+                        true
+                    }
+                    // Group index was < n, so remove from table
+                    None => false,
+                }
+            }
+        });
+
+        if !STREAMING {
+            self.group_index_lists.truncate(next_new_list_offset);
+        }
     }
 
     // ========================================================================
@@ -1082,6 +1212,8 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         // `try_new` and the reset points in `emit` / `clear_shrink` keep
         // `self.group_values` populated with one builder per schema field,
         // so no lazy initialization is needed here.
+        self.compact_first_block_state()?;
+
         if !STREAMING {
             self.vectorized_intern(cols, groups)
         } else {
@@ -1091,7 +1223,15 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
 
     fn size(&self) -> usize {
         let group_values_size: usize = self.group_values.iter().map(|v| v.size()).sum();
-        group_values_size + self.map_size + self.hashes_buffer.allocated_size()
+        let first_block_values_size: usize = self
+            .first_block_values
+            .as_ref()
+            .map(|values| values.iter().map(|v| v.get_array_memory_size()).sum())
+            .unwrap_or_default();
+        group_values_size
+            + first_block_values_size
+            + self.map_size
+            + self.hashes_buffer.allocated_size()
     }
 
     fn is_empty(&self) -> bool {
@@ -1099,98 +1239,97 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
     }
 
     fn len(&self) -> usize {
+        if let Some(values) = &self.first_block_values {
+            return values
+                .first()
+                .map(|v| v.len() - self.first_block_emit_offset)
+                .unwrap_or(0);
+        }
+
         if self.group_values.is_empty() {
             return 0;
         }
 
-        self.group_values[0].len()
+        self.group_values[0].len() - self.first_block_emit_offset
     }
 
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         let mut output = match emit_to {
             EmitTo::All => {
-                // Replace the column builders with a fresh set so the
-                // aggregator is immediately reusable after the drain.
-                // Same `self.schema` was already validated by `try_new`,
-                // so `build_group_columns` would only error here if some
-                // out-of-band schema mutation occurred — propagate it as
-                // a real Result rather than panicking.
-                let fresh = Self::build_group_columns(&self.schema)?;
-                let group_values = mem::replace(&mut self.group_values, fresh);
+                if let Some(values) = self.first_block_values.take() {
+                    let offset = self.first_block_emit_offset;
+                    let n = values.first().map(|v| v.len() - offset).unwrap_or(0);
+                    let output = values
+                        .iter()
+                        .map(|v| v.slice(offset, n))
+                        .collect::<Vec<_>>();
+                    self.reset_after_first_block_drained()?;
+                    output
+                } else if self.first_block_emit_offset == 0 {
+                    // Replace the column builders with a fresh set so the
+                    // aggregator is immediately reusable after the drain.
+                    // Same `self.schema` was already validated by `try_new`,
+                    // so `build_group_columns` would only error here if some
+                    // out-of-band schema mutation occurred — propagate it as
+                    // a real Result rather than panicking.
+                    let fresh = Self::build_group_columns(&self.schema)?;
+                    let group_values = mem::replace(&mut self.group_values, fresh);
 
-                group_values
-                    .into_iter()
-                    .map(|v| v.build())
-                    .collect::<Vec<_>>()
+                    group_values
+                        .into_iter()
+                        .map(|v| v.build())
+                        .collect::<Vec<_>>()
+                } else {
+                    let offset = self.first_block_emit_offset;
+                    let n = self.len();
+                    let output = self
+                        .group_values
+                        .iter_mut()
+                        .map(|v| v.slice_n(offset, n))
+                        .collect::<Vec<_>>();
+                    self.reset_after_first_block_drained()?;
+                    output
+                }
             }
             EmitTo::First(n) => {
+                self.compact_first_block_state()?;
+
                 let output = self
                     .group_values
                     .iter_mut()
                     .map(|v| v.take_n(n))
                     .collect::<Vec<_>>();
-                let mut next_new_list_offset = 0;
+                self.adjust_lookup_after_emit(n);
 
-                self.map.retain(|(_exist_hash, group_idx_view)| {
-                    // In non-streaming case, we need to check if the `group index view`
-                    // is `inlined` or `non-inlined`
-                    if !STREAMING && group_idx_view.is_non_inlined() {
-                        // Non-inlined case
-                        // We take `group_index_list` from `old_group_index_lists`
+                output
+            }
+            EmitTo::FirstBlock(n) => {
+                if self.first_block_values.is_none() {
+                    let fresh = Self::build_group_columns(&self.schema)?;
+                    let group_values = mem::replace(&mut self.group_values, fresh);
+                    self.first_block_values =
+                        Some(group_values.into_iter().map(|v| v.build()).collect());
+                    self.map.clear();
 
-                        // list_offset is incrementally
+                    if !STREAMING {
+                        self.group_index_lists.clear();
                         self.emit_group_index_list_buffer.clear();
-                        let list_offset = group_idx_view.value() as usize;
-                        for group_index in self.group_index_lists[list_offset].iter() {
-                            if let Some(remaining) = group_index.checked_sub(n) {
-                                self.emit_group_index_list_buffer.push(remaining);
-                            }
-                        }
-
-                        // The possible results:
-                        //   - `new_group_index_list` is empty, we should erase this bucket
-                        //   - only one value in `new_group_index_list`, switch the `view` to `inlined`
-                        //   - still multiple values in `new_group_index_list`, build and set the new `unlined view`
-                        if self.emit_group_index_list_buffer.is_empty() {
-                            false
-                        } else if self.emit_group_index_list_buffer.len() == 1 {
-                            let group_index =
-                                self.emit_group_index_list_buffer.first().unwrap();
-                            *group_idx_view =
-                                GroupIndexView::new_inlined(*group_index as u64);
-                            true
-                        } else {
-                            let group_index_list =
-                                &mut self.group_index_lists[next_new_list_offset];
-                            group_index_list.clear();
-                            group_index_list
-                                .extend(self.emit_group_index_list_buffer.iter());
-                            *group_idx_view = GroupIndexView::new_non_inlined(
-                                next_new_list_offset as u64,
-                            );
-                            next_new_list_offset += 1;
-                            true
-                        }
-                    } else {
-                        // In `streaming case`, the `group index view` is ensured to be `inlined`
-                        debug_assert!(!group_idx_view.is_non_inlined());
-
-                        // Inlined case, we just decrement group index by n)
-                        let group_index = group_idx_view.value() as usize;
-                        match group_index.checked_sub(n) {
-                            // Group index was >= n, shift value down
-                            Some(sub) => {
-                                *group_idx_view = GroupIndexView::new_inlined(sub as u64);
-                                true
-                            }
-                            // Group index was < n, so remove from table
-                            None => false,
-                        }
+                        self.vectorized_operation_buffers.clear();
                     }
-                });
+                }
 
-                if !STREAMING {
-                    self.group_index_lists.truncate(next_new_list_offset);
+                let offset = self.first_block_emit_offset;
+                let output = self
+                    .first_block_values
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.slice(offset, n))
+                    .collect::<Vec<_>>();
+                self.first_block_emit_offset += n;
+
+                if self.is_empty() {
+                    self.reset_after_first_block_drained()?;
                 }
 
                 output
@@ -1221,6 +1360,8 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         // `clear_shrink` is infallible by trait signature.
         self.group_values = Self::build_group_columns(&self.schema)
             .expect("schema previously validated in try_new");
+        self.first_block_values = None;
+        self.first_block_emit_offset = 0;
         self.map.clear();
         self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
         self.map_size = self.map.capacity() * size_of::<(u64, usize)>();
@@ -1443,6 +1584,37 @@ mod tests {
             let actual_batch = concat_batches(&schema, &actual_sub_batches).unwrap();
             check_result(&actual_batch, &data_set.expected_batch);
         }
+    }
+
+    #[test]
+    fn test_emit_first_block_for_vectorized_group_values_materializes_state_once() {
+        let data_set = VectorizedTestDataSet::new();
+        let mut group_values =
+            GroupValuesColumn::<false>::try_new(data_set.schema()).unwrap();
+        data_set.load_to_group_values(&mut group_values);
+
+        let num_rows = data_set.expected_batch.num_rows();
+        let physical_rows = group_values.group_values[0].len();
+        assert_eq!(physical_rows, num_rows);
+
+        let first = group_values.emit(EmitTo::FirstBlock(4)).unwrap();
+        let first = RecordBatch::try_new(data_set.schema(), first).unwrap();
+
+        assert_eq!(group_values.len(), num_rows - 4);
+        assert_eq!(
+            group_values.group_values[0].len(),
+            0,
+            "FirstBlock should move group builders into materialized arrays instead of retaining builder state for repeated slice copies"
+        );
+
+        let rest = group_values
+            .emit(EmitTo::FirstBlock(group_values.len()))
+            .unwrap();
+        let rest = RecordBatch::try_new(data_set.schema(), rest).unwrap();
+        assert!(group_values.is_empty());
+
+        let actual_batch = concat_batches(&data_set.schema(), &[first, rest]).unwrap();
+        check_result(&actual_batch, &data_set.expected_batch);
     }
 
     #[test]

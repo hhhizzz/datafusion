@@ -108,7 +108,11 @@ pub trait GroupValues: Send {
     /// The number of values (distinct group values) stored in this [`GroupValues`]
     fn len(&self) -> usize;
 
-    /// Emits the group values
+    /// Emits the group values.
+    ///
+    /// For [`EmitTo::FirstBlock`], implementations may keep an internal cursor
+    /// rather than shifting retained values immediately, but [`Self::len`] and
+    /// [`Self::is_empty`] must report the number of groups still remaining to emit.
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>>;
 
     /// Clear the contents and shrink the capacity to the size of the batch (free up memory usage)

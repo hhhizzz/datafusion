@@ -109,7 +109,7 @@ where
 
         let values = match emit_to {
             EmitTo::All => values,
-            EmitTo::First(n) => {
+            EmitTo::First(n) | EmitTo::FirstBlock(n) => {
                 let first_n: BooleanBuffer = values.iter().take(n).collect();
                 // put n+1 back into self.values
                 for v in values.iter().skip(n) {
@@ -119,7 +119,11 @@ where
             }
         };
 
-        let nulls = self.null_state.build(emit_to);
+        let null_emit_to = match emit_to {
+            EmitTo::FirstBlock(n) => EmitTo::First(n),
+            _ => emit_to,
+        };
+        let nulls = self.null_state.build(null_emit_to);
         let values = BooleanArray::new(values, nulls);
         Ok(Arc::new(values))
     }
@@ -159,5 +163,42 @@ where
 
     fn supports_convert_to_state(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::BooleanArray;
+
+    #[test]
+    fn boolean_groups_first_block_compacts_null_state_before_update() -> Result<()> {
+        let mut accumulator =
+            BooleanGroupsAccumulator::new(|current, new| current && new, true);
+        let values: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+        ]));
+        let filter = BooleanArray::from(vec![true, true, false, true]);
+        accumulator.update_batch(&[values], &[0, 1, 2, 3], Some(&filter), 4)?;
+
+        let emitted = accumulator.evaluate(EmitTo::FirstBlock(2))?;
+        assert_eq!(
+            emitted.as_boolean().iter().collect::<Vec<_>>(),
+            vec![Some(true), Some(true)]
+        );
+
+        let values: ArrayRef = Arc::new(BooleanArray::from(vec![false, true]));
+        accumulator.update_batch(&[values], &[0, 2], None, 3)?;
+
+        let emitted = accumulator.evaluate(EmitTo::All)?;
+        assert_eq!(
+            emitted.as_boolean().iter().collect::<Vec<_>>(),
+            vec![Some(false), Some(true), Some(true)]
+        );
+
+        Ok(())
     }
 }

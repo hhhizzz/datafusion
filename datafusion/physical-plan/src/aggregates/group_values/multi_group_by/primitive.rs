@@ -47,6 +47,7 @@ pub struct PrimitiveGroupValueBuilder<T: ArrowPrimitiveType, const NULLABLE: boo
     data_type: DataType,
     group_values: Vec<T::Native>,
     nulls: MaybeNullBufferBuilder,
+    first_block_values: Option<ArrayRef>,
 }
 
 impl<T, const NULLABLE: bool> PrimitiveGroupValueBuilder<T, NULLABLE>
@@ -60,7 +61,33 @@ where
             data_type,
             group_values: vec![],
             nulls: MaybeNullBufferBuilder::new(),
+            first_block_values: None,
         }
+    }
+
+    fn materialize_first_block_values(&mut self) -> &ArrayRef {
+        if self.first_block_values.is_none() {
+            let nulls = if NULLABLE {
+                self.nulls.slice_n(0, self.group_values.len())
+            } else {
+                None
+            };
+            self.first_block_values = Some(Arc::new(
+                PrimitiveArray::<T>::new(
+                    ScalarBuffer::from(self.group_values.clone()),
+                    nulls,
+                )
+                .with_data_type(self.data_type.clone()),
+            ));
+        }
+        self.first_block_values.as_ref().unwrap()
+    }
+
+    fn first_block_values_size(&self) -> usize {
+        self.first_block_values
+            .as_ref()
+            .map(|values| values.get_array_memory_size())
+            .unwrap_or_default()
     }
 
     fn vectorized_equal_to_non_nullable(
@@ -165,6 +192,7 @@ where
     }
 
     fn append_val(&mut self, array: &ArrayRef, row: usize) -> Result<()> {
+        self.first_block_values = None;
         // Perf: skip null check if input can't have nulls
         if NULLABLE {
             if array.is_null(row) {
@@ -203,6 +231,7 @@ where
     }
 
     fn vectorized_append(&mut self, array: &ArrayRef, rows: &[usize]) -> Result<()> {
+        self.first_block_values = None;
         let arr = array.as_primitive::<T>();
 
         let null_count = array.null_count();
@@ -256,7 +285,9 @@ where
     }
 
     fn size(&self) -> usize {
-        self.group_values.allocated_size() + self.nulls.allocated_size()
+        self.group_values.allocated_size()
+            + self.nulls.allocated_size()
+            + self.first_block_values_size()
     }
 
     fn build(self: Box<Self>) -> ArrayRef {
@@ -264,6 +295,7 @@ where
             data_type,
             group_values,
             nulls,
+            first_block_values: _,
         } = *self;
 
         let nulls = nulls.build();
@@ -276,7 +308,13 @@ where
         Arc::new(arr.with_data_type(data_type))
     }
 
+    fn slice_n(&mut self, offset: usize, n: usize) -> ArrayRef {
+        debug_assert!(self.len() >= offset + n);
+        self.materialize_first_block_values().slice(offset, n)
+    }
+
     fn take_n(&mut self, n: usize) -> ArrayRef {
+        self.first_block_values = None;
         let first_n = split_vec_min_alloc(&mut self.group_values, n);
         let first_n_nulls = if NULLABLE { self.nulls.take_n(n) } else { None };
 
@@ -293,7 +331,8 @@ mod tests {
 
     use crate::aggregates::group_values::multi_group_by::primitive::PrimitiveGroupValueBuilder;
     use arrow::array::{
-        ArrayRef, BooleanBufferBuilder, Float32Array, Int64Array, NullBufferBuilder,
+        ArrayRef, AsArray, BooleanBufferBuilder, Float32Array, Int64Array,
+        NullBufferBuilder,
     };
     use arrow::datatypes::{DataType, Float32Type, Int64Type};
 
@@ -628,5 +667,27 @@ mod tests {
         let expected3 = Arc::new(Int64Array::from(vec![Some(50)])) as ArrayRef;
         assert_eq!(&out3, &expected3);
         assert_eq!(builder.len(), 0);
+    }
+
+    #[test]
+    fn primitive_first_block_slices_share_materialized_values() {
+        let mut builder =
+            PrimitiveGroupValueBuilder::<Int64Type, false>::new(DataType::Int64);
+        let array = Arc::new(Int64Array::from_iter_values(0..6)) as ArrayRef;
+        builder
+            .vectorized_append(&array, &[0, 1, 2, 3, 4, 5])
+            .unwrap();
+
+        let first = builder.slice_n(0, 4);
+        let second = builder.slice_n(4, 2);
+        let first = first.as_primitive::<Int64Type>();
+        let second = second.as_primitive::<Int64Type>();
+
+        let expected_second_ptr = unsafe { first.values().as_ptr().add(first.len()) };
+        assert_eq!(
+            expected_second_ptr,
+            second.values().as_ptr(),
+            "FirstBlock primitive slices should come from one materialized values buffer"
+        );
     }
 }

@@ -3233,7 +3233,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_grouped_aggregate_materializes_before_slicing() -> Result<()> {
+    async fn partial_grouped_aggregate_uses_first_block_when_slicing() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::Int32, false),
             Field::new("value", DataType::Int32, false),
@@ -6419,8 +6419,13 @@ mod tests {
                     let counts = std::mem::take(&mut self.counts);
                     Ok(Arc::new(Int64Array::from(counts)))
                 }
+                EmitTo::FirstBlock(n) => {
+                    let len = n.min(self.counts.len());
+                    let counts = self.counts.drain(..len).collect::<Vec<_>>();
+                    Ok(Arc::new(Int64Array::from(counts)))
+                }
                 EmitTo::First(_) => internal_err!(
-                    "partial grouped aggregate output must materialize with EmitTo::All before slicing"
+                    "partial grouped aggregate output must not slice with EmitTo::First"
                 ),
             }
         }

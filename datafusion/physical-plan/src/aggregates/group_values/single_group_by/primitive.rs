@@ -114,6 +114,8 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     null_group: Option<usize>,
     /// The values for each group index
     values: Vec<T::Native>,
+    /// Number of leading groups already emitted by `EmitTo::FirstBlock`.
+    first_block_emit_offset: usize,
     /// The random state used to generate hashes
     random_state: RandomState,
 }
@@ -126,8 +128,82 @@ impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
             map: HashTable::with_capacity(128),
             values: Vec::with_capacity(128),
             null_group: None,
+            first_block_emit_offset: 0,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
         }
+    }
+}
+
+impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T>
+where
+    T::Native: HashValue,
+{
+    fn rebuild_map(&mut self) {
+        self.map.clear();
+        let state = &self.random_state;
+        for (group_idx, key) in self.values.iter().copied().enumerate() {
+            if self.null_group == Some(group_idx) {
+                continue;
+            }
+            let hash = key.hash(state);
+            self.map.insert_unique(hash, (group_idx, hash), |&(_, h)| h);
+        }
+    }
+
+    fn compact_first_block_remainder(&mut self) {
+        let offset = self.first_block_emit_offset;
+        if offset == 0 {
+            return;
+        }
+
+        if offset >= self.values.len() {
+            self.values.clear();
+            self.map.clear();
+            self.null_group = None;
+        } else {
+            self.values.drain(0..offset);
+            self.null_group = self
+                .null_group
+                .and_then(|group_idx| group_idx.checked_sub(offset));
+            self.rebuild_map();
+        }
+        self.first_block_emit_offset = 0;
+    }
+
+    fn build_primitive(
+        values: Vec<T::Native>,
+        null_idx: Option<usize>,
+    ) -> PrimitiveArray<T> {
+        let nulls = null_idx.map(|null_idx| {
+            let mut buffer = NullBufferBuilder::new(values.len());
+            buffer.append_n_non_nulls(null_idx);
+            buffer.append_null();
+            buffer.append_n_non_nulls(values.len() - null_idx - 1);
+            // NOTE: The inner builder must be constructed as there is at least one null
+            buffer.finish().unwrap()
+        });
+        PrimitiveArray::<T>::new(values.into(), nulls)
+    }
+
+    fn take_first_block(&mut self, n: usize) -> PrimitiveArray<T> {
+        self.map.clear();
+        let start = self.first_block_emit_offset;
+        let end = (start + n).min(self.values.len());
+        let null_group = self
+            .null_group
+            .filter(|group_idx| (start..end).contains(group_idx))
+            .map(|group_idx| group_idx - start);
+        let array = Self::build_primitive(self.values[start..end].to_vec(), null_group);
+
+        if end == self.values.len() {
+            self.values.clear();
+            self.null_group = None;
+            self.first_block_emit_offset = 0;
+        } else {
+            self.first_block_emit_offset = end;
+        }
+
+        array
     }
 }
 
@@ -137,6 +213,7 @@ where
 {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
         assert_eq!(cols.len(), 1);
+        self.compact_first_block_remainder();
         groups.clear();
 
         for v in cols[0].as_primitive::<T>() {
@@ -182,35 +259,37 @@ where
     }
 
     fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.len() == 0
     }
 
     fn len(&self) -> usize {
-        self.values.len()
+        self.values.len() - self.first_block_emit_offset
     }
 
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        fn build_primitive<T: ArrowPrimitiveType>(
-            values: Vec<T::Native>,
-            null_idx: Option<usize>,
-        ) -> PrimitiveArray<T> {
-            let nulls = null_idx.map(|null_idx| {
-                let mut buffer = NullBufferBuilder::new(values.len());
-                buffer.append_n_non_nulls(null_idx);
-                buffer.append_null();
-                buffer.append_n_non_nulls(values.len() - null_idx - 1);
-                // NOTE: The inner builder must be constructed as there is at least one null
-                buffer.finish().unwrap()
-            });
-            PrimitiveArray::<T>::new(values.into(), nulls)
-        }
-
         let array: PrimitiveArray<T> = match emit_to {
             EmitTo::All => {
                 self.map.clear();
-                build_primitive(std::mem::take(&mut self.values), self.null_group.take())
+                let offset = self.first_block_emit_offset;
+                if offset == 0 {
+                    Self::build_primitive(
+                        std::mem::take(&mut self.values),
+                        self.null_group.take(),
+                    )
+                } else {
+                    let null_group = self
+                        .null_group
+                        .and_then(|group_idx| group_idx.checked_sub(offset));
+                    let array =
+                        Self::build_primitive(self.values[offset..].to_vec(), null_group);
+                    self.values.clear();
+                    self.null_group = None;
+                    self.first_block_emit_offset = 0;
+                    array
+                }
             }
             EmitTo::First(n) => {
+                self.compact_first_block_remainder();
                 self.map.retain(|entry| {
                     // Decrement group index by n
                     let group_idx = entry.0;
@@ -232,8 +311,12 @@ where
                     Some(_) => self.null_group.take(),
                     None => None,
                 };
-                build_primitive(split_vec_min_alloc(&mut self.values, n), null_group)
+                Self::build_primitive(
+                    split_vec_min_alloc(&mut self.values, n),
+                    null_group,
+                )
             }
+            EmitTo::FirstBlock(n) => self.take_first_block(n),
         };
 
         Ok(vec![Arc::new(array.with_data_type(self.data_type.clone()))])
@@ -241,6 +324,8 @@ where
 
     fn clear_shrink(&mut self, num_rows: usize) {
         self.values.clear();
+        self.first_block_emit_offset = 0;
+        self.null_group = None;
         self.values.shrink_to(num_rows);
         self.map.clear();
         self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
@@ -290,6 +375,49 @@ mod tests {
             gv.values.capacity(),
             capacity_before,
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn primitive_group_values_emit_first_block() -> Result<()> {
+        let mut gv = GroupValuesPrimitive::<Int32Type>::new(DataType::Int32);
+        let arr: ArrayRef = Arc::new(Int32Array::from_iter_values(0..6i32));
+        let mut groups = vec![];
+
+        gv.intern(&[arr], &mut groups)?;
+
+        let emitted = gv.emit(EmitTo::FirstBlock(4))?;
+        let emitted = emitted[0].as_primitive::<Int32Type>();
+        assert_eq!(emitted.values(), &[0, 1, 2, 3]);
+
+        let remaining = gv.emit(EmitTo::All)?;
+        let remaining = remaining[0].as_primitive::<Int32Type>();
+        assert_eq!(remaining.values(), &[4, 5]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn primitive_group_values_first_block_does_not_shift_remaining_state() -> Result<()> {
+        let mut gv = GroupValuesPrimitive::<Int32Type>::new(DataType::Int32);
+        let arr: ArrayRef = Arc::new(Int32Array::from_iter_values(0..6i32));
+        let mut groups = vec![];
+
+        gv.intern(&[arr], &mut groups)?;
+        let original_capacity = gv.values.capacity();
+
+        let emitted = gv.emit(EmitTo::FirstBlock(4))?;
+        assert_eq!(emitted[0].len(), 4);
+        assert_eq!(gv.values.len(), 6);
+        assert_eq!(gv.values.capacity(), original_capacity);
+        assert_eq!(gv.len(), 2);
+
+        let remaining = gv.emit(EmitTo::FirstBlock(2))?;
+        let remaining = remaining[0].as_primitive::<Int32Type>();
+        assert_eq!(remaining.values(), &[4, 5]);
+        assert!(gv.is_empty());
+        assert!(gv.values.is_empty());
 
         Ok(())
     }

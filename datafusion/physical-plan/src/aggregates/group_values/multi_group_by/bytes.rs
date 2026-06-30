@@ -53,6 +53,8 @@ where
     offsets: Vec<O>,
     /// Nulls
     nulls: MaybeNullBufferBuilder,
+    /// Materialized values retained while emitting `FirstBlock`s.
+    first_block_values: Option<ArrayRef>,
     /// The maximum size of the buffer for `0`
     max_buffer_size: usize,
 }
@@ -67,12 +69,53 @@ where
             buffer: BufferBuilder::new(INITIAL_BUFFER_CAPACITY),
             offsets: vec![O::default()],
             nulls: MaybeNullBufferBuilder::new(),
+            first_block_values: None,
             max_buffer_size: if O::IS_LARGE {
                 i64::MAX as usize
             } else {
                 i32::MAX as usize
             },
         }
+    }
+
+    fn materialize_first_block_values(&mut self) -> &ArrayRef {
+        if self.first_block_values.is_none() {
+            let null_buffer = self.nulls.slice_n(0, self.len());
+            let offsets = unsafe {
+                OffsetBuffer::new_unchecked(ScalarBuffer::from(self.offsets.clone()))
+            };
+            let values = Buffer::from_slice_ref(self.buffer.as_slice());
+
+            let values: ArrayRef = match self.output_type {
+                OutputType::Binary => {
+                    // SAFETY: the offsets were constructed correctly
+                    Arc::new(unsafe {
+                        GenericBinaryArray::new_unchecked(offsets, values, null_buffer)
+                    }) as ArrayRef
+                }
+                OutputType::Utf8 => {
+                    // SAFETY:
+                    // 1. the offsets were constructed safely
+                    //
+                    // 2. the input arrays were all the correct type and thus since
+                    // all the values that went in were valid (e.g. utf8) so are all
+                    // the values that come out
+                    Arc::new(unsafe {
+                        GenericStringArray::new_unchecked(offsets, values, null_buffer)
+                    }) as ArrayRef
+                }
+                _ => unreachable!("View types should use `ArrowBytesViewMap`"),
+            };
+            self.first_block_values = Some(values);
+        }
+        self.first_block_values.as_ref().unwrap()
+    }
+
+    fn first_block_values_size(&self) -> usize {
+        self.first_block_values
+            .as_ref()
+            .map(|values| values.get_array_memory_size())
+            .unwrap_or_default()
     }
 
     fn equal_to_inner<B>(&self, lhs_row: usize, array: &ArrayRef, rhs_row: usize) -> bool
@@ -245,6 +288,7 @@ where
     }
 
     fn append_val(&mut self, column: &ArrayRef, row: usize) -> Result<()> {
+        self.first_block_values = None;
         // Sanity array type
         match self.output_type {
             OutputType::Binary => {
@@ -305,6 +349,7 @@ where
     }
 
     fn vectorized_append(&mut self, column: &ArrayRef, rows: &[usize]) -> Result<()> {
+        self.first_block_values = None;
         match self.output_type {
             OutputType::Binary => {
                 debug_assert!(matches!(
@@ -334,6 +379,7 @@ where
         self.buffer.capacity() * size_of::<u8>()
             + self.offsets.allocated_size()
             + self.nulls.allocated_size()
+            + self.first_block_values_size()
     }
 
     fn build(self: Box<Self>) -> ArrayRef {
@@ -373,47 +419,13 @@ where
         }
     }
 
-    fn slice_n(&self, offset: usize, n: usize) -> ArrayRef {
+    fn slice_n(&mut self, offset: usize, n: usize) -> ArrayRef {
         debug_assert!(self.len() >= offset + n);
-
-        let null_buffer = self.nulls.slice_n(offset, n);
-        let start_offset = self.offsets[offset];
-        let start = O::as_usize(start_offset);
-        let end = O::as_usize(self.offsets[offset + n]);
-
-        let offsets = self.offsets[offset..=offset + n]
-            .iter()
-            .map(|o| o.sub(start_offset))
-            .collect::<Vec<_>>();
-
-        // SAFETY: the offsets were constructed correctly in `insert_if_new` --
-        // monotonically increasing, overflows were checked.
-        let offsets = unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets)) };
-        let values = Buffer::from_slice_ref(&self.buffer.as_slice()[start..end]);
-
-        match self.output_type {
-            OutputType::Binary => {
-                // SAFETY: the offsets were constructed correctly
-                Arc::new(unsafe {
-                    GenericBinaryArray::new_unchecked(offsets, values, null_buffer)
-                })
-            }
-            OutputType::Utf8 => {
-                // SAFETY:
-                // 1. the offsets were constructed safely
-                //
-                // 2. the input arrays were all the correct type and thus since
-                // all the values that went in were valid (e.g. utf8) so are all
-                // the values that come out
-                Arc::new(unsafe {
-                    GenericStringArray::new_unchecked(offsets, values, null_buffer)
-                })
-            }
-            _ => unreachable!("View types should use `ArrowBytesViewMap`"),
-        }
+        self.materialize_first_block_values().slice(offset, n)
     }
 
     fn take_n(&mut self, n: usize) -> ArrayRef {
+        self.first_block_values = None;
         debug_assert!(self.len() >= n);
         let null_buffer = self.nulls.take_n(n);
         let first_remaining_offset = O::as_usize(self.offsets[n]);

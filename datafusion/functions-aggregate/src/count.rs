@@ -16,7 +16,7 @@
 // under the License.
 
 use arrow::{
-    array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, PrimitiveArray},
+    array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array},
     buffer::BooleanBuffer,
     compute,
     datatypes::{
@@ -625,6 +625,8 @@ struct CountGroupsAccumulator {
     /// for the counts, the output [`Int64Array`] can be created
     /// without copy.
     counts: Vec<i64>,
+    /// Materialized counts retained while emitting `FirstBlock`s.
+    first_block_counts: Option<Int64Array>,
     /// Number of leading groups already emitted by `EmitTo::FirstBlock`.
     first_block_emit_offset: usize,
 }
@@ -633,11 +635,24 @@ impl CountGroupsAccumulator {
     pub fn new() -> Self {
         Self {
             counts: vec![],
+            first_block_counts: None,
             first_block_emit_offset: 0,
         }
     }
 
     fn compact_first_block_remainder(&mut self) {
+        if let Some(counts) = self.first_block_counts.take() {
+            let offset = self.first_block_emit_offset;
+            let remaining_len = counts.len() - offset;
+            self.counts.clear();
+            if remaining_len > 0 {
+                self.counts
+                    .extend_from_slice(&counts.values()[offset..offset + remaining_len]);
+            }
+            self.first_block_emit_offset = 0;
+            return;
+        }
+
         let offset = self.first_block_emit_offset;
         if offset == 0 {
             return;
@@ -651,34 +666,47 @@ impl CountGroupsAccumulator {
         self.first_block_emit_offset = 0;
     }
 
-    fn take_counts(&mut self, emit_to: EmitTo) -> Vec<i64> {
+    fn materialize_first_block_counts(&mut self) -> &Int64Array {
+        self.first_block_counts
+            .get_or_insert_with(|| Int64Array::from(std::mem::take(&mut self.counts)))
+    }
+
+    fn take_counts_array(&mut self, emit_to: EmitTo) -> ArrayRef {
         match emit_to {
-            EmitTo::All => {
-                let offset = self.first_block_emit_offset;
-                if offset == 0 {
-                    std::mem::take(&mut self.counts)
-                } else {
-                    let counts = self.counts[offset..].to_vec();
-                    self.counts.clear();
+            EmitTo::All => match self.first_block_counts.take() {
+                Some(counts) => {
+                    let offset = self.first_block_emit_offset;
+                    let output = counts.slice(offset, counts.len() - offset);
                     self.first_block_emit_offset = 0;
-                    counts
+                    Arc::new(output)
                 }
-            }
-            EmitTo::First(_) => {
+                None => {
+                    self.first_block_emit_offset = 0;
+                    Arc::new(Int64Array::from(std::mem::take(&mut self.counts)))
+                }
+            },
+            EmitTo::First(n) => {
                 self.compact_first_block_remainder();
-                emit_to.take_needed(&mut self.counts)
+                Arc::new(Int64Array::from(
+                    EmitTo::First(n).take_needed(&mut self.counts),
+                ))
             }
             EmitTo::FirstBlock(n) => {
                 let start = self.first_block_emit_offset;
-                let end = (start + n).min(self.counts.len());
-                let counts = self.counts[start..end].to_vec();
-                if end == self.counts.len() {
-                    self.counts.clear();
+                let (output, end, counts_len) = {
+                    let counts = self.materialize_first_block_counts();
+                    let end = (start + n).min(counts.len());
+                    (counts.slice(start, end - start), end, counts.len())
+                };
+
+                if end == counts_len {
+                    self.first_block_counts = None;
                     self.first_block_emit_offset = 0;
                 } else {
                     self.first_block_emit_offset = end;
                 }
-                counts
+
+                Arc::new(output)
             }
         }
     }
@@ -740,20 +768,12 @@ impl GroupsAccumulator for CountGroupsAccumulator {
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        let counts = self.take_counts(emit_to);
-
-        // Count is always non null (null inputs just don't contribute to the overall values)
-        let nulls = None;
-        let array = PrimitiveArray::<Int64Type>::new(counts.into(), nulls);
-
-        Ok(Arc::new(array))
+        Ok(self.take_counts_array(emit_to))
     }
 
     // return arrays for counts
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        let counts = self.take_counts(emit_to);
-        let counts: PrimitiveArray<Int64Type> = Int64Array::from(counts); // zero copy, no nulls
-        Ok(vec![Arc::new(counts) as ArrayRef])
+        Ok(vec![self.take_counts_array(emit_to)])
     }
 
     /// Converts an input batch directly to a state batch
@@ -822,7 +842,12 @@ impl GroupsAccumulator for CountGroupsAccumulator {
     }
 
     fn size(&self) -> usize {
-        self.counts.capacity() * size_of::<usize>()
+        let first_block_counts_size = self
+            .first_block_counts
+            .as_ref()
+            .map(|counts| counts.get_array_memory_size())
+            .unwrap_or_default();
+        self.counts.capacity() * size_of::<i64>() + first_block_counts_size
     }
 }
 
@@ -1008,18 +1033,19 @@ mod tests {
     }
 
     #[test]
-    fn count_groups_first_block_does_not_shift_remaining_state() -> Result<()> {
+    fn count_groups_first_block_materializes_counts_once() -> Result<()> {
         let mut accumulator = CountGroupsAccumulator::new();
         let values: ArrayRef = Arc::new(Int32Array::from_iter_values(0..6));
         let group_indices = vec![0, 1, 2, 3, 4, 5];
 
         accumulator.update_batch(&[values], &group_indices, None, 6)?;
-        let original_capacity = accumulator.counts.capacity();
 
         let emitted = accumulator.evaluate(EmitTo::FirstBlock(4))?;
         assert_eq!(emitted.len(), 4);
-        assert_eq!(accumulator.counts.len(), 6);
-        assert_eq!(accumulator.counts.capacity(), original_capacity);
+        assert!(
+            accumulator.counts.is_empty(),
+            "FirstBlock should materialize COUNT output once instead of keeping the mutable counts vec for repeated chunk copies"
+        );
 
         let remaining = accumulator.evaluate(EmitTo::FirstBlock(2))?;
         let remaining = remaining.as_primitive::<Int64Type>();

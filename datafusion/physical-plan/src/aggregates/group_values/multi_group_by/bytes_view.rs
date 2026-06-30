@@ -71,6 +71,9 @@ pub struct ByteViewGroupValueBuilder<B: ByteViewType> {
     /// Nulls
     nulls: MaybeNullBufferBuilder,
 
+    /// Materialized values retained while emitting `FirstBlock`s.
+    first_block_values: Option<ArrayRef>,
+
     /// phantom data so the type requires `<B>`
     _phantom: PhantomData<B>,
 }
@@ -89,6 +92,7 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
             completed: Vec::new(),
             max_block_size: BYTE_VIEW_MAX_BLOCK_SIZE,
             nulls: MaybeNullBufferBuilder::new(),
+            first_block_values: None,
             _phantom: PhantomData {},
         }
     }
@@ -97,6 +101,38 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
     fn with_max_block_size(mut self, max_block_size: usize) -> Self {
         self.max_block_size = max_block_size;
         self
+    }
+
+    fn materialize_first_block_values(&mut self) -> &ArrayRef {
+        if self.first_block_values.is_none() {
+            let null_buffer = self.nulls.slice_n(0, self.views.len());
+            let views = ScalarBuffer::from(self.views.clone());
+
+            let mut buffers = self.completed.clone();
+            if !self.in_progress.is_empty() {
+                buffers.push(Buffer::from_vec(self.in_progress.clone()));
+            }
+
+            // Safety:
+            // * all views were correctly made
+            // * (if utf8): input was valid Utf8 so buffer contents are valid utf8
+            //   as well
+            self.first_block_values = Some(unsafe {
+                Arc::new(GenericByteViewArray::<B>::new_unchecked(
+                    views,
+                    buffers,
+                    null_buffer,
+                ))
+            });
+        }
+        self.first_block_values.as_ref().unwrap()
+    }
+
+    fn first_block_values_size(&self) -> usize {
+        self.first_block_values
+            .as_ref()
+            .map(|values| values.get_array_memory_size())
+            .unwrap_or_default()
     }
 
     fn equal_to_inner(&self, lhs_row: usize, array: &ArrayRef, rhs_row: usize) -> bool {
@@ -532,6 +568,7 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
     }
 
     fn append_val(&mut self, array: &ArrayRef, row: usize) -> Result<()> {
+        self.first_block_values = None;
         self.append_val_inner(array, row);
         Ok(())
     }
@@ -576,6 +613,7 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
     }
 
     fn vectorized_append(&mut self, array: &ArrayRef, rows: &[usize]) -> Result<()> {
+        self.first_block_values = None;
         self.vectorized_append_inner(array, rows)
     }
 
@@ -594,6 +632,7 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
             + self.views.capacity() * size_of::<u128>()
             + self.in_progress.capacity() * size_of::<u8>()
             + buffers_size
+            + self.first_block_values_size()
             + size_of::<Self>()
     }
 
@@ -601,31 +640,13 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
         Self::build_inner(*self)
     }
 
-    fn slice_n(&self, offset: usize, n: usize) -> ArrayRef {
+    fn slice_n(&mut self, offset: usize, n: usize) -> ArrayRef {
         debug_assert!(self.len() >= offset + n);
-
-        let null_buffer = self.nulls.slice_n(offset, n);
-        let views = ScalarBuffer::from(self.views[offset..offset + n].to_vec());
-
-        let mut buffers = self.completed.clone();
-        if !self.in_progress.is_empty() {
-            buffers.push(Buffer::from_vec(self.in_progress.clone()));
-        }
-
-        // Safety:
-        // * all views were correctly made
-        // * (if utf8): input was valid Utf8 so buffer contents are valid utf8
-        //   as well
-        unsafe {
-            Arc::new(GenericByteViewArray::<B>::new_unchecked(
-                views,
-                buffers,
-                null_buffer,
-            ))
-        }
+        self.materialize_first_block_values().slice(offset, n)
     }
 
     fn take_n(&mut self, n: usize) -> ArrayRef {
+        self.first_block_values = None;
         self.take_n_inner(n)
     }
 }
@@ -1042,5 +1063,28 @@ mod tests {
 
         let taken_array = builder.take_n(3);
         assert_eq!(&taken_array, &input_array.slice(0, 3));
+    }
+
+    #[test]
+    fn byte_view_first_block_slices_share_materialized_views() {
+        let mut builder = ByteViewGroupValueBuilder::<StringViewType>::new();
+        let values: ArrayRef =
+            Arc::new(StringViewArray::from(vec!["a", "b", "c", "d", "e", "f"]));
+        builder
+            .vectorized_append(&values, &[0, 1, 2, 3, 4, 5])
+            .unwrap();
+
+        let first = builder.slice_n(0, 4);
+        let second = builder.slice_n(4, 2);
+        let first = first.as_string_view();
+        let second = second.as_string_view();
+
+        let expected_second_ptr =
+            unsafe { first.views().as_ptr().add(first.views().len()) };
+        assert_eq!(
+            expected_second_ptr,
+            second.views().as_ptr(),
+            "FirstBlock byte-view slices should come from one materialized views buffer"
+        );
     }
 }

@@ -786,6 +786,12 @@ where
     /// Track nulls in the input / filters
     null_state: NullState,
 
+    /// Materialized counts retained while emitting `FirstBlock`s.
+    first_block_counts: Option<UInt64Array>,
+
+    /// Materialized sums retained while emitting `FirstBlock`s.
+    first_block_sums: Option<PrimitiveArray<T>>,
+
     /// Function that computes the final average (value / count)
     avg_fn: F,
 
@@ -810,12 +816,35 @@ where
             counts: vec![],
             sums: vec![],
             null_state: NullState::new(),
+            first_block_counts: None,
+            first_block_sums: None,
             avg_fn,
             first_block_emit_offset: 0,
         }
     }
 
     fn compact_first_block_state(&mut self) {
+        if let (Some(counts), Some(sums)) =
+            (self.first_block_counts.take(), self.first_block_sums.take())
+        {
+            let offset = self.first_block_emit_offset;
+            let remaining_len = sums.len() - offset;
+            self.counts.clear();
+            self.sums.clear();
+            if remaining_len > 0 {
+                let counts = counts.slice(offset, remaining_len);
+                let sums = sums.slice(offset, remaining_len);
+                self.counts.extend_from_slice(counts.values());
+                self.sums.extend_from_slice(sums.values());
+                self.null_state
+                    .reset_from_nulls(remaining_len, sums.nulls());
+            } else {
+                self.null_state.reset_from_nulls(0, None);
+            }
+            self.first_block_emit_offset = 0;
+            return;
+        }
+
         let n = self.first_block_emit_offset;
         if n == 0 {
             return;
@@ -827,39 +856,82 @@ where
         self.first_block_emit_offset = 0;
     }
 
-    fn take_counts_and_sums(&mut self, emit_to: EmitTo) -> (Vec<u64>, Vec<T::Native>) {
+    fn materialize_first_block_state(&mut self) -> (&UInt64Array, &PrimitiveArray<T>) {
+        if self.first_block_counts.is_none() || self.first_block_sums.is_none() {
+            let nulls = self.null_state.build(EmitTo::All);
+            self.first_block_counts = Some(UInt64Array::new(
+                std::mem::take(&mut self.counts).into(),
+                nulls.clone(),
+            ));
+            self.first_block_sums = Some(
+                PrimitiveArray::<T>::new(std::mem::take(&mut self.sums).into(), nulls)
+                    .with_data_type(self.sum_data_type.clone()),
+            );
+        }
+        (
+            self.first_block_counts.as_ref().unwrap(),
+            self.first_block_sums.as_ref().unwrap(),
+        )
+    }
+
+    fn take_counts_and_sums_arrays(
+        &mut self,
+        emit_to: EmitTo,
+    ) -> (UInt64Array, PrimitiveArray<T>) {
         match emit_to {
             EmitTo::All => {
-                if self.first_block_emit_offset == 0 {
-                    (
-                        std::mem::take(&mut self.counts),
-                        std::mem::take(&mut self.sums),
-                    )
-                } else {
-                    let offset = self.first_block_emit_offset;
-                    let counts = self.counts[offset..].to_vec();
-                    let sums = self.sums[offset..].to_vec();
-                    self.counts.clear();
-                    self.sums.clear();
-                    self.first_block_emit_offset = 0;
-                    (counts, sums)
+                match (self.first_block_counts.take(), self.first_block_sums.take()) {
+                    (Some(counts), Some(sums)) => {
+                        let offset = self.first_block_emit_offset;
+                        let counts = counts.slice(offset, counts.len() - offset);
+                        let sums = sums.slice(offset, sums.len() - offset);
+                        self.first_block_emit_offset = 0;
+                        (counts, sums)
+                    }
+                    _ => {
+                        let nulls = self.null_state.build(EmitTo::All);
+                        let counts = UInt64Array::new(
+                            std::mem::take(&mut self.counts).into(),
+                            nulls.clone(),
+                        );
+                        let sums = PrimitiveArray::<T>::new(
+                            std::mem::take(&mut self.sums).into(),
+                            nulls,
+                        )
+                        .with_data_type(self.sum_data_type.clone());
+                        (counts, sums)
+                    }
                 }
             }
             EmitTo::First(n) => {
                 self.compact_first_block_state();
-                (
-                    EmitTo::First(n).take_needed(&mut self.counts),
-                    EmitTo::First(n).take_needed(&mut self.sums),
+                let nulls = self.null_state.build(EmitTo::First(n));
+                let counts = UInt64Array::new(
+                    EmitTo::First(n).take_needed(&mut self.counts).into(),
+                    nulls.clone(),
+                );
+                let sums = PrimitiveArray::<T>::new(
+                    EmitTo::First(n).take_needed(&mut self.sums).into(),
+                    nulls,
                 )
+                .with_data_type(self.sum_data_type.clone());
+                (counts, sums)
             }
             EmitTo::FirstBlock(n) => {
                 let start = self.first_block_emit_offset;
-                let end = start + n;
-                let counts = self.counts[start..end].to_vec();
-                let sums = self.sums[start..end].to_vec();
-                if end == self.sums.len() {
-                    self.counts.clear();
-                    self.sums.clear();
+                let (counts, sums, end, state_len) = {
+                    let (counts, sums) = self.materialize_first_block_state();
+                    let end = start + n;
+                    (
+                        counts.slice(start, n),
+                        sums.slice(start, n),
+                        end,
+                        sums.len(),
+                    )
+                };
+                if end == state_len {
+                    self.first_block_counts = None;
+                    self.first_block_sums = None;
                     self.first_block_emit_offset = 0;
                 } else {
                     self.first_block_emit_offset = end;
@@ -908,8 +980,8 @@ where
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        let (counts, sums) = self.take_counts_and_sums(emit_to);
-        let nulls = self.null_state.build(emit_to);
+        let (counts, sums) = self.take_counts_and_sums_arrays(emit_to);
+        let nulls = sums.nulls().cloned();
 
         if let Some(nulls) = &nulls {
             assert_eq!(nulls.len(), sums.len());
@@ -923,7 +995,12 @@ where
         {
             let mut builder = PrimitiveBuilder::<T>::with_capacity(nulls.len())
                 .with_data_type(self.return_data_type.clone());
-            let iter = sums.into_iter().zip(counts).zip(nulls.iter());
+            let iter = sums
+                .values()
+                .iter()
+                .copied()
+                .zip(counts.values().iter().copied())
+                .zip(nulls.iter());
 
             for ((sum, count), is_valid) in iter {
                 if is_valid {
@@ -935,8 +1012,10 @@ where
             builder.finish()
         } else {
             let averages: Vec<T::Native> = sums
-                .into_iter()
-                .zip(counts)
+                .values()
+                .iter()
+                .copied()
+                .zip(counts.values().iter().copied())
                 .map(|(sum, count)| (self.avg_fn)(sum, count))
                 .collect::<Result<Vec<_>>>()?;
             PrimitiveArray::new(averages.into(), nulls) // no copy
@@ -948,13 +1027,7 @@ where
 
     // return arrays for sums and counts
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        let (counts, sums) = self.take_counts_and_sums(emit_to);
-        let nulls = self.null_state.build(emit_to);
-
-        let counts = UInt64Array::new(counts.into(), nulls.clone()); // zero copy
-
-        let sums = PrimitiveArray::<T>::new(sums.into(), nulls) // zero copy
-            .with_data_type(self.sum_data_type.clone());
+        let (counts, sums) = self.take_counts_and_sums_arrays(emit_to);
 
         Ok(vec![
             Arc::new(counts) as ArrayRef,
@@ -1031,7 +1104,20 @@ where
     }
 
     fn size(&self) -> usize {
-        self.counts.capacity() * size_of::<u64>() + self.sums.capacity() * size_of::<T>()
+        let first_block_counts_size = self
+            .first_block_counts
+            .as_ref()
+            .map(|counts| counts.get_array_memory_size())
+            .unwrap_or_default();
+        let first_block_sums_size = self
+            .first_block_sums
+            .as_ref()
+            .map(|sums| sums.get_array_memory_size())
+            .unwrap_or_default();
+        self.counts.capacity() * size_of::<u64>()
+            + self.sums.capacity() * size_of::<T::Native>()
+            + first_block_counts_size
+            + first_block_sums_size
     }
 }
 
@@ -1041,7 +1127,7 @@ mod tests {
     use arrow::array::Float64Array;
 
     #[test]
-    fn avg_groups_emit_first_block_does_not_shift_state() -> Result<()> {
+    fn avg_groups_emit_first_block_materializes_state_once() -> Result<()> {
         let mut accumulator = AvgGroupsAccumulator::<Float64Type, _>::new(
             &DataType::Float64,
             &DataType::Float64,
@@ -1056,13 +1142,13 @@ mod tests {
         assert_eq!(emitted.values(), &[1.0, 2.0, 3.0]);
         assert_eq!(
             accumulator.sums.len(),
-            6,
-            "FirstBlock should advance a logical cursor without shifting avg sums"
+            0,
+            "FirstBlock should materialize avg sums once instead of keeping the mutable sums vec for repeated chunk copies"
         );
         assert_eq!(
             accumulator.counts.len(),
-            6,
-            "FirstBlock should advance a logical cursor without shifting avg counts"
+            0,
+            "FirstBlock should materialize avg counts once instead of keeping the mutable counts vec for repeated chunk copies"
         );
 
         let remaining = accumulator.evaluate(EmitTo::FirstBlock(3))?;

@@ -149,6 +149,19 @@ impl NullState {
         }
     }
 
+    /// Rebuilds the seen-values state from a materialized output validity bitmap.
+    pub fn reset_from_nulls(&mut self, len: usize, nulls: Option<&NullBuffer>) {
+        self.first_block_emit_offset = 0;
+        self.seen_values = match nulls {
+            None => SeenValues::All { num_values: len },
+            Some(nulls) => {
+                let mut values = BooleanBufferBuilder::new(len);
+                values.append_buffer(nulls.inner());
+                SeenValues::Some { values }
+            }
+        };
+    }
+
     /// Invokes `value_fn(group_index, value)` for each non null, non
     /// filtered value of `value`, while tracking which groups have
     /// seen null inputs and which groups have seen any inputs if necessary

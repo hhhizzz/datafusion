@@ -18,7 +18,7 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, AsArray, BooleanArray, PrimitiveArray};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray};
 use arrow::buffer::NullBuffer;
 use arrow::compute;
 use arrow::datatypes::ArrowPrimitiveType;
@@ -55,6 +55,9 @@ where
     /// Track nulls in the input / filters
     null_state: NullState,
 
+    /// Materialized values retained while emitting `FirstBlock`s.
+    first_block_values: Option<PrimitiveArray<T>>,
+
     /// Function that computes the primitive result
     prim_fn: F,
 
@@ -72,6 +75,7 @@ where
             values: vec![],
             data_type: data_type.clone(),
             null_state: NullState::new(),
+            first_block_values: None,
             starting_value: T::default_value(),
             prim_fn,
             first_block_emit_offset: 0,
@@ -85,6 +89,22 @@ where
     }
 
     fn compact_first_block_state(&mut self) {
+        if let Some(values) = self.first_block_values.take() {
+            let offset = self.first_block_emit_offset;
+            let remaining_len = values.len() - offset;
+            self.values.clear();
+            if remaining_len > 0 {
+                let remaining = values.slice(offset, remaining_len);
+                self.values.extend_from_slice(remaining.values());
+                self.null_state
+                    .reset_from_nulls(remaining.len(), remaining.nulls());
+            } else {
+                self.null_state.reset_from_nulls(0, None);
+            }
+            self.first_block_emit_offset = 0;
+            return;
+        }
+
         let n = self.first_block_emit_offset;
         if n == 0 {
             return;
@@ -95,33 +115,60 @@ where
         self.first_block_emit_offset = 0;
     }
 
-    fn take_values(&mut self, emit_to: EmitTo) -> Vec<T::Native> {
+    fn materialize_first_block_values(&mut self) -> &PrimitiveArray<T> {
+        if self.first_block_values.is_none() {
+            let nulls = self.null_state.build(EmitTo::All);
+            self.first_block_values = Some(
+                PrimitiveArray::<T>::new(std::mem::take(&mut self.values).into(), nulls)
+                    .with_data_type(self.data_type.clone()),
+            );
+        }
+        self.first_block_values.as_ref().unwrap()
+    }
+
+    fn take_array(&mut self, emit_to: EmitTo) -> PrimitiveArray<T> {
         match emit_to {
-            EmitTo::All => {
-                if self.first_block_emit_offset == 0 {
-                    std::mem::take(&mut self.values)
-                } else {
-                    let values = self.values[self.first_block_emit_offset..].to_vec();
-                    self.values.clear();
+            EmitTo::All => match self.first_block_values.take() {
+                Some(values) => {
+                    let offset = self.first_block_emit_offset;
+                    let output = values.slice(offset, values.len() - offset);
                     self.first_block_emit_offset = 0;
-                    values
+                    output
                 }
-            }
+                None => {
+                    let nulls = self.null_state.build(EmitTo::All);
+                    PrimitiveArray::<T>::new(
+                        std::mem::take(&mut self.values).into(),
+                        nulls,
+                    )
+                    .with_data_type(self.data_type.clone())
+                }
+            },
             EmitTo::First(n) => {
                 self.compact_first_block_state();
-                EmitTo::First(n).take_needed(&mut self.values)
+                let nulls = self.null_state.build(EmitTo::First(n));
+                PrimitiveArray::<T>::new(
+                    EmitTo::First(n).take_needed(&mut self.values).into(),
+                    nulls,
+                )
+                .with_data_type(self.data_type.clone())
             }
             EmitTo::FirstBlock(n) => {
                 let start = self.first_block_emit_offset;
-                let end = start + n;
-                let values = self.values[start..end].to_vec();
-                if end == self.values.len() {
-                    self.values.clear();
+                let (output, end, values_len) = {
+                    let values = self.materialize_first_block_values();
+                    let end = start + n;
+                    (values.slice(start, n), end, values.len())
+                };
+
+                if end == values_len {
+                    self.first_block_values = None;
                     self.first_block_emit_offset = 0;
                 } else {
                     self.first_block_emit_offset = end;
                 }
-                values
+
+                output
             }
         }
     }
@@ -164,11 +211,7 @@ where
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        let values = self.take_values(emit_to);
-        let nulls = self.null_state.build(emit_to);
-        let values = PrimitiveArray::<T>::new(values.into(), nulls) // no copy
-            .with_data_type(self.data_type.clone());
-        Ok(Arc::new(values))
+        Ok(Arc::new(self.take_array(emit_to)))
     }
 
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
@@ -243,7 +286,14 @@ where
     }
 
     fn size(&self) -> usize {
-        self.values.capacity() * size_of::<T::Native>() + self.null_state.size()
+        let first_block_values_size = self
+            .first_block_values
+            .as_ref()
+            .map(|values| values.get_array_memory_size())
+            .unwrap_or_default();
+        self.values.capacity() * size_of::<T::Native>()
+            + self.null_state.size()
+            + first_block_values_size
     }
 }
 
@@ -254,7 +304,7 @@ mod tests {
     use arrow::datatypes::Int64Type;
 
     #[test]
-    fn primitive_groups_emit_first_block_does_not_shift_state() -> Result<()> {
+    fn primitive_groups_emit_first_block_materializes_values_once() -> Result<()> {
         let mut accumulator = PrimitiveGroupsAccumulator::<Int64Type, _>::new(
             &DataType::Int64,
             |current, new| *current += new,
@@ -267,8 +317,8 @@ mod tests {
         assert_eq!(emitted.values(), &[1, 2, 3]);
         assert_eq!(
             accumulator.values.len(),
-            6,
-            "FirstBlock should advance a logical cursor without shifting primitive state"
+            0,
+            "FirstBlock should materialize primitive state once instead of keeping the mutable values vec for repeated chunk copies"
         );
 
         let remaining = accumulator.evaluate(EmitTo::FirstBlock(3))?;

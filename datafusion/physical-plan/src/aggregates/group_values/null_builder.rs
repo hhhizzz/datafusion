@@ -90,6 +90,17 @@ impl MaybeNullBufferBuilder {
         new_builder.finish()
     }
 
+    /// Returns a NullBuffer representing `n` rows starting at `offset`.
+    pub fn slice_n(&self, offset: usize, n: usize) -> Option<NullBuffer> {
+        self.nulls.as_slice()?;
+
+        let mut builder = NullBufferBuilder::new(n);
+        for i in offset..offset + n {
+            builder.append(self.nulls.is_valid(i));
+        }
+        builder.finish()
+    }
+
     /// Returns true if this builder might have any nulls
     ///
     /// This is guaranteed to be true if there are nulls

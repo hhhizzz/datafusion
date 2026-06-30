@@ -177,6 +177,20 @@ impl<const NULLABLE: bool> GroupColumn for BooleanGroupValueBuilder<NULLABLE> {
         Arc::new(arr)
     }
 
+    fn slice_n(&self, offset: usize, n: usize) -> ArrayRef {
+        debug_assert!(self.len() >= offset + n);
+        let nulls = if NULLABLE {
+            self.nulls.slice_n(offset, n)
+        } else {
+            None
+        };
+
+        let mut builder = BooleanBufferBuilder::new(n);
+        builder.append_packed_range(offset..offset + n, self.buffer.as_slice());
+
+        Arc::new(BooleanArray::new(builder.finish(), nulls))
+    }
+
     fn take_n(&mut self, n: usize) -> ArrayRef {
         let first_n_nulls = if NULLABLE { self.nulls.take_n(n) } else { None };
 

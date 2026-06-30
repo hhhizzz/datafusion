@@ -23,7 +23,7 @@ use arrow::array::{
     Array, ArrayRef, AsArray, BooleanBufferBuilder, BufferBuilder, GenericBinaryArray,
     GenericByteArray, GenericStringArray, OffsetSizeTrait, types::GenericStringType,
 };
-use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{ByteArrayType, DataType, GenericBinaryType};
 use datafusion_common::utils::proxy::VecAllocExt;
 use datafusion_common::utils::split_vec_min_alloc;
@@ -352,6 +352,46 @@ where
         let offsets = unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets)) };
         let values = buffer.finish();
         match output_type {
+            OutputType::Binary => {
+                // SAFETY: the offsets were constructed correctly
+                Arc::new(unsafe {
+                    GenericBinaryArray::new_unchecked(offsets, values, null_buffer)
+                })
+            }
+            OutputType::Utf8 => {
+                // SAFETY:
+                // 1. the offsets were constructed safely
+                //
+                // 2. the input arrays were all the correct type and thus since
+                // all the values that went in were valid (e.g. utf8) so are all
+                // the values that come out
+                Arc::new(unsafe {
+                    GenericStringArray::new_unchecked(offsets, values, null_buffer)
+                })
+            }
+            _ => unreachable!("View types should use `ArrowBytesViewMap`"),
+        }
+    }
+
+    fn slice_n(&self, offset: usize, n: usize) -> ArrayRef {
+        debug_assert!(self.len() >= offset + n);
+
+        let null_buffer = self.nulls.slice_n(offset, n);
+        let start_offset = self.offsets[offset];
+        let start = O::as_usize(start_offset);
+        let end = O::as_usize(self.offsets[offset + n]);
+
+        let offsets = self.offsets[offset..=offset + n]
+            .iter()
+            .map(|o| o.sub(start_offset))
+            .collect::<Vec<_>>();
+
+        // SAFETY: the offsets were constructed correctly in `insert_if_new` --
+        // monotonically increasing, overflows were checked.
+        let offsets = unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets)) };
+        let values = Buffer::from_slice_ref(&self.buffer.as_slice()[start..end]);
+
+        match self.output_type {
             OutputType::Binary => {
                 // SAFETY: the offsets were constructed correctly
                 Arc::new(unsafe {

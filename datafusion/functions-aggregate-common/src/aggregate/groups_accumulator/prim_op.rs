@@ -57,6 +57,9 @@ where
 
     /// Function that computes the primitive result
     prim_fn: F,
+
+    /// Number of leading groups already emitted by `EmitTo::FirstBlock`.
+    first_block_emit_offset: usize,
 }
 
 impl<T, F> PrimitiveGroupsAccumulator<T, F>
@@ -71,6 +74,7 @@ where
             null_state: NullState::new(),
             starting_value: T::default_value(),
             prim_fn,
+            first_block_emit_offset: 0,
         }
     }
 
@@ -78,6 +82,48 @@ where
     pub fn with_starting_value(mut self, starting_value: T::Native) -> Self {
         self.starting_value = starting_value;
         self
+    }
+
+    fn compact_first_block_state(&mut self) {
+        let n = self.first_block_emit_offset;
+        if n == 0 {
+            return;
+        }
+
+        let _ = EmitTo::First(n).take_needed(&mut self.values);
+        self.null_state.compact_first_block_state();
+        self.first_block_emit_offset = 0;
+    }
+
+    fn take_values(&mut self, emit_to: EmitTo) -> Vec<T::Native> {
+        match emit_to {
+            EmitTo::All => {
+                if self.first_block_emit_offset == 0 {
+                    std::mem::take(&mut self.values)
+                } else {
+                    let values = self.values[self.first_block_emit_offset..].to_vec();
+                    self.values.clear();
+                    self.first_block_emit_offset = 0;
+                    values
+                }
+            }
+            EmitTo::First(n) => {
+                self.compact_first_block_state();
+                EmitTo::First(n).take_needed(&mut self.values)
+            }
+            EmitTo::FirstBlock(n) => {
+                let start = self.first_block_emit_offset;
+                let end = start + n;
+                let values = self.values[start..end].to_vec();
+                if end == self.values.len() {
+                    self.values.clear();
+                    self.first_block_emit_offset = 0;
+                } else {
+                    self.first_block_emit_offset = end;
+                }
+                values
+            }
+        }
     }
 }
 
@@ -95,6 +141,8 @@ where
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "single argument to update_batch");
         let values = values[0].as_primitive::<T>();
+
+        self.compact_first_block_state();
 
         // update values
         self.values.resize(total_num_groups, self.starting_value);
@@ -116,7 +164,7 @@ where
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        let values = emit_to.take_needed(&mut self.values);
+        let values = self.take_values(emit_to);
         let nulls = self.null_state.build(emit_to);
         let values = PrimitiveArray::<T>::new(values.into(), nulls) // no copy
             .with_data_type(self.data_type.clone());
@@ -196,5 +244,73 @@ where
 
     fn size(&self) -> usize {
         self.values.capacity() * size_of::<T::Native>() + self.null_state.size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::Int64Type;
+
+    #[test]
+    fn primitive_groups_emit_first_block_does_not_shift_state() -> Result<()> {
+        let mut accumulator = PrimitiveGroupsAccumulator::<Int64Type, _>::new(
+            &DataType::Int64,
+            |current, new| *current += new,
+        );
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6]));
+        accumulator.update_batch(&[values], &[0, 1, 2, 3, 4, 5], None, 6)?;
+
+        let emitted = accumulator.evaluate(EmitTo::FirstBlock(3))?;
+        let emitted = emitted.as_primitive::<Int64Type>();
+        assert_eq!(emitted.values(), &[1, 2, 3]);
+        assert_eq!(
+            accumulator.values.len(),
+            6,
+            "FirstBlock should advance a logical cursor without shifting primitive state"
+        );
+
+        let remaining = accumulator.evaluate(EmitTo::FirstBlock(3))?;
+        let remaining = remaining.as_primitive::<Int64Type>();
+        assert_eq!(remaining.values(), &[4, 5, 6]);
+        assert!(accumulator.values.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn primitive_groups_first_block_compacts_before_update() -> Result<()> {
+        let mut accumulator = PrimitiveGroupsAccumulator::<Int64Type, _>::new(
+            &DataType::Int64,
+            |current, new| *current += new,
+        );
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            None,
+            Some(6),
+        ]));
+        accumulator.update_batch(&[values], &[0, 1, 2, 3, 4, 5], None, 6)?;
+
+        let emitted = accumulator.evaluate(EmitTo::FirstBlock(3))?;
+        let emitted = emitted.as_primitive::<Int64Type>();
+        assert_eq!(emitted.values(), &[1, 2, 3]);
+
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 5, 20]));
+        accumulator.update_batch(&[values], &[0, 1, 3], None, 4)?;
+
+        let emitted = accumulator.evaluate(EmitTo::All)?;
+        assert_eq!(
+            emitted
+                .as_primitive::<Int64Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(14), Some(5), Some(6), Some(20)]
+        );
+
+        Ok(())
     }
 }

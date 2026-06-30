@@ -122,6 +122,9 @@ pub struct NullState {
     ///
     /// If `seen_values` is `SeenValues::All`, all groups have seen at least one non null value
     seen_values: SeenValues,
+
+    /// Number of leading groups already emitted by `EmitTo::FirstBlock`.
+    first_block_emit_offset: usize,
 }
 
 impl Default for NullState {
@@ -134,6 +137,7 @@ impl NullState {
     pub fn new() -> Self {
         Self {
             seen_values: SeenValues::All { num_values: 0 },
+            first_block_emit_offset: 0,
         }
     }
 
@@ -296,37 +300,104 @@ impl NullState {
     /// resets the internal state appropriately
     pub fn build(&mut self, emit_to: EmitTo) -> Option<NullBuffer> {
         match emit_to {
-            EmitTo::All => {
-                let old_seen = std::mem::take(&mut self.seen_values);
-                match old_seen {
-                    SeenValues::All { .. } => None,
-                    SeenValues::Some { mut values } => {
-                        Some(NullBuffer::new(values.finish()))
-                    }
+            EmitTo::All => self.build_all(),
+            EmitTo::First(n) => {
+                self.compact_first_block_state();
+                self.build_first(n)
+            }
+            EmitTo::FirstBlock(n) => self.build_first_block(n),
+        }
+    }
+
+    /// Physically drops any groups already emitted by `EmitTo::FirstBlock`.
+    pub fn compact_first_block_state(&mut self) {
+        let n = self.first_block_emit_offset;
+        if n == 0 {
+            return;
+        }
+
+        match &mut self.seen_values {
+            SeenValues::All { num_values } => {
+                *num_values = num_values.saturating_sub(n);
+            }
+            SeenValues::Some { values } => {
+                let mut new_builder = BooleanBufferBuilder::new(values.len() - n);
+                new_builder.append_packed_range(n..values.len(), values.as_slice());
+                *values = new_builder;
+            }
+        }
+        self.first_block_emit_offset = 0;
+    }
+
+    fn build_all(&mut self) -> Option<NullBuffer> {
+        let offset = self.first_block_emit_offset;
+        self.first_block_emit_offset = 0;
+
+        let old_seen = std::mem::take(&mut self.seen_values);
+        match old_seen {
+            SeenValues::All { .. } => None,
+            SeenValues::Some { mut values } => {
+                if offset == 0 {
+                    Some(NullBuffer::new(values.finish()))
+                } else {
+                    let mut builder = BooleanBufferBuilder::new(values.len() - offset);
+                    builder.append_packed_range(offset..values.len(), values.as_slice());
+                    Some(NullBuffer::new(builder.finish()))
                 }
             }
-            EmitTo::First(n) => match &mut self.seen_values {
-                SeenValues::All { num_values } => {
-                    *num_values = num_values.saturating_sub(n);
-                    None
-                }
-                SeenValues::Some { .. } => {
-                    let mut old_values = match std::mem::take(&mut self.seen_values) {
-                        SeenValues::Some { values } => values,
-                        _ => unreachable!(),
-                    };
-                    let nulls = old_values.finish();
-                    let first_n_null = nulls.slice(0, n);
-                    let remainder = nulls.slice(n, nulls.len() - n);
-                    let mut new_builder = BooleanBufferBuilder::new(remainder.len());
-                    new_builder.append_buffer(&remainder);
-                    self.seen_values = SeenValues::Some {
-                        values: new_builder,
-                    };
-                    Some(NullBuffer::new(first_n_null))
-                }
-            },
         }
+    }
+
+    fn build_first(&mut self, n: usize) -> Option<NullBuffer> {
+        match &mut self.seen_values {
+            SeenValues::All { num_values } => {
+                *num_values = num_values.saturating_sub(n);
+                None
+            }
+            SeenValues::Some { .. } => {
+                let mut old_values = match std::mem::take(&mut self.seen_values) {
+                    SeenValues::Some { values } => values,
+                    _ => unreachable!(),
+                };
+                let nulls = old_values.finish();
+                let first_n_null = nulls.slice(0, n);
+                let remainder = nulls.slice(n, nulls.len() - n);
+                let mut new_builder = BooleanBufferBuilder::new(remainder.len());
+                new_builder.append_buffer(&remainder);
+                self.seen_values = SeenValues::Some {
+                    values: new_builder,
+                };
+                Some(NullBuffer::new(first_n_null))
+            }
+        }
+    }
+
+    fn build_first_block(&mut self, n: usize) -> Option<NullBuffer> {
+        let offset = self.first_block_emit_offset;
+        let end = offset + n;
+        let reset;
+
+        let nulls = match &mut self.seen_values {
+            SeenValues::All { num_values } => {
+                reset = end == *num_values;
+                None
+            }
+            SeenValues::Some { values } => {
+                let mut builder = BooleanBufferBuilder::new(n);
+                builder.append_packed_range(offset..end, values.as_slice());
+                reset = end == values.len();
+                Some(NullBuffer::new(builder.finish()))
+            }
+        };
+
+        if reset {
+            self.seen_values = SeenValues::All { num_values: 0 };
+            self.first_block_emit_offset = 0;
+        } else {
+            self.first_block_emit_offset = end;
+        }
+
+        nulls
     }
 }
 

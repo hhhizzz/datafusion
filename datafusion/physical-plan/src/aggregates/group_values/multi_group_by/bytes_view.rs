@@ -601,6 +601,30 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
         Self::build_inner(*self)
     }
 
+    fn slice_n(&self, offset: usize, n: usize) -> ArrayRef {
+        debug_assert!(self.len() >= offset + n);
+
+        let null_buffer = self.nulls.slice_n(offset, n);
+        let views = ScalarBuffer::from(self.views[offset..offset + n].to_vec());
+
+        let mut buffers = self.completed.clone();
+        if !self.in_progress.is_empty() {
+            buffers.push(Buffer::from_vec(self.in_progress.clone()));
+        }
+
+        // Safety:
+        // * all views were correctly made
+        // * (if utf8): input was valid Utf8 so buffer contents are valid utf8
+        //   as well
+        unsafe {
+            Arc::new(GenericByteViewArray::<B>::new_unchecked(
+                views,
+                buffers,
+                null_buffer,
+            ))
+        }
+    }
+
     fn take_n(&mut self, n: usize) -> ArrayRef {
         self.take_n_inner(n)
     }

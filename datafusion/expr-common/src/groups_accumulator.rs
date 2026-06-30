@@ -31,6 +31,13 @@ pub enum EmitTo {
     /// For example, if `n=10`, group_index `0, 1, ... 9` are emitted
     /// and group indexes `10, 11, 12, ...` become `0, 1, 2, ...`.
     First(usize),
+    /// Emit one complete block of groups.
+    ///
+    /// This prototype variant currently falls back to the same semantics as
+    /// [`EmitTo::First`] for implementations that do not have block-aligned
+    /// storage. Block-aware implementations can use it to avoid arbitrary
+    /// prefix shifting.
+    FirstBlock(usize),
 }
 
 impl EmitTo {
@@ -45,7 +52,7 @@ impl EmitTo {
                 // Take the entire vector, leave new (empty) vector
                 std::mem::take(v)
             }
-            Self::First(n) => split_vec_min_alloc(v, *n),
+            Self::First(n) | Self::FirstBlock(n) => split_vec_min_alloc(v, *n),
         }
     }
 }
@@ -152,6 +159,13 @@ pub trait GroupsAccumulator: Send + std::any::Any {
     /// future use. The group_indices on subsequent calls to
     /// `update_batch` or `merge_batch` will be shifted down by
     /// `n`. See [`EmitTo::First`] for more details.
+    ///
+    /// If `emit_to` is [`EmitTo::FirstBlock`], the same first `n`
+    /// groups should be emitted. Implementations may keep block-aligned
+    /// storage and an internal cursor instead of immediately shifting the
+    /// remaining state down, as long as future emits preserve group-index
+    /// order. If a later update or merge happens, the retained state must
+    /// be compacted back to continuous group indexes first.
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef>;
 
     /// Returns the intermediate aggregate state for this accumulator,

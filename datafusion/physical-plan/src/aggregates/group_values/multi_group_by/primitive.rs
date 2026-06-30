@@ -276,6 +276,21 @@ where
         Arc::new(arr.with_data_type(data_type))
     }
 
+    fn slice_n(&self, offset: usize, n: usize) -> ArrayRef {
+        debug_assert!(self.len() >= offset + n);
+        let values = self.group_values[offset..offset + n].to_vec();
+        let nulls = if NULLABLE {
+            self.nulls.slice_n(offset, n)
+        } else {
+            None
+        };
+
+        Arc::new(
+            PrimitiveArray::<T>::new(ScalarBuffer::from(values), nulls)
+                .with_data_type(self.data_type.clone()),
+        )
+    }
+
     fn take_n(&mut self, n: usize) -> ArrayRef {
         let first_n = split_vec_min_alloc(&mut self.group_values, n);
         let first_n_nulls = if NULLABLE { self.nulls.take_n(n) } else { None };

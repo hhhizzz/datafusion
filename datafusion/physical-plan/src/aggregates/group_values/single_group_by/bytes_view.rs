@@ -17,6 +17,7 @@
 
 use crate::aggregates::group_values::GroupValues;
 use arrow::array::{Array, ArrayRef};
+use datafusion_common::Result;
 use datafusion_expr::EmitTo;
 use datafusion_physical_expr::binary_map::OutputType;
 use datafusion_physical_expr_common::binary_view_map::ArrowBytesViewMap;
@@ -31,6 +32,10 @@ pub struct GroupValuesBytesView {
     map: ArrowBytesViewMap<usize>,
     /// The total number of groups so far (used to assign group_index)
     num_groups: usize,
+    /// Materialized group values retained while emitting `FirstBlock`s.
+    first_block_values: Option<ArrayRef>,
+    /// Number of leading groups already emitted by `EmitTo::FirstBlock`.
+    first_block_emit_offset: usize,
 }
 
 impl GroupValuesBytesView {
@@ -38,17 +43,47 @@ impl GroupValuesBytesView {
         Self {
             map: ArrowBytesViewMap::new(output_type),
             num_groups: 0,
+            first_block_values: None,
+            first_block_emit_offset: 0,
         }
+    }
+
+    fn compact_first_block_state(&mut self) -> Result<()> {
+        let Some(values) = self.first_block_values.take() else {
+            return Ok(());
+        };
+
+        let offset = self.first_block_emit_offset;
+        let remaining_len = values.len() - offset;
+        self.map.take();
+        self.num_groups = 0;
+        self.first_block_emit_offset = 0;
+
+        if remaining_len > 0 {
+            let remaining_values = values.slice(offset, remaining_len);
+            let mut group_indexes = vec![];
+            self.intern(&[remaining_values], &mut group_indexes)?;
+
+            // Verify that the group indexes were assigned in the correct order
+            assert_eq!(0, group_indexes[0]);
+        }
+
+        Ok(())
+    }
+
+    fn first_block_values_size(&self) -> usize {
+        self.first_block_values
+            .as_ref()
+            .map(|values| values.get_array_memory_size())
+            .unwrap_or_default()
     }
 }
 
 impl GroupValues for GroupValuesBytesView {
-    fn intern(
-        &mut self,
-        cols: &[ArrayRef],
-        groups: &mut Vec<usize>,
-    ) -> datafusion_common::Result<()> {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
         assert_eq!(cols.len(), 1);
+
+        self.compact_first_block_state()?;
 
         // look up / add entries in the table
         let arr = &cols[0];
@@ -75,31 +110,42 @@ impl GroupValues for GroupValuesBytesView {
     }
 
     fn size(&self) -> usize {
-        self.map.size() + size_of::<Self>()
+        self.map.size() + self.first_block_values_size() + size_of::<Self>()
     }
 
     fn is_empty(&self) -> bool {
-        self.num_groups == 0
+        self.len() == 0
     }
 
     fn len(&self) -> usize {
-        self.num_groups
+        self.num_groups - self.first_block_emit_offset
     }
 
-    fn emit(&mut self, emit_to: EmitTo) -> datafusion_common::Result<Vec<ArrayRef>> {
-        // Reset the map to default, and convert it into a single array
-        let map_contents = self.map.take().into_state();
-
+    fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         let group_values = match emit_to {
             EmitTo::All => {
-                self.num_groups -= map_contents.len();
-                map_contents
+                if let Some(values) = self.first_block_values.take() {
+                    let values = values.slice(self.first_block_emit_offset, self.len());
+                    self.num_groups = 0;
+                    self.first_block_emit_offset = 0;
+                    values
+                } else {
+                    // Reset the map to default, and convert it into a single array
+                    let map_contents = self.map.take().into_state();
+                    self.num_groups -= map_contents.len();
+                    map_contents
+                }
             }
             EmitTo::First(n) if n == self.len() => {
+                self.compact_first_block_state()?;
+                let map_contents = self.map.take().into_state();
                 self.num_groups -= map_contents.len();
                 map_contents
             }
             EmitTo::First(n) => {
+                self.compact_first_block_state()?;
+                // Reset the map to default, and convert it into a single array
+                let map_contents = self.map.take().into_state();
                 // if we only wanted to take the first n, insert the rest back
                 // into the map we could potentially avoid this reallocation, at
                 // the expense of much more complex code.
@@ -117,6 +163,24 @@ impl GroupValues for GroupValuesBytesView {
 
                 emit_group_values
             }
+            EmitTo::FirstBlock(n) => {
+                if self.first_block_values.is_none() {
+                    let map_contents = self.map.take().into_state();
+                    self.first_block_values = Some(map_contents);
+                }
+
+                let values = self.first_block_values.as_ref().unwrap();
+                let emit_group_values = values.slice(self.first_block_emit_offset, n);
+                self.first_block_emit_offset += n;
+
+                if self.first_block_emit_offset == self.num_groups {
+                    self.first_block_values = None;
+                    self.first_block_emit_offset = 0;
+                    self.num_groups = 0;
+                }
+
+                emit_group_values
+            }
         };
 
         Ok(vec![group_values])
@@ -126,5 +190,61 @@ impl GroupValues for GroupValuesBytesView {
         // in theory we could potentially avoid this reallocation and clear the
         // contents of the maps, but for now we just reset the map from the beginning
         self.map.take();
+        self.num_groups = 0;
+        self.first_block_values = None;
+        self.first_block_emit_offset = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{AsArray, StringViewArray};
+    use std::sync::Arc;
+
+    #[test]
+    fn bytes_view_group_values_first_block_does_not_rebuild_remaining_state() {
+        let mut group_values = GroupValuesBytesView::new(OutputType::Utf8View);
+        let values: ArrayRef =
+            Arc::new(StringViewArray::from(vec!["a", "b", "c", "d", "e", "f"]));
+        group_values.intern(&[values], &mut vec![]).unwrap();
+
+        let emitted = group_values.emit(EmitTo::FirstBlock(3)).unwrap();
+        assert_eq!(emitted[0].as_string_view().value(0), "a");
+        assert_eq!(emitted[0].as_string_view().value(2), "c");
+        assert_eq!(group_values.len(), 3);
+        assert_eq!(
+            group_values.num_groups, 6,
+            "FirstBlock should advance a logical cursor without rebuilding bytes view state"
+        );
+
+        let remaining = group_values.emit(EmitTo::FirstBlock(3)).unwrap();
+        assert_eq!(remaining[0].as_string_view().value(0), "d");
+        assert_eq!(remaining[0].as_string_view().value(2), "f");
+        assert!(group_values.is_empty());
+    }
+
+    #[test]
+    fn bytes_view_group_values_compacts_before_intern_after_first_block() {
+        let mut group_values = GroupValuesBytesView::new(OutputType::Utf8View);
+        let values: ArrayRef = Arc::new(StringViewArray::from(vec!["a", "b", "c", "d"]));
+        group_values.intern(&[values], &mut vec![]).unwrap();
+
+        let emitted = group_values.emit(EmitTo::FirstBlock(2)).unwrap();
+        assert_eq!(emitted[0].as_string_view().value(0), "a");
+        assert_eq!(emitted[0].as_string_view().value(1), "b");
+
+        let values: ArrayRef = Arc::new(StringViewArray::from(vec!["c", "e"]));
+        let mut groups = vec![];
+        group_values.intern(&[values], &mut groups).unwrap();
+        assert_eq!(groups, vec![0, 2]);
+
+        let emitted = group_values.emit(EmitTo::All).unwrap();
+        let values = emitted[0].as_string_view();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.value(0), "c");
+        assert_eq!(values.value(1), "d");
+        assert_eq!(values.value(2), "e");
+        assert!(group_values.is_empty());
     }
 }

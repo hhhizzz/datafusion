@@ -788,6 +788,9 @@ where
 
     /// Function that computes the final average (value / count)
     avg_fn: F,
+
+    /// Number of leading groups already emitted by `EmitTo::FirstBlock`.
+    first_block_emit_offset: usize,
 }
 
 impl<T, F> AvgGroupsAccumulator<T, F>
@@ -808,6 +811,61 @@ where
             sums: vec![],
             null_state: NullState::new(),
             avg_fn,
+            first_block_emit_offset: 0,
+        }
+    }
+
+    fn compact_first_block_state(&mut self) {
+        let n = self.first_block_emit_offset;
+        if n == 0 {
+            return;
+        }
+
+        let _ = EmitTo::First(n).take_needed(&mut self.counts);
+        let _ = EmitTo::First(n).take_needed(&mut self.sums);
+        self.null_state.compact_first_block_state();
+        self.first_block_emit_offset = 0;
+    }
+
+    fn take_counts_and_sums(&mut self, emit_to: EmitTo) -> (Vec<u64>, Vec<T::Native>) {
+        match emit_to {
+            EmitTo::All => {
+                if self.first_block_emit_offset == 0 {
+                    (
+                        std::mem::take(&mut self.counts),
+                        std::mem::take(&mut self.sums),
+                    )
+                } else {
+                    let offset = self.first_block_emit_offset;
+                    let counts = self.counts[offset..].to_vec();
+                    let sums = self.sums[offset..].to_vec();
+                    self.counts.clear();
+                    self.sums.clear();
+                    self.first_block_emit_offset = 0;
+                    (counts, sums)
+                }
+            }
+            EmitTo::First(n) => {
+                self.compact_first_block_state();
+                (
+                    EmitTo::First(n).take_needed(&mut self.counts),
+                    EmitTo::First(n).take_needed(&mut self.sums),
+                )
+            }
+            EmitTo::FirstBlock(n) => {
+                let start = self.first_block_emit_offset;
+                let end = start + n;
+                let counts = self.counts[start..end].to_vec();
+                let sums = self.sums[start..end].to_vec();
+                if end == self.sums.len() {
+                    self.counts.clear();
+                    self.sums.clear();
+                    self.first_block_emit_offset = 0;
+                } else {
+                    self.first_block_emit_offset = end;
+                }
+                (counts, sums)
+            }
         }
     }
 }
@@ -826,6 +884,8 @@ where
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "single argument to update_batch");
         let values = values[0].as_primitive::<T>();
+
+        self.compact_first_block_state();
 
         // increment counts, update sums
         self.counts.resize(total_num_groups, 0);
@@ -848,8 +908,7 @@ where
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        let counts = emit_to.take_needed(&mut self.counts);
-        let sums = emit_to.take_needed(&mut self.sums);
+        let (counts, sums) = self.take_counts_and_sums(emit_to);
         let nulls = self.null_state.build(emit_to);
 
         if let Some(nulls) = &nulls {
@@ -889,12 +948,11 @@ where
 
     // return arrays for sums and counts
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        let (counts, sums) = self.take_counts_and_sums(emit_to);
         let nulls = self.null_state.build(emit_to);
 
-        let counts = emit_to.take_needed(&mut self.counts);
         let counts = UInt64Array::new(counts.into(), nulls.clone()); // zero copy
 
-        let sums = emit_to.take_needed(&mut self.sums);
         let sums = PrimitiveArray::<T>::new(sums.into(), nulls) // zero copy
             .with_data_type(self.sum_data_type.clone());
 
@@ -914,6 +972,9 @@ where
         // first batch is counts, second is partial sums
         let partial_counts = values[0].as_primitive::<UInt64Type>();
         let partial_sums = values[1].as_primitive::<T>();
+
+        self.compact_first_block_state();
+
         // update counts with partial counts
         self.counts.resize(total_num_groups, 0);
         self.null_state.accumulate(
@@ -971,5 +1032,86 @@ where
 
     fn size(&self) -> usize {
         self.counts.capacity() * size_of::<u64>() + self.sums.capacity() * size_of::<T>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Float64Array;
+
+    #[test]
+    fn avg_groups_emit_first_block_does_not_shift_state() -> Result<()> {
+        let mut accumulator = AvgGroupsAccumulator::<Float64Type, _>::new(
+            &DataType::Float64,
+            &DataType::Float64,
+            |sum, count| Ok(sum / count as f64),
+        );
+        let values: ArrayRef =
+            Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        accumulator.update_batch(&[values], &[0, 1, 2, 3, 4, 5], None, 6)?;
+
+        let emitted = accumulator.evaluate(EmitTo::FirstBlock(3))?;
+        let emitted = emitted.as_primitive::<Float64Type>();
+        assert_eq!(emitted.values(), &[1.0, 2.0, 3.0]);
+        assert_eq!(
+            accumulator.sums.len(),
+            6,
+            "FirstBlock should advance a logical cursor without shifting avg sums"
+        );
+        assert_eq!(
+            accumulator.counts.len(),
+            6,
+            "FirstBlock should advance a logical cursor without shifting avg counts"
+        );
+
+        let remaining = accumulator.evaluate(EmitTo::FirstBlock(3))?;
+        let remaining = remaining.as_primitive::<Float64Type>();
+        assert_eq!(remaining.values(), &[4.0, 5.0, 6.0]);
+        assert!(accumulator.sums.is_empty());
+        assert!(accumulator.counts.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn avg_groups_first_block_compacts_before_update() -> Result<()> {
+        let mut accumulator = AvgGroupsAccumulator::<Float64Type, _>::new(
+            &DataType::Float64,
+            &DataType::Float64,
+            |sum, count| Ok(sum / count as f64),
+        );
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            Some(2.0),
+            Some(3.0),
+            Some(4.0),
+            None,
+            Some(6.0),
+        ]));
+        accumulator.update_batch(&[values], &[0, 1, 2, 3, 4, 5], None, 6)?;
+
+        let emitted = accumulator.evaluate(EmitTo::FirstBlock(3))?;
+        assert_eq!(
+            emitted
+                .as_primitive::<Float64Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(1.0), Some(2.0), Some(3.0)]
+        );
+
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![10.0, 5.0, 20.0]));
+        accumulator.update_batch(&[values], &[0, 1, 3], None, 4)?;
+
+        let emitted = accumulator.evaluate(EmitTo::All)?;
+        assert_eq!(
+            emitted
+                .as_primitive::<Float64Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(7.0), Some(5.0), Some(6.0), Some(20.0)]
+        );
+
+        Ok(())
     }
 }

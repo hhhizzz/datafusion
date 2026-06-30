@@ -219,7 +219,7 @@ pub(super) fn emit_to_for_batch_size(batch_size: usize, group_count: usize) -> E
     if group_count <= batch_size {
         EmitTo::All
     } else {
-        EmitTo::First(batch_size)
+        EmitTo::FirstBlock(batch_size)
     }
 }
 
@@ -494,6 +494,12 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn emit_to_for_batch_size_uses_first_block_for_partial_batches() {
+        assert_eq!(emit_to_for_batch_size(4, 4), EmitTo::All);
+        assert_eq!(emit_to_for_batch_size(4, 5), EmitTo::FirstBlock(4));
+    }
 
     #[test]
     fn materialized_final_output_slices_batches_until_exhausted() -> Result<()> {

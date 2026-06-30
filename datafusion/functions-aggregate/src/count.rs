@@ -625,11 +625,62 @@ struct CountGroupsAccumulator {
     /// for the counts, the output [`Int64Array`] can be created
     /// without copy.
     counts: Vec<i64>,
+    /// Number of leading groups already emitted by `EmitTo::FirstBlock`.
+    first_block_emit_offset: usize,
 }
 
 impl CountGroupsAccumulator {
     pub fn new() -> Self {
-        Self { counts: vec![] }
+        Self {
+            counts: vec![],
+            first_block_emit_offset: 0,
+        }
+    }
+
+    fn compact_first_block_remainder(&mut self) {
+        let offset = self.first_block_emit_offset;
+        if offset == 0 {
+            return;
+        }
+
+        if offset >= self.counts.len() {
+            self.counts.clear();
+        } else {
+            self.counts.drain(0..offset);
+        }
+        self.first_block_emit_offset = 0;
+    }
+
+    fn take_counts(&mut self, emit_to: EmitTo) -> Vec<i64> {
+        match emit_to {
+            EmitTo::All => {
+                let offset = self.first_block_emit_offset;
+                if offset == 0 {
+                    std::mem::take(&mut self.counts)
+                } else {
+                    let counts = self.counts[offset..].to_vec();
+                    self.counts.clear();
+                    self.first_block_emit_offset = 0;
+                    counts
+                }
+            }
+            EmitTo::First(_) => {
+                self.compact_first_block_remainder();
+                emit_to.take_needed(&mut self.counts)
+            }
+            EmitTo::FirstBlock(n) => {
+                let start = self.first_block_emit_offset;
+                let end = (start + n).min(self.counts.len());
+                let counts = self.counts[start..end].to_vec();
+                if end == self.counts.len() {
+                    self.counts.clear();
+                    self.first_block_emit_offset = 0;
+                } else {
+                    self.first_block_emit_offset = end;
+                }
+                counts
+            }
+        }
     }
 }
 
@@ -642,6 +693,7 @@ impl GroupsAccumulator for CountGroupsAccumulator {
         total_num_groups: usize,
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "single argument to update_batch");
+        self.compact_first_block_remainder();
         let values = &values[0];
 
         // Add one to each group's counter for each non null, non
@@ -668,6 +720,7 @@ impl GroupsAccumulator for CountGroupsAccumulator {
         total_num_groups: usize,
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "one argument to merge_batch");
+        self.compact_first_block_remainder();
         // first batch is counts, second is partial sums
         let partial_counts = values[0].as_primitive::<Int64Type>();
 
@@ -687,7 +740,7 @@ impl GroupsAccumulator for CountGroupsAccumulator {
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        let counts = emit_to.take_needed(&mut self.counts);
+        let counts = self.take_counts(emit_to);
 
         // Count is always non null (null inputs just don't contribute to the overall values)
         let nulls = None;
@@ -698,7 +751,7 @@ impl GroupsAccumulator for CountGroupsAccumulator {
 
     // return arrays for counts
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        let counts = emit_to.take_needed(&mut self.counts);
+        let counts = self.take_counts(emit_to);
         let counts: PrimitiveArray<Int64Type> = Int64Array::from(counts); // zero copy, no nulls
         Ok(vec![Arc::new(counts) as ArrayRef])
     }
@@ -932,6 +985,47 @@ mod tests {
         let mut accumulator = CountAccumulator::new();
         accumulator.update_batch(&[Arc::new(NullArray::new(10))])?;
         assert_eq!(accumulator.evaluate()?, ScalarValue::Int64(Some(0)));
+        Ok(())
+    }
+
+    #[test]
+    fn count_groups_emit_first_block() -> Result<()> {
+        let mut accumulator = CountGroupsAccumulator::new();
+        let values: ArrayRef = Arc::new(Int32Array::from_iter_values(0..6));
+        let group_indices = vec![0, 1, 2, 3, 4, 5];
+
+        accumulator.update_batch(&[values], &group_indices, None, 6)?;
+
+        let emitted = accumulator.evaluate(EmitTo::FirstBlock(4))?;
+        let emitted = emitted.as_primitive::<Int64Type>();
+        assert_eq!(emitted.values(), &[1, 1, 1, 1]);
+
+        let remaining = accumulator.evaluate(EmitTo::All)?;
+        let remaining = remaining.as_primitive::<Int64Type>();
+        assert_eq!(remaining.values(), &[1, 1]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn count_groups_first_block_does_not_shift_remaining_state() -> Result<()> {
+        let mut accumulator = CountGroupsAccumulator::new();
+        let values: ArrayRef = Arc::new(Int32Array::from_iter_values(0..6));
+        let group_indices = vec![0, 1, 2, 3, 4, 5];
+
+        accumulator.update_batch(&[values], &group_indices, None, 6)?;
+        let original_capacity = accumulator.counts.capacity();
+
+        let emitted = accumulator.evaluate(EmitTo::FirstBlock(4))?;
+        assert_eq!(emitted.len(), 4);
+        assert_eq!(accumulator.counts.len(), 6);
+        assert_eq!(accumulator.counts.capacity(), original_capacity);
+
+        let remaining = accumulator.evaluate(EmitTo::FirstBlock(2))?;
+        let remaining = remaining.as_primitive::<Int64Type>();
+        assert_eq!(remaining.values(), &[1, 1]);
+        assert!(accumulator.counts.is_empty());
+
         Ok(())
     }
 

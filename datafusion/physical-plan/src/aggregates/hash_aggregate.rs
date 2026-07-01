@@ -537,9 +537,16 @@ impl PartialHashAggregateStream {
 
         match result {
             Ok(Some(batch)) => {
-                let _ = self
+                if let Err(e) = self
                     .reservation
-                    .try_resize(original_state.hash_table().memory_size());
+                    .try_resize(original_state.hash_table().memory_size())
+                {
+                    let _ = self.reservation.try_resize(0);
+                    return ControlFlow::Break((
+                        Poll::Ready(Some(Err(e))),
+                        PartialHashAggregateState::Done,
+                    ));
+                }
                 self.reduction_factor.add_part(batch.num_rows());
                 debug_assert!(batch.num_rows() > 0);
                 let next_state = if original_state.hash_table().is_done() {
@@ -1004,6 +1011,7 @@ impl RecordBatchStream for FinalHashAggregateStream {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of_val;
     use std::sync::Arc;
 
     use super::*;
@@ -1011,14 +1019,243 @@ mod tests {
     use crate::execution_plan::ExecutionPlan;
     use crate::test::TestMemoryExec;
 
-    use arrow::array::{Int32Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::Result;
+    use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, FieldRef, Schema};
+    use datafusion_common::{Result, assert_contains};
+    use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
+    use datafusion_expr::{
+        Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator,
+        Signature, Volatility,
+    };
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
     use datafusion_physical_expr::expressions::col;
     use futures::StreamExt;
+
+    const LARGE_STATE_VALUE_BYTES: usize = 4096;
+
+    #[tokio::test]
+    async fn partial_materialized_output_respects_memory_reservation() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("group_col", DataType::Int32, false),
+            Field::new("value_col", DataType::Int32, false),
+        ]));
+        let num_groups = 64;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_groups as i32)),
+                Arc::new(Int32Array::from(vec![1; num_groups])),
+            ],
+        )?;
+
+        let udaf = Arc::new(AggregateUDF::from(LargeStateUdaf::new()));
+        let aggr_expr = vec![Arc::new(
+            AggregateExprBuilder::new(udaf, vec![col("value_col", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("large_state(value_col)")
+                .build()?,
+        )];
+        let exec = Arc::new(TestMemoryExec::try_new(
+            &[vec![batch.clone()]],
+            Arc::clone(&schema),
+            None,
+        )?);
+        let aggregate_exec = AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::new_single(vec![(
+                col("group_col", &schema)?,
+                "group_col".to_string(),
+            )]),
+            aggr_expr,
+            vec![None],
+            exec,
+            Arc::clone(&schema),
+        )?;
+
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_runtime(
+                    RuntimeEnvBuilder::default()
+                        .with_memory_limit(64 * 1024, 1.0)
+                        .build_arc()?,
+                )
+                .with_session_config(SessionConfig::new().with_batch_size(16)),
+        );
+        let mut stream = PartialHashAggregateStream::new(&aggregate_exec, &task_ctx, 0)?;
+        let mut hash_table = AggregateHashTable::<PartialMarker>::new(
+            &aggregate_exec,
+            0,
+            aggregate_exec.schema(),
+            task_ctx.session_config().batch_size(),
+        )?;
+        hash_table.aggregate_batch(&batch)?;
+        stream.start_output(&mut hash_table, true)?;
+
+        let transition =
+            stream.handle_producing_output(PartialHashAggregateState::ProducingOutput {
+                hash_table,
+                skip_hash_table: None,
+            });
+
+        let ControlFlow::Break((Poll::Ready(Some(Err(e))), next_state)) = transition
+        else {
+            panic!("expected materialized output reservation failure");
+        };
+        assert_contains!(e.to_string(), "Additional allocation failed");
+        assert!(matches!(next_state, PartialHashAggregateState::Done));
+
+        Ok(())
+    }
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct LargeStateUdaf {
+        signature: Signature,
+    }
+
+    impl LargeStateUdaf {
+        fn new() -> Self {
+            Self {
+                signature: Signature::exact(vec![DataType::Int32], Volatility::Immutable),
+            }
+        }
+    }
+
+    impl AggregateUDFImpl for LargeStateUdaf {
+        fn name(&self) -> &str {
+            "large_state"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Utf8)
+        }
+
+        fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+            Ok(vec![Arc::new(Field::new(
+                format!("{}[state]", args.name),
+                DataType::Utf8,
+                false,
+            ))])
+        }
+
+        fn accumulator(
+            &self,
+            _acc_args: AccumulatorArgs,
+        ) -> Result<Box<dyn Accumulator>> {
+            Ok(Box::new(LargeStateAccumulator))
+        }
+
+        fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
+            true
+        }
+
+        fn create_groups_accumulator(
+            &self,
+            _args: AccumulatorArgs,
+        ) -> Result<Box<dyn GroupsAccumulator>> {
+            Ok(Box::new(LargeStateGroupsAccumulator { num_groups: 0 }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct LargeStateAccumulator;
+
+    impl Accumulator for LargeStateAccumulator {
+        fn update_batch(&mut self, _values: &[ArrayRef]) -> Result<()> {
+            Ok(())
+        }
+
+        fn evaluate(&mut self) -> Result<datafusion_common::ScalarValue> {
+            Ok(datafusion_common::ScalarValue::Utf8(Some(
+                large_state_value(),
+            )))
+        }
+
+        fn size(&self) -> usize {
+            size_of_val(self)
+        }
+
+        fn state(&mut self) -> Result<Vec<datafusion_common::ScalarValue>> {
+            Ok(vec![datafusion_common::ScalarValue::Utf8(Some(
+                large_state_value(),
+            ))])
+        }
+
+        fn merge_batch(&mut self, _states: &[ArrayRef]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct LargeStateGroupsAccumulator {
+        num_groups: usize,
+    }
+
+    impl LargeStateGroupsAccumulator {
+        fn emit_len(&mut self, emit_to: EmitTo) -> usize {
+            match emit_to {
+                EmitTo::All => std::mem::take(&mut self.num_groups),
+                EmitTo::First(n) | EmitTo::FirstBlock(n) => {
+                    let len = n.min(self.num_groups);
+                    self.num_groups -= len;
+                    len
+                }
+            }
+        }
+
+        fn emit_large_strings(&mut self, emit_to: EmitTo) -> ArrayRef {
+            let len = self.emit_len(emit_to);
+            let value = large_state_value();
+            Arc::new(StringArray::from_iter_values(
+                (0..len).map(|_| value.as_str()),
+            ))
+        }
+    }
+
+    impl GroupsAccumulator for LargeStateGroupsAccumulator {
+        fn update_batch(
+            &mut self,
+            _values: &[ArrayRef],
+            _group_indices: &[usize],
+            _opt_filter: Option<&BooleanArray>,
+            total_num_groups: usize,
+        ) -> Result<()> {
+            self.num_groups = total_num_groups;
+            Ok(())
+        }
+
+        fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+            Ok(self.emit_large_strings(emit_to))
+        }
+
+        fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+            Ok(vec![self.emit_large_strings(emit_to)])
+        }
+
+        fn merge_batch(
+            &mut self,
+            _values: &[ArrayRef],
+            _group_indices: &[usize],
+            total_num_groups: usize,
+        ) -> Result<()> {
+            self.num_groups = total_num_groups;
+            Ok(())
+        }
+
+        fn size(&self) -> usize {
+            size_of_val(self)
+        }
+    }
+
+    fn large_state_value() -> String {
+        "x".repeat(LARGE_STATE_VALUE_BYTES)
+    }
 
     #[tokio::test]
     async fn test_partial_hash_stream_double_emission_race_condition_bug() -> Result<()> {
@@ -1032,9 +1269,9 @@ mod tests {
             Field::new("value_col", DataType::Int64, false),
         ]));
 
-        // Create data that will trigger BOTH conditions in the same iteration:
-        // 1. More groups than batch_size (triggers early emission when memory pressure hits)
-        // 2. High cardinality ratio (triggers skip aggregation)
+        // Create data with more groups than the output batch size and a high
+        // cardinality ratio. The stream must drain the accumulated partial
+        // output before switching to skip aggregation.
         let batch_size = 1024; // We'll set this in session config
         let num_groups = batch_size + 100; // Slightly more than batch_size (1124 groups)
 
@@ -1051,18 +1288,19 @@ mod tests {
         )?;
         let input_partitions = vec![vec![batch]];
 
-        // Create constrained memory to trigger early emission but not completely fail
+        // Keep enough reservation headroom for output; this test targets the
+        // skip transition, not memory exhaustion.
         let runtime = RuntimeEnvBuilder::default()
-            .with_memory_limit(1024, 1.0) // small enough to start but will trigger pressure
+            .with_memory_limit(64 * 1024, 1.0)
             .build_arc()?;
 
         let mut task_ctx = TaskContext::default().with_runtime(runtime);
 
-        // Configure to trigger BOTH conditions:
+        // Configure to trigger the skip transition:
         // 1. Low probe threshold (triggers skip probe after few rows)
         // 2. Low ratio threshold (triggers skip aggregation immediately)
-        // 3. Set batch_size to 1024 so our 1124 groups will trigger early emission
-        // This creates the race condition where both emit paths are triggered
+        // 3. Set batch_size to 1024 so the accumulated groups require two
+        //    output batches.
         let mut session_config = task_ctx.session_config().clone();
         session_config = session_config.set(
             "datafusion.execution.batch_size",

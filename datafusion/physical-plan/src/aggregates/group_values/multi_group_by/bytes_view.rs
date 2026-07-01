@@ -72,7 +72,7 @@ pub struct ByteViewGroupValueBuilder<B: ByteViewType> {
     nulls: MaybeNullBufferBuilder,
 
     /// Materialized values retained while emitting `FirstBlock`s.
-    first_block_values: Option<ArrayRef>,
+    first_block_values: Option<GenericByteViewArray<B>>,
 
     /// phantom data so the type requires `<B>`
     _phantom: PhantomData<B>,
@@ -103,7 +103,7 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
         self
     }
 
-    fn materialize_first_block_values(&mut self) -> &ArrayRef {
+    fn materialize_first_block_values(&mut self) -> &GenericByteViewArray<B> {
         if self.first_block_values.is_none() {
             let null_buffer = self.nulls.slice_n(0, self.views.len());
             let views = ScalarBuffer::from(self.views.clone());
@@ -118,11 +118,7 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
             // * (if utf8): input was valid Utf8 so buffer contents are valid utf8
             //   as well
             self.first_block_values = Some(unsafe {
-                Arc::new(GenericByteViewArray::<B>::new_unchecked(
-                    views,
-                    buffers,
-                    null_buffer,
-                ))
+                GenericByteViewArray::<B>::new_unchecked(views, buffers, null_buffer)
             });
         }
         self.first_block_values.as_ref().unwrap()
@@ -642,7 +638,7 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
 
     fn slice_n(&mut self, offset: usize, n: usize) -> ArrayRef {
         debug_assert!(self.len() >= offset + n);
-        self.materialize_first_block_values().slice(offset, n)
+        Arc::new(self.materialize_first_block_values().slice(offset, n))
     }
 
     fn take_n(&mut self, n: usize) -> ArrayRef {
@@ -653,6 +649,7 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{RefUnwindSafe, UnwindSafe};
     use std::sync::Arc;
 
     use crate::aggregates::group_values::multi_group_by::bytes_view::ByteViewGroupValueBuilder;
@@ -662,6 +659,13 @@ mod tests {
     use arrow::datatypes::StringViewType;
 
     use super::GroupColumn;
+
+    fn assert_unwind_safe<T: UnwindSafe + RefUnwindSafe>() {}
+
+    #[test]
+    fn byte_view_group_value_builder_remains_unwind_safe() {
+        assert_unwind_safe::<ByteViewGroupValueBuilder<StringViewType>>();
+    }
 
     fn make_true_buffer(n: usize) -> BooleanBufferBuilder {
         let mut buf = BooleanBufferBuilder::new(n);

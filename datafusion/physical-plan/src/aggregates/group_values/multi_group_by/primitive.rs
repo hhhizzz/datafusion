@@ -47,7 +47,7 @@ pub struct PrimitiveGroupValueBuilder<T: ArrowPrimitiveType, const NULLABLE: boo
     data_type: DataType,
     group_values: Vec<T::Native>,
     nulls: MaybeNullBufferBuilder,
-    first_block_values: Option<ArrayRef>,
+    first_block_values: Option<PrimitiveArray<T>>,
 }
 
 impl<T, const NULLABLE: bool> PrimitiveGroupValueBuilder<T, NULLABLE>
@@ -65,20 +65,20 @@ where
         }
     }
 
-    fn materialize_first_block_values(&mut self) -> &ArrayRef {
+    fn materialize_first_block_values(&mut self) -> &PrimitiveArray<T> {
         if self.first_block_values.is_none() {
             let nulls = if NULLABLE {
                 self.nulls.slice_n(0, self.group_values.len())
             } else {
                 None
             };
-            self.first_block_values = Some(Arc::new(
+            self.first_block_values = Some(
                 PrimitiveArray::<T>::new(
                     ScalarBuffer::from(self.group_values.clone()),
                     nulls,
                 )
                 .with_data_type(self.data_type.clone()),
-            ));
+            );
         }
         self.first_block_values.as_ref().unwrap()
     }
@@ -310,7 +310,7 @@ where
 
     fn slice_n(&mut self, offset: usize, n: usize) -> ArrayRef {
         debug_assert!(self.len() >= offset + n);
-        self.materialize_first_block_values().slice(offset, n)
+        Arc::new(self.materialize_first_block_values().slice(offset, n))
     }
 
     fn take_n(&mut self, n: usize) -> ArrayRef {
@@ -327,6 +327,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{RefUnwindSafe, UnwindSafe};
     use std::sync::Arc;
 
     use crate::aggregates::group_values::multi_group_by::primitive::PrimitiveGroupValueBuilder;
@@ -337,6 +338,14 @@ mod tests {
     use arrow::datatypes::{DataType, Float32Type, Int64Type};
 
     use super::GroupColumn;
+
+    fn assert_unwind_safe<T: UnwindSafe + RefUnwindSafe>() {}
+
+    #[test]
+    fn primitive_group_value_builder_remains_unwind_safe() {
+        assert_unwind_safe::<PrimitiveGroupValueBuilder<Int64Type, false>>();
+        assert_unwind_safe::<PrimitiveGroupValueBuilder<Int64Type, true>>();
+    }
 
     fn make_true_buffer(n: usize) -> BooleanBufferBuilder {
         let mut buf = BooleanBufferBuilder::new(n);

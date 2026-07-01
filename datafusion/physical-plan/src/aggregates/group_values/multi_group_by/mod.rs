@@ -104,7 +104,17 @@ pub trait GroupColumn: Send + Sync {
 
     /// Builds a new array from `n` stored rows starting at `offset`, without
     /// shifting the stored rows.
-    fn slice_n(&mut self, offset: usize, n: usize) -> ArrayRef;
+    ///
+    /// The default implementation exists only as a source-compatible fallback
+    /// for implementors that do not override this method. It supports `offset`
+    /// zero by delegating to [`GroupColumn::take_n`].
+    fn slice_n(&mut self, offset: usize, n: usize) -> ArrayRef {
+        assert_eq!(
+            offset, 0,
+            "GroupColumn::slice_n with non-zero offset requires an optimized implementation"
+        );
+        self.take_n(n)
+    }
 
     /// Builds a new array from the first `n` stored rows, shifting the
     /// remaining rows to the start of the builder
@@ -1400,7 +1410,10 @@ enum Nulls {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, StringViewArray};
+    use arrow::array::{
+        ArrayRef, BooleanBufferBuilder, Int64Array, RecordBatch, StringArray,
+        StringViewArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::{compute::concat_batches, util::pretty::pretty_format_batches};
     use datafusion_common::utils::proxy::HashTableAllocExt;
@@ -1411,8 +1424,81 @@ mod tests {
     };
 
     use super::{
-        GroupIndexView, group_column_supported_type, make_group_column, supported_schema,
+        GroupColumn, GroupIndexView, group_column_supported_type, make_group_column,
+        supported_schema,
     };
+
+    struct DefaultSliceGroupColumn {
+        values: Vec<i64>,
+    }
+
+    impl GroupColumn for DefaultSliceGroupColumn {
+        fn equal_to(&self, _lhs_row: usize, _array: &ArrayRef, _rhs_row: usize) -> bool {
+            unimplemented!("not needed by this compatibility test")
+        }
+
+        fn append_val(
+            &mut self,
+            _array: &ArrayRef,
+            _row: usize,
+        ) -> datafusion_common::Result<()> {
+            unimplemented!("not needed by this compatibility test")
+        }
+
+        fn vectorized_equal_to(
+            &self,
+            _lhs_rows: &[usize],
+            _array: &ArrayRef,
+            _rhs_rows: &[usize],
+            _equal_to_results: &mut BooleanBufferBuilder,
+        ) {
+            unimplemented!("not needed by this compatibility test")
+        }
+
+        fn vectorized_append(
+            &mut self,
+            _array: &ArrayRef,
+            _rows: &[usize],
+        ) -> datafusion_common::Result<()> {
+            unimplemented!("not needed by this compatibility test")
+        }
+
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn size(&self) -> usize {
+            self.values.capacity() * size_of::<i64>()
+        }
+
+        fn build(self: Box<Self>) -> ArrayRef {
+            Arc::new(Int64Array::from(self.values))
+        }
+
+        fn take_n(&mut self, n: usize) -> ArrayRef {
+            let values = self.values.drain(0..n).collect::<Vec<_>>();
+            Arc::new(Int64Array::from(values))
+        }
+    }
+
+    #[test]
+    fn group_column_slice_n_has_back_compat_default() {
+        let mut column = DefaultSliceGroupColumn {
+            values: vec![10, 20, 30],
+        };
+
+        let output = column.slice_n(0, 2);
+
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[10, 20]
+        );
+        assert_eq!(column.values, vec![30]);
+    }
 
     /// CRITICAL invariant: if `group_column_supported_type(t)` returns true
     /// the dispatcher must accept that type at intern time, and conversely

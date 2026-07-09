@@ -1,0 +1,18 @@
+[patch.crates-io]
+arrow = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow" }
+arrow-arith = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-arith" }
+arrow-array = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-array" }
+arrow-avro = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-avro" }
+arrow-buffer = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-buffer" }
+arrow-cast = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-cast" }
+arrow-csv = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-csv" }
+arrow-data = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-data" }
+arrow-flight = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-flight" }
+arrow-ipc = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-ipc" }
+arrow-json = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-json" }
+arrow-ord = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-ord" }
+arrow-row = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-row" }
+arrow-schema = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-schema" }
+arrow-select = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-select" }
+arrow-string = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/arrow-string" }
+parquet = { path = "/home/inspur/arrow-rs-codex/datafusion-bench/slot-worktrees/df54-q72-direct/slot0/arrow-current/parquet" }

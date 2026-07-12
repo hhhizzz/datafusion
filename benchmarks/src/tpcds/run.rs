@@ -29,12 +29,15 @@ use datafusion::datasource::listing::{
 };
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result;
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::*;
 use datafusion_common::instant::Instant;
 use datafusion_common::utils::get_available_parallelism;
-use datafusion_common::{DEFAULT_PARQUET_EXTENSION, plan_err};
+use datafusion_common::{DEFAULT_PARQUET_EXTENSION, DataFusionError, plan_err};
+use object_store::aws::AmazonS3Builder;
+use url::Url;
 
 use clap::Args;
 use log::info;
@@ -170,6 +173,9 @@ impl RunOpt {
             self.hash_join_buffering_capacity;
         let rt = self.common.build_runtime()?;
         let ctx = SessionContext::new_with_config_rt(config, rt);
+
+        register_s3_object_store(&ctx, self.path.to_str().unwrap())?;
+
         // register tables
         self.register_tables(&ctx).await?;
 
@@ -360,5 +366,52 @@ impl RunOpt {
         self.common
             .partitions
             .unwrap_or_else(get_available_parallelism)
+    }
+}
+
+fn register_s3_object_store(ctx: &SessionContext, path: &str) -> Result<()> {
+    let Some(object_store_url) = s3_object_store_url(path)? else {
+        return Ok(());
+    };
+
+    let object_store_url_ref: &Url = object_store_url.as_ref();
+    let bucket_name = object_store_url_ref.host_str().ok_or_else(|| {
+        DataFusionError::Plan(format!("S3 path must include a bucket name: {path}"))
+    })?;
+
+    let store = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket_name)
+        .build()?;
+
+    ctx.register_object_store(object_store_url_ref, Arc::new(store));
+    println!("Registered S3 object store for {object_store_url}");
+    Ok(())
+}
+
+fn s3_object_store_url(path: &str) -> Result<Option<ObjectStoreUrl>> {
+    if !path.starts_with("s3://") && !path.starts_with("s3a://") {
+        return Ok(None);
+    }
+
+    let listing_url = ListingTableUrl::parse(path)?;
+    Ok(Some(listing_url.object_store()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_s3_object_store_url_from_tpcds_path() {
+        let url = s3_object_store_url("s3://datafusion-bench/tpcds/sf10/parquet")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(url.to_string(), "s3://datafusion-bench/");
+    }
+
+    #[test]
+    fn ignores_local_path_for_s3_registration() {
+        assert!(s3_object_store_url("/tmp/tpcds_sf10").unwrap().is_none());
     }
 }

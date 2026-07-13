@@ -425,7 +425,6 @@ impl<T: ObjectStore> MetricsObjectStore<T> {
         );
 
         let payload = match result.payload {
-            #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
             payload @ GetResultPayload::File(_, _) => {
                 tracker.finish();
                 payload

@@ -1061,6 +1061,7 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 })
                 .unwrap_or(None),
             pushdown_filters: value.pushdown_filters,
+            row_group_lookahead: value.row_group_lookahead,
             reorder_filters: value.reorder_filters,
             force_filter_selections: value.force_filter_selections,
             data_pagesize_limit: value.data_pagesize_limit as usize,
@@ -1374,6 +1375,20 @@ mod tests {
         let recovered = parquet_options_proto_round_trip(opts.clone());
         assert_eq!(recovered.coerce_int96, Some("us".to_string()));
         assert_eq!(recovered.coerce_int96_tz, Some("UTC".to_string()));
+    }
+
+    #[test]
+    fn test_parquet_options_row_group_lookahead_round_trip() {
+        for expected in [false, true] {
+            let opts = ParquetOptions {
+                row_group_lookahead: expected,
+                ..ParquetOptions::default()
+            };
+
+            let recovered = parquet_options_proto_round_trip(opts);
+
+            assert_eq!(recovered.row_group_lookahead, expected);
+        }
     }
 
     #[test]

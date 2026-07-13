@@ -910,6 +910,7 @@ impl TryFrom<&ParquetOptions> for protobuf::ParquetOptions {
             skip_metadata: value.skip_metadata,
             metadata_size_hint_opt: value.metadata_size_hint.map(|v| protobuf::parquet_options::MetadataSizeHintOpt::MetadataSizeHint(v as u64)),
             pushdown_filters: value.pushdown_filters,
+            row_group_lookahead: value.row_group_lookahead,
             reorder_filters: value.reorder_filters,
             force_filter_selections: value.force_filter_selections,
             data_pagesize_limit: value.data_pagesize_limit as u64,

@@ -866,6 +866,9 @@ pub struct ParquetOptions {
     pub created_by: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "35")]
     pub content_defined_chunking: ::core::option::Option<ParquetCdcOptions>,
+    /// default = false
+    #[prost(bool, tag = "37")]
+    pub row_group_lookahead: bool,
     #[prost(oneof = "parquet_options::MetadataSizeHintOpt", tags = "4")]
     pub metadata_size_hint_opt: ::core::option::Option<
         parquet_options::MetadataSizeHintOpt,

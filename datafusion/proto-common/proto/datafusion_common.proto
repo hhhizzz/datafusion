@@ -636,6 +636,8 @@ message ParquetOptions {
   oneof coerce_int96_tz_opt {
     string coerce_int96_tz = 36;
   }
+
+  bool row_group_lookahead = 37; // default = false
 }
 
 // Content-defined chunking (CDC) options for writing parquet files.

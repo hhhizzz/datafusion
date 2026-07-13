@@ -6155,6 +6155,9 @@ impl serde::Serialize for ParquetOptions {
         if self.content_defined_chunking.is_some() {
             len += 1;
         }
+        if self.row_group_lookahead {
+            len += 1;
+        }
         if self.metadata_size_hint_opt.is_some() {
             len += 1;
         }
@@ -6271,6 +6274,9 @@ impl serde::Serialize for ParquetOptions {
         }
         if let Some(v) = self.content_defined_chunking.as_ref() {
             struct_ser.serialize_field("contentDefinedChunking", v)?;
+        }
+        if self.row_group_lookahead {
+            struct_ser.serialize_field("rowGroupLookahead", &self.row_group_lookahead)?;
         }
         if let Some(v) = self.metadata_size_hint_opt.as_ref() {
             match v {
@@ -6419,6 +6425,8 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             "createdBy",
             "content_defined_chunking",
             "contentDefinedChunking",
+            "row_group_lookahead",
+            "rowGroupLookahead",
             "metadata_size_hint",
             "metadataSizeHint",
             "compression",
@@ -6467,6 +6475,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             MaxRowGroupSize,
             CreatedBy,
             ContentDefinedChunking,
+            RowGroupLookahead,
             MetadataSizeHint,
             Compression,
             DictionaryEnabled,
@@ -6522,6 +6531,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             "maxRowGroupSize" | "max_row_group_size" => Ok(GeneratedField::MaxRowGroupSize),
                             "createdBy" | "created_by" => Ok(GeneratedField::CreatedBy),
                             "contentDefinedChunking" | "content_defined_chunking" => Ok(GeneratedField::ContentDefinedChunking),
+                            "rowGroupLookahead" | "row_group_lookahead" => Ok(GeneratedField::RowGroupLookahead),
                             "metadataSizeHint" | "metadata_size_hint" => Ok(GeneratedField::MetadataSizeHint),
                             "compression" => Ok(GeneratedField::Compression),
                             "dictionaryEnabled" | "dictionary_enabled" => Ok(GeneratedField::DictionaryEnabled),
@@ -6575,6 +6585,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                 let mut max_row_group_size__ = None;
                 let mut created_by__ = None;
                 let mut content_defined_chunking__ = None;
+                let mut row_group_lookahead__ = None;
                 let mut metadata_size_hint_opt__ = None;
                 let mut compression_opt__ = None;
                 let mut dictionary_enabled_opt__ = None;
@@ -6735,6 +6746,12 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             }
                             content_defined_chunking__ = map_.next_value()?;
                         }
+                        GeneratedField::RowGroupLookahead => {
+                            if row_group_lookahead__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("rowGroupLookahead"));
+                            }
+                            row_group_lookahead__ = Some(map_.next_value()?);
+                        }
                         GeneratedField::MetadataSizeHint => {
                             if metadata_size_hint_opt__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("metadataSizeHint"));
@@ -6832,6 +6849,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                     max_row_group_size: max_row_group_size__.unwrap_or_default(),
                     created_by: created_by__.unwrap_or_default(),
                     content_defined_chunking: content_defined_chunking__,
+                    row_group_lookahead: row_group_lookahead__.unwrap_or_default(),
                     metadata_size_hint_opt: metadata_size_hint_opt__,
                     compression_opt: compression_opt__,
                     dictionary_enabled_opt: dictionary_enabled_opt__,

@@ -112,34 +112,12 @@ mod tests {
     use datafusion_execution::memory_pool::{
         GreedyMemoryPool, MemoryConsumer, MemoryPool, UnboundedMemoryPool,
     };
-    use std::ffi::OsString;
+    use std::process::Command;
     use std::sync::Arc;
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: This test uses a unique configuration key and restores it on drop.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: This restores the process environment to its pre-test state.
-            unsafe {
-                match self.previous.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
+    const ENV_TEST_CHILD: &str = "DATAFUSION_ROW_GROUP_LOOKAHEAD_ENV_TEST_CHILD";
+    const ROW_GROUP_LOOKAHEAD_ENV: &str =
+        "DATAFUSION_EXECUTION_PARQUET_ROW_GROUP_LOOKAHEAD";
 
     fn context_with_pool(
         pool: Arc<dyn MemoryPool>,
@@ -162,8 +140,27 @@ mod tests {
 
     #[test]
     fn row_group_lookahead_parses_from_env() {
-        let _guard =
-            EnvVarGuard::set("DATAFUSION_EXECUTION_PARQUET_ROW_GROUP_LOOKAHEAD", "true");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("row_group_lookahead_parses_from_env_child")
+            .arg("--nocapture")
+            .env(ENV_TEST_CHILD, "1")
+            .env(ROW_GROUP_LOOKAHEAD_ENV, "true")
+            .output()
+            .expect("failed to run isolated environment test");
+
+        assert!(
+            output.status.success(),
+            "isolated environment test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn row_group_lookahead_parses_from_env_child() {
+        if std::env::var_os(ENV_TEST_CHILD).is_none() {
+            return;
+        }
 
         let options = ConfigOptions::from_env().unwrap();
 

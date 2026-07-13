@@ -1457,10 +1457,12 @@ mod test {
     use super::*;
     use super::{ConstantColumns, ParquetMorselizer, constant_columns_from_stats};
     use crate::lookahead::{LookaheadScanContext, ParquetLookaheadCoordinator};
-    use crate::{DefaultParquetFileReaderFactory, RowGroupAccess};
-    use arrow::array::RecordBatch;
+    use crate::{
+        DefaultParquetFileReaderFactory, ParquetFileReaderFactory, RowGroupAccess,
+    };
+    use arrow::array::{ArrayRef, Int32Array as TestInt32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use bytes::{BufMut, BytesMut};
+    use bytes::{BufMut, Bytes, BytesMut};
     use datafusion_common::{
         ColumnStatistics, ScalarValue, Statistics, internal_err, record_batch,
         stats::Precision,
@@ -1479,13 +1481,97 @@ mod test {
         DefaultPhysicalExprAdapterFactory, replace_columns_with_literals,
     };
     use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
-    use futures::StreamExt;
+    use futures::future::BoxFuture;
     use futures::stream::BoxStream;
+    use futures::{FutureExt, StreamExt, TryStreamExt};
     use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
     use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ArrowReaderOptions;
+    use parquet::arrow::async_reader::AsyncFileReader;
+    use parquet::errors::Result as ParquetResult;
+    use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
     use parquet::file::properties::WriterProperties;
-    use std::collections::VecDeque;
-    use std::sync::Arc;
+    use std::collections::{HashMap, VecDeque};
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone)]
+    struct RecordingReaderFactory {
+        data: Bytes,
+        metadata: Arc<ParquetMetaData>,
+        request_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl RecordingReaderFactory {
+        fn new(data: Bytes) -> Self {
+            let metadata = Arc::new(
+                ParquetMetaDataReader::new()
+                    .parse_and_finish(&data)
+                    .unwrap(),
+            );
+            Self {
+                data,
+                metadata,
+                request_sizes: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
+        fn request_sizes(&self) -> Vec<usize> {
+            self.request_sizes.lock().unwrap().clone()
+        }
+    }
+
+    impl ParquetFileReaderFactory for RecordingReaderFactory {
+        fn create_reader(
+            &self,
+            _partition_index: usize,
+            _partitioned_file: PartitionedFile,
+            _metadata_size_hint: Option<usize>,
+            _metrics: &ExecutionPlanMetricsSet,
+        ) -> Result<Box<dyn AsyncFileReader + Send>> {
+            Ok(Box::new(RecordingAsyncFileReader {
+                data: self.data.clone(),
+                metadata: Arc::clone(&self.metadata),
+                request_sizes: Arc::clone(&self.request_sizes),
+            }))
+        }
+    }
+
+    struct RecordingAsyncFileReader {
+        data: Bytes,
+        metadata: Arc<ParquetMetaData>,
+        request_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncFileReader for RecordingAsyncFileReader {
+        fn get_bytes(
+            &mut self,
+            range: Range<u64>,
+        ) -> BoxFuture<'_, ParquetResult<Bytes>> {
+            let data = self.data.slice(range.start as usize..range.end as usize);
+            futures::future::ready(Ok(data)).boxed()
+        }
+
+        fn get_byte_ranges(
+            &mut self,
+            ranges: Vec<Range<u64>>,
+        ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
+            self.request_sizes.lock().unwrap().push(ranges.len());
+            let data = self.data.clone();
+            futures::future::ready(Ok(ranges
+                .into_iter()
+                .map(|range| data.slice(range.start as usize..range.end as usize))
+                .collect()))
+            .boxed()
+        }
+
+        fn get_metadata<'a>(
+            &'a mut self,
+            _options: Option<&'a ArrowReaderOptions>,
+        ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+            futures::future::ready(Ok(Arc::clone(&self.metadata))).boxed()
+        }
+    }
 
     #[test]
     fn lookahead_file_context_is_named_and_opt_in() {
@@ -1858,6 +1944,16 @@ mod test {
         batches: Vec<arrow::record_batch::RecordBatch>,
         props: Option<WriterProperties>,
     ) -> usize {
+        let data = encode_parquet_batches(batches, props);
+        let data_len = data.len();
+        store.put(&Path::from(filename), data.into()).await.unwrap();
+        data_len
+    }
+
+    fn encode_parquet_batches(
+        batches: Vec<arrow::record_batch::RecordBatch>,
+        props: Option<WriterProperties>,
+    ) -> Bytes {
         let mut out = BytesMut::new().writer();
         {
             let schema = batches[0].schema();
@@ -1867,10 +1963,7 @@ mod test {
             }
             writer.finish().unwrap();
         }
-        let data = out.into_inner().freeze();
-        let data_len = data.len();
-        store.put(&Path::from(filename), data.into()).await.unwrap();
-        data_len
+        out.into_inner().freeze()
     }
 
     fn make_dynamic_expr(expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
@@ -1878,6 +1971,271 @@ mod test {
             expr.children().into_iter().map(Arc::clone).collect(),
             expr,
         ))
+    }
+
+    const LOOKAHEAD_COLUMNS: [&str; 6] = [
+        "value", "filter_1", "filter_2", "filter_3", "filter_4", "filter_5",
+    ];
+
+    fn lookahead_integration_fixture() -> (Bytes, SchemaRef) {
+        let physical_schema = Arc::new(Schema::new(
+            LOOKAHEAD_COLUMNS
+                .iter()
+                .map(|name| Field::new(*name, DataType::Int32, false))
+                .collect::<Vec<_>>(),
+        ));
+        let values = Arc::new(TestInt32Array::from_iter_values(0..9)) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&physical_schema),
+            (0..LOOKAHEAD_COLUMNS.len())
+                .map(|_| Arc::clone(&values))
+                .collect(),
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let data = encode_parquet_batches(vec![batch], Some(props));
+
+        let mut logical_fields =
+            physical_schema.fields().iter().cloned().collect::<Vec<_>>();
+        logical_fields[0] =
+            Arc::new(Field::new("value", DataType::Int32, true).with_metadata(
+                HashMap::from([("logical_name".to_string(), "preserved".to_string())]),
+            ));
+        let logical_schema = Arc::new(Schema::new(logical_fields));
+        (data, logical_schema)
+    }
+
+    fn lookahead_integration_predicate(schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
+        let sum = LOOKAHEAD_COLUMNS
+            .iter()
+            .skip(1)
+            .fold(col(LOOKAHEAD_COLUMNS[0]), |sum, name| sum + col(*name));
+        logical2physical(&sum.gt(lit(0)), schema)
+    }
+
+    fn metric_value(metrics: &ExecutionPlanMetricsSet, name: &str) -> usize {
+        metrics.clone_inner().sum_by_name(name).unwrap().as_usize()
+    }
+
+    fn batch_int32_values(batches: &[RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<TestInt32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn lookahead_integration_opener(
+        store: Arc<dyn ObjectStore>,
+        schema: SchemaRef,
+        predicate: Arc<dyn PhysicalExpr>,
+        metrics: ExecutionPlanMetricsSet,
+        reader_factory: Arc<dyn ParquetFileReaderFactory>,
+        lookahead: Option<LookaheadScanContext>,
+    ) -> ParquetMorselizer {
+        let mut opener = ParquetMorselizerBuilder::new()
+            .with_store(store)
+            .with_schema(schema)
+            .with_projection_indices(&[0])
+            .with_predicate(predicate)
+            .with_pushdown_filters(true)
+            .build();
+        opener.batch_size = 1;
+        opener.metrics = metrics;
+        opener.parquet_file_reader_factory = reader_factory;
+        opener.lookahead = lookahead;
+        opener
+    }
+
+    #[tokio::test]
+    async fn opener_selects_serial_or_lookahead_with_output_schema_and_metrics_parity() {
+        let (data, logical_schema) = lookahead_integration_fixture();
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data.len()).unwrap(),
+        );
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+        let serial_factory = Arc::new(RecordingReaderFactory::new(data.clone()));
+        let serial_metrics = ExecutionPlanMetricsSet::new();
+        let serial_opener = lookahead_integration_opener(
+            Arc::clone(&store),
+            Arc::clone(&logical_schema),
+            lookahead_integration_predicate(&logical_schema),
+            serial_metrics.clone(),
+            serial_factory.clone(),
+            None,
+        );
+        let serial_batches = open_file(&serial_opener, file.clone())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let lookahead_factory = Arc::new(RecordingReaderFactory::new(data));
+        let lookahead_metrics = ExecutionPlanMetricsSet::new();
+        let pool = Arc::new(UnboundedMemoryPool::default());
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+        let lookahead_opener = lookahead_integration_opener(
+            Arc::clone(&store),
+            Arc::clone(&logical_schema),
+            lookahead_integration_predicate(&logical_schema),
+            lookahead_metrics.clone(),
+            lookahead_factory.clone(),
+            Some(LookaheadScanContext {
+                coordinator: Arc::clone(&coordinator),
+                memory_pool: pool.clone(),
+            }),
+        );
+        let mut lookahead_stream = open_file(&lookahead_opener, file).await.unwrap();
+        let first = lookahead_stream.next().await.unwrap().unwrap();
+
+        assert!(pool.reserved() > 0);
+        assert!(
+            coordinator.range_permits.available_permits()
+                < crate::lookahead::MAX_IN_FLIGHT_RANGES
+        );
+
+        let mut lookahead_batches = vec![first];
+        lookahead_batches.extend(lookahead_stream.try_collect::<Vec<_>>().await.unwrap());
+
+        let expected_schema = Arc::new(logical_schema.project(&[0]).unwrap());
+        assert_eq!(
+            batch_int32_values(&serial_batches),
+            (1..9).collect::<Vec<_>>()
+        );
+        assert_eq!(lookahead_batches, serial_batches);
+        assert!(
+            lookahead_batches
+                .iter()
+                .all(|batch| batch.schema() == expected_schema)
+        );
+        assert!(expected_schema.field(0).is_nullable());
+        assert_eq!(
+            expected_schema
+                .field(0)
+                .metadata()
+                .get("logical_name")
+                .map(String::as_str),
+            Some("preserved")
+        );
+        assert_eq!(serial_factory.request_sizes(), vec![6, 6, 6]);
+        assert_eq!(lookahead_factory.request_sizes(), vec![6, 4, 2, 4, 2]);
+        assert_eq!(
+            metric_value(&serial_metrics, "predicate_cache_inner_records"),
+            metric_value(&lookahead_metrics, "predicate_cache_inner_records")
+        );
+        assert_eq!(
+            metric_value(&serial_metrics, "predicate_cache_records"),
+            metric_value(&lookahead_metrics, "predicate_cache_records")
+        );
+        assert!(metric_value(&lookahead_metrics, "predicate_cache_inner_records") > 0);
+        assert!(metric_value(&lookahead_metrics, "predicate_cache_records") > 0);
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            crate::lookahead::MAX_IN_FLIGHT_RANGES
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_prune_releases_live_lookahead_resources_before_eof() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch = record_batch!((
+            "a",
+            Int32,
+            vec![
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(8)
+            ]
+        ))
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch.clone()],
+            Some(props),
+        )
+        .await;
+        let schema = batch.schema();
+        let initial = logical2physical(&col("a").gt_eq(lit(0)), &schema);
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            initial.children().into_iter().map(Arc::clone).collect(),
+            initial,
+        ));
+        let predicate: Arc<dyn PhysicalExpr> = dynamic_filter.clone();
+        let mut file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        );
+        file.statistics = Some(Arc::new(Statistics {
+            num_rows: Precision::Exact(9),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(8))),
+                min_value: Precision::Exact(ScalarValue::Int32(Some(0))),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            }],
+        }));
+        let pool = Arc::new(UnboundedMemoryPool::default());
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+        let mut opener = ParquetMorselizerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_predicate(predicate)
+            .build();
+        opener.batch_size = 1;
+        opener.lookahead = Some(LookaheadScanContext {
+            coordinator: Arc::clone(&coordinator),
+            memory_pool: pool.clone(),
+        });
+        let mut stream = open_file(&opener, file).await.unwrap();
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(batch_int32_values(&[first]), vec![0]);
+        assert!(pool.reserved() > 0);
+        assert!(
+            coordinator.range_permits.available_permits()
+                < crate::lookahead::MAX_IN_FLIGHT_RANGES
+        );
+
+        dynamic_filter
+            .update(logical2physical(&col("a").gt(lit(100)), &schema))
+            .unwrap();
+
+        assert!(stream.next().await.is_none());
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            crate::lookahead::MAX_IN_FLIGHT_RANGES
+        );
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
@@ -2660,6 +3018,45 @@ mod test {
 
         let values = collect_int32_values(open_file(&opener, file).await.unwrap()).await;
         assert_eq!(values, vec![7, 4, 5, 6, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_lookahead_split_runs_preserve_forward_and_reverse_order() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let (schema, file) = fully_matched_split_test_file(Arc::clone(&store)).await;
+
+        for (reverse, expected) in
+            [(false, vec![3, 4, 5, 6, 7]), (true, vec![7, 4, 5, 6, 3])]
+        {
+            let predicate = logical2physical(&col("a").gt_eq(lit(3)), &schema);
+            let pool = Arc::new(UnboundedMemoryPool::default());
+            let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+            let mut opener = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(Arc::clone(&schema))
+                .with_projection_indices(&[0])
+                .with_predicate(predicate)
+                .with_pushdown_filters(true)
+                .with_row_group_stats_pruning(true)
+                .with_reverse_row_groups(reverse)
+                .build();
+            opener.batch_size = 1;
+            opener.lookahead = Some(LookaheadScanContext {
+                coordinator: Arc::clone(&coordinator),
+                memory_pool: pool.clone(),
+            });
+
+            let values =
+                collect_int32_values(open_file(&opener, file.clone()).await.unwrap())
+                    .await;
+
+            assert_eq!(values, expected);
+            assert_eq!(pool.reserved(), 0);
+            assert_eq!(
+                coordinator.range_permits.available_permits(),
+                crate::lookahead::MAX_IN_FLIGHT_RANGES
+            );
+        }
     }
 
     #[test]

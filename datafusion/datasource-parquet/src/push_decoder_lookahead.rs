@@ -456,6 +456,8 @@ mod tests {
         release_gate: Notify,
         gated_row_group: Option<usize>,
         failed_row_group: Option<usize>,
+        successful_requests_before_failure: usize,
+        corrupted_row_group: Option<usize>,
         gate_released: AtomicBool,
         active_fetches: AtomicUsize,
     }
@@ -467,16 +469,34 @@ mod tests {
 
     impl ScriptControl {
         fn new(gated_row_group: Option<usize>) -> Self {
-            Self::with_script(gated_row_group, None)
+            Self::with_script(gated_row_group, None, 0, None)
         }
 
         fn failing(failed_row_group: usize) -> Self {
-            Self::with_script(None, Some(failed_row_group))
+            Self::with_script(None, Some(failed_row_group), 0, None)
+        }
+
+        fn failing_after(
+            failed_row_group: usize,
+            successful_requests_before_failure: usize,
+        ) -> Self {
+            Self::with_script(
+                None,
+                Some(failed_row_group),
+                successful_requests_before_failure,
+                None,
+            )
+        }
+
+        fn corrupting(corrupted_row_group: usize) -> Self {
+            Self::with_script(None, None, 0, Some(corrupted_row_group))
         }
 
         fn with_script(
             gated_row_group: Option<usize>,
             failed_row_group: Option<usize>,
+            successful_requests_before_failure: usize,
+            corrupted_row_group: Option<usize>,
         ) -> Self {
             Self {
                 inner: Arc::new(ScriptControlInner {
@@ -485,6 +505,8 @@ mod tests {
                     release_gate: Notify::new(),
                     gated_row_group,
                     failed_row_group,
+                    successful_requests_before_failure,
+                    corrupted_row_group,
                     gate_released: AtomicBool::new(gated_row_group.is_none()),
                     active_fetches: AtomicUsize::new(0),
                 }),
@@ -568,6 +590,12 @@ mod tests {
 
         fn should_fail(&self, row_group: usize) -> bool {
             self.inner.failed_row_group == Some(row_group)
+                && self.requests_for(row_group).len()
+                    > self.inner.successful_requests_before_failure
+        }
+
+        fn should_corrupt(&self, row_group: usize) -> bool {
+            self.inner.corrupted_row_group == Some(row_group)
         }
     }
 
@@ -633,7 +661,14 @@ mod tests {
                 }
                 Ok(ranges
                     .into_iter()
-                    .map(|range| data.slice(range.start as usize..range.end as usize))
+                    .map(|range| {
+                        if control.should_corrupt(row_group) {
+                            let len = usize::try_from(range.end - range.start).unwrap();
+                            Bytes::from(vec![0_u8; len])
+                        } else {
+                            data.slice(range.start as usize..range.end as usize)
+                        }
+                    })
                     .collect())
             }
             .boxed()
@@ -740,31 +775,46 @@ mod tests {
             row_groups: Option<Vec<usize>>,
             arrow_reader_metrics: &ArrowReaderMetrics,
         ) -> ParquetPushDecoder {
+            self.decoder_for_row_groups_with_filter(
+                row_groups,
+                arrow_reader_metrics,
+                Some(0),
+            )
+        }
+
+        fn decoder_for_row_groups_with_filter(
+            &self,
+            row_groups: Option<Vec<usize>>,
+            arrow_reader_metrics: &ArrowReaderMetrics,
+            filter_threshold: Option<i32>,
+        ) -> ParquetPushDecoder {
             let mut builder =
                 ParquetPushDecoderBuilder::try_new_decoder(Arc::clone(&self.metadata))
                     .unwrap();
             let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
-            let predicate = ArrowPredicateFn::new(
-                ProjectionMask::columns(&schema_descr, FILTER_COLUMNS),
-                |batch| {
-                    let values = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .unwrap();
-                    gt(values, &Int32Array::new_scalar(0))
-                },
-            );
             if let Some(row_groups) = row_groups {
                 builder = builder.with_row_groups(row_groups);
             }
-            builder
+            builder = builder
                 .with_projection(ProjectionMask::columns(&schema_descr, ["value"]))
-                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
                 .with_batch_size(1)
-                .with_metrics(arrow_reader_metrics.clone())
-                .build()
-                .unwrap()
+                .with_metrics(arrow_reader_metrics.clone());
+            if let Some(filter_threshold) = filter_threshold {
+                let predicate = ArrowPredicateFn::new(
+                    ProjectionMask::columns(&schema_descr, FILTER_COLUMNS),
+                    move |batch| {
+                        let values = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap();
+                        gt(values, &Int32Array::new_scalar(filter_threshold))
+                    },
+                );
+                builder =
+                    builder.with_row_filter(RowFilter::new(vec![Box::new(predicate)]));
+            }
+            builder.build().unwrap()
         }
 
         fn output_state(
@@ -992,6 +1042,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreground_fetch_error_during_bootstrap_is_immediate_and_terminal() {
+        let fixture = ThreeRowGroupFixture::new();
+        let control = ScriptControl::failing(0);
+        let (coordinator, context) = fixture.lookahead_context();
+        let reservation = Arc::clone(&context.reservation);
+        let mut stream = fixture.lookahead_stream(control.clone(), context);
+
+        let error = stream.next().await.unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("scripted row-group 0 failure"));
+        assert!(!control.has_request_for(1));
+        assert_eq!(control.active_fetches(), 0);
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn foreground_fetch_error_after_partial_byte_denial_is_immediate_and_terminal()
+    {
+        let fixture = ThreeRowGroupFixture::new();
+        let (_, serial_control) = fixture.serial_oracle().await;
+        let first_chunk_bytes = serial_control.requests_for(1)[0].ranges[..4]
+            .iter()
+            .map(|range| usize::try_from(range.end - range.start).unwrap())
+            .sum();
+        let control = ScriptControl::failing_after(1, 1);
+        let pool = Arc::new(GreedyMemoryPool::new(first_chunk_bytes));
+        let (coordinator, context) = fixture.lookahead_context_with_pool(pool.clone());
+        let reservation = Arc::clone(&context.reservation);
+        let mut stream = fixture.lookahead_stream(control.clone(), context);
+
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        let error = stream.next().await.unwrap().unwrap_err();
+
+        assert_eq!(batch_values(&first), vec![1]);
+        assert_eq!(batch_values(&second), vec![2]);
+        assert!(error.to_string().contains("scripted row-group 1 failure"));
+        assert_eq!(
+            control
+                .requests_for(1)
+                .iter()
+                .map(|request| request.ranges.len())
+                .collect::<Vec<_>>(),
+            vec![4, 2]
+        );
+        assert!(!control.has_request_for(2));
+        assert_eq!(control.active_fetches(), 0);
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn foreground_record_reader_decode_error_cancels_prefetch_and_terminates() {
+        let fixture = ThreeRowGroupFixture::new();
+        let control = ScriptControl::corrupting(0);
+        let (coordinator, context) = fixture.lookahead_context();
+        let reservation = Arc::clone(&context.reservation);
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let decoder =
+            fixture.decoder_for_row_groups_with_filter(None, &arrow_reader_metrics, None);
+        let mut stream = LookaheadPushDecoderStreamState::new(
+            decoder,
+            VecDeque::new(),
+            fixture.reader(control.clone()),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .into_stream();
+
+        let error = stream.next().await.unwrap().unwrap_err();
+
+        assert!(control.has_request_for(1));
+        assert!(!error.to_string().is_empty());
+        assert_eq!(control.active_fetches(), 0);
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn replacement_schema_error_cancels_pending_prefetch_and_terminates() {
+        let fixture = ThreeRowGroupFixture::new();
+        let control = ScriptControl::new(Some(1));
+        let (coordinator, context) = fixture.lookahead_context();
+        let reservation = Arc::clone(&context.reservation);
+        let (decoder, arrow_reader_metrics) = fixture.decoder();
+        let mut output = fixture.output_state(arrow_reader_metrics);
+        output.replace_schema = true;
+        output.output_schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, false),
+            Field::new("unexpected", DataType::Int32, false),
+        ]));
+        let mut stream = LookaheadPushDecoderStreamState::new(
+            decoder,
+            VecDeque::new(),
+            fixture.reader(control.clone()),
+            output,
+            context,
+        )
+        .into_stream();
+
+        let error = stream.next().await.unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("number of columns"));
+        assert!(control.has_request_for(1));
+        assert_eq!(control.active_fetches(), 0);
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn pending_decoder_run_is_not_prefetched_across_boundary() {
         let fixture = ThreeRowGroupFixture::new();
         let (serial, _) = fixture.serial_oracle().await;
@@ -1098,6 +1276,233 @@ mod tests {
         );
         assert_eq!(reservation.size(), 0);
         assert_eq!(pool.reserved(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_memory_denial_preserves_ranges_and_disables_later_speculation() {
+        let fixture = ThreeRowGroupFixture::new();
+        let (serial, serial_control) = fixture.serial_oracle().await;
+        let first_chunk_bytes = serial_control.requests_for(1)[0].ranges[..4]
+            .iter()
+            .map(|range| usize::try_from(range.end - range.start).unwrap())
+            .sum();
+        let control = ScriptControl::new(None);
+        let pool = Arc::new(GreedyMemoryPool::new(first_chunk_bytes));
+        let (coordinator, context) = fixture.lookahead_context_with_pool(pool.clone());
+        let reservation = Arc::clone(&context.reservation);
+        let stream = fixture.lookahead_stream(control.clone(), context);
+
+        let lookahead = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(lookahead, serial);
+        assert_eq!(
+            control
+                .requests_for(1)
+                .iter()
+                .map(|request| request.ranges.len())
+                .collect::<Vec<_>>(),
+            vec![4, 2]
+        );
+        assert_eq!(
+            control
+                .requests_for(2)
+                .iter()
+                .map(|request| request.ranges.len())
+                .collect::<Vec<_>>(),
+            vec![6]
+        );
+        let actual_ranges = control
+            .requests_for(1)
+            .iter()
+            .flat_map(|request| request.ranges.iter())
+            .map(|range| (range.start, range.end))
+            .collect::<HashSet<_>>();
+        let expected_ranges = serial_control
+            .requests_for(1)
+            .iter()
+            .flat_map(|request| request.ranges.iter())
+            .map(|range| (range.start, range.end))
+            .collect::<HashSet<_>>();
+        assert_eq!(actual_ranges, expected_ranges);
+        assert_eq!(actual_ranges.len(), 6);
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+    }
+
+    #[tokio::test]
+    async fn future_reader_can_be_ready_before_current_reader_drains() {
+        let fixture = ThreeRowGroupFixture::new();
+        let control = ScriptControl::new(None);
+        let (coordinator, context) = fixture.lookahead_context();
+        let reservation = Arc::clone(&context.reservation);
+        let mut stream = fixture.lookahead_stream(control.clone(), context);
+
+        let first = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(batch_values(&first), vec![1]);
+        assert!(control.has_request_for(1));
+        assert!(!control.has_request_for(2));
+        assert!(reservation.size() > 0);
+        assert!(coordinator.range_permits.available_permits() < MAX_IN_FLIGHT_RANGES);
+
+        let mut batches = vec![first];
+        batches.extend((&mut stream).try_collect::<Vec<_>>().await.unwrap());
+        assert_eq!(
+            batches.iter().flat_map(batch_values).collect::<Vec<_>>(),
+            (1..9).collect::<Vec<_>>()
+        );
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fully_filtered_row_group_is_skipped_before_following_data() {
+        let fixture = ThreeRowGroupFixture::new();
+        let control = ScriptControl::new(None);
+        let (coordinator, context) = fixture.lookahead_context();
+        let reservation = Arc::clone(&context.reservation);
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let decoder = fixture.decoder_for_row_groups_with_filter(
+            None,
+            &arrow_reader_metrics,
+            Some(2),
+        );
+        let stream = LookaheadPushDecoderStreamState::new(
+            decoder,
+            VecDeque::new(),
+            fixture.reader(control.clone()),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .into_stream();
+
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(
+            batches.iter().flat_map(batch_values).collect::<Vec<_>>(),
+            (3..9).collect::<Vec<_>>()
+        );
+        assert!(control.has_request_for(0));
+        assert!(control.has_request_for(1));
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+    }
+
+    #[tokio::test]
+    async fn immediately_finished_decoder_returns_terminal_eof_without_fetching() {
+        let fixture = ThreeRowGroupFixture::new();
+        let control = ScriptControl::new(None);
+        let (coordinator, context) = fixture.lookahead_context();
+        let reservation = Arc::clone(&context.reservation);
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let decoder = fixture.decoder_for_row_groups_with_filter(
+            Some(vec![]),
+            &arrow_reader_metrics,
+            Some(0),
+        );
+        let mut stream = LookaheadPushDecoderStreamState::new(
+            decoder,
+            VecDeque::new(),
+            fixture.reader(control.clone()),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .into_stream();
+
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
+        assert!(control.inner.requests.lock().unwrap().is_empty());
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_row_group_order_is_preserved_by_lookahead() {
+        let fixture = ThreeRowGroupFixture::new();
+        let control = ScriptControl::new(None);
+        let (coordinator, context) = fixture.lookahead_context();
+        let reservation = Arc::clone(&context.reservation);
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let decoder =
+            fixture.decoder_for_row_groups(Some(vec![2, 1, 0]), &arrow_reader_metrics);
+        let stream = LookaheadPushDecoderStreamState::new(
+            decoder,
+            VecDeque::new(),
+            fixture.reader(control),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .into_stream();
+
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(
+            batches.iter().flat_map(batch_values).collect::<Vec<_>>(),
+            vec![6, 7, 8, 3, 4, 5, 1, 2]
+        );
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_and_fully_matched_decoder_runs_preserve_output_order() {
+        let fixture = ThreeRowGroupFixture::new();
+        let control = ScriptControl::new(None);
+        let (coordinator, context) = fixture.lookahead_context();
+        let reservation = Arc::clone(&context.reservation);
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let first = fixture.decoder_for_row_groups_with_filter(
+            Some(vec![0]),
+            &arrow_reader_metrics,
+            Some(0),
+        );
+        let fully_matched = fixture.decoder_for_row_groups_with_filter(
+            Some(vec![1]),
+            &arrow_reader_metrics,
+            None,
+        );
+        let last = fixture.decoder_for_row_groups_with_filter(
+            Some(vec![2]),
+            &arrow_reader_metrics,
+            Some(6),
+        );
+        let stream = LookaheadPushDecoderStreamState::new(
+            first,
+            VecDeque::from([fully_matched, last]),
+            fixture.reader(control),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .into_stream();
+
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(
+            batches.iter().flat_map(batch_values).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 7, 8]
+        );
+        assert_eq!(reservation.size(), 0);
         assert_eq!(
             coordinator.range_permits.available_permits(),
             MAX_IN_FLIGHT_RANGES

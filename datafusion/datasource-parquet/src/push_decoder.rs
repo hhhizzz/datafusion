@@ -51,6 +51,11 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Gauge};
 use crate::access_plan::PreparedAccessPlan;
 use crate::row_filter::ParquetReadPlan;
 
+#[path = "push_decoder_lookahead.rs"]
+mod lookahead_driver;
+
+pub(crate) use lookahead_driver::LookaheadPushDecoderStreamState;
+
 /// Shared options applied to every [`ParquetPushDecoderBuilder`] in a file scan.
 ///
 /// A single scan may produce multiple decoders (for example, when fully matched
@@ -106,13 +111,18 @@ pub(crate) struct PushDecoderStreamState {
     /// Used when fully matched row groups split the scan into consecutive
     /// runs with different filter configurations, maintaining original order.
     pub(crate) pending_decoders: VecDeque<ParquetPushDecoder>,
+    pub(crate) reader: Box<dyn AsyncFileReader>,
+    pub(crate) output: PushDecoderOutputState,
+}
+
+/// Shared output handling for the serial and lookahead decoder drivers.
+pub(crate) struct PushDecoderOutputState {
     /// Global remaining row limit across all decoder runs.
     ///
     /// Decoder-local limits are only safe for single-run scans. When the scan
     /// is split across multiple decoders, the combined stream limit is enforced
     /// here instead.
     pub(crate) remaining_limit: Option<usize>,
-    pub(crate) reader: Box<dyn AsyncFileReader>,
     pub(crate) projector: Projector,
     pub(crate) output_schema: Arc<Schema>,
     pub(crate) replace_schema: bool,
@@ -120,6 +130,61 @@ pub(crate) struct PushDecoderStreamState {
     pub(crate) predicate_cache_inner_records: Gauge,
     pub(crate) predicate_cache_records: Gauge,
     pub(crate) baseline_metrics: BaselineMetrics,
+}
+
+impl PushDecoderOutputState {
+    pub(crate) fn limit_reached(&self) -> bool {
+        self.remaining_limit == Some(0)
+    }
+
+    pub(crate) fn finalize_batch(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+        let Self {
+            remaining_limit,
+            projector,
+            output_schema,
+            replace_schema,
+            arrow_reader_metrics,
+            predicate_cache_inner_records,
+            predicate_cache_records,
+            baseline_metrics,
+        } = self;
+
+        let batch = if let Some(remaining_limit) = remaining_limit {
+            if batch.num_rows() > *remaining_limit {
+                let batch = batch.slice(0, *remaining_limit);
+                *remaining_limit = 0;
+                batch
+            } else {
+                *remaining_limit -= batch.num_rows();
+                batch
+            }
+        } else {
+            batch
+        };
+
+        let mut timer = baseline_metrics.elapsed_compute().timer();
+        if let Some(value) = arrow_reader_metrics.records_read_from_inner() {
+            predicate_cache_inner_records.set(value);
+        }
+        if let Some(value) = arrow_reader_metrics.records_read_from_cache() {
+            predicate_cache_records.set(value);
+        }
+
+        let mut batch = projector.project_batch(&batch)?;
+        if *replace_schema {
+            // Preserve logical metadata and nullability that may not be present
+            // in the physical file schema.
+            let (_stream_schema, arrays, num_rows) = batch.into_parts();
+            let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
+            batch = RecordBatch::try_new_with_options(
+                Arc::clone(output_schema),
+                arrays,
+                &options,
+            )?;
+        }
+        timer.stop();
+        Ok(batch)
+    }
 }
 
 impl PushDecoderStreamState {
@@ -148,7 +213,7 @@ impl PushDecoderStreamState {
     /// with `unfold`'s ownership across yield points.
     async fn transition(mut self) -> Option<(Result<RecordBatch>, Self)> {
         loop {
-            if self.remaining_limit == Some(0) {
+            if self.output.limit_reached() {
                 return None;
             }
             match self.decoder.try_decode() {
@@ -168,24 +233,7 @@ impl PushDecoderStreamState {
                     }
                 }
                 Ok(DecodeResult::Data(batch)) => {
-                    let batch = if let Some(remaining_limit) = self.remaining_limit {
-                        if batch.num_rows() > remaining_limit {
-                            self.remaining_limit = Some(0);
-                            batch.slice(0, remaining_limit)
-                        } else {
-                            self.remaining_limit =
-                                Some(remaining_limit - batch.num_rows());
-                            batch
-                        }
-                    } else {
-                        batch
-                    };
-                    let mut timer = self.baseline_metrics.elapsed_compute().timer();
-                    self.copy_arrow_reader_metrics();
-                    let result = self.project_batch(&batch);
-                    timer.stop();
-                    // Release the borrow on baseline_metrics before moving self
-                    drop(timer);
+                    let result = self.output.finalize_batch(batch);
                     return Some((result, self));
                 }
                 Ok(DecodeResult::Finished) => {
@@ -202,38 +250,5 @@ impl PushDecoderStreamState {
                 }
             }
         }
-    }
-
-    /// Copies metrics from ArrowReaderMetrics (the metrics collected by the
-    /// arrow-rs parquet reader) to the parquet file metrics for DataFusion
-    fn copy_arrow_reader_metrics(&self) {
-        if let Some(v) = self.arrow_reader_metrics.records_read_from_inner() {
-            self.predicate_cache_inner_records.set(v);
-        }
-        if let Some(v) = self.arrow_reader_metrics.records_read_from_cache() {
-            self.predicate_cache_records.set(v);
-        }
-    }
-
-    fn project_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let mut batch = self.projector.project_batch(batch)?;
-        if self.replace_schema {
-            // Ensure the output batch has the expected schema.
-            // This handles things like schema level and field level metadata, which may not be present
-            // in the physical file schema.
-            // It is also possible for nullability to differ; some writers create files with
-            // OPTIONAL fields even when there are no nulls in the data.
-            // In these cases it may make sense for the logical schema to be `NOT NULL`.
-            // RecordBatch::try_new_with_options checks that if the schema is NOT NULL
-            // the array cannot contain nulls, amongst other checks.
-            let (_stream_schema, arrays, num_rows) = batch.into_parts();
-            let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
-            batch = RecordBatch::try_new_with_options(
-                Arc::clone(&self.output_schema),
-                arrays,
-                &options,
-            )?;
-        }
-        Ok(batch)
     }
 }

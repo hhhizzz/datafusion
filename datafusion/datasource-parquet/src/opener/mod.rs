@@ -26,7 +26,10 @@ use self::encryption::EncryptionContext;
 use crate::access_plan::PreparedAccessPlan;
 use crate::lookahead::{LookaheadFileContext, LookaheadScanContext};
 use crate::page_filter::PagePruningAccessPlanFilter;
-use crate::push_decoder::{DecoderBuilderConfig, PushDecoderStreamState};
+use crate::push_decoder::{
+    DecoderBuilderConfig, LookaheadPushDecoderStreamState, PushDecoderOutputState,
+    PushDecoderStreamState,
+};
 use crate::row_filter::{RowFilterGenerator, build_projection_read_plan};
 use crate::row_group_filter::{BloomFilterStatistics, RowGroupAccessPlanFilter};
 use crate::{
@@ -298,7 +301,6 @@ struct PreparedParquetOpen {
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
-    #[expect(dead_code, reason = "consumed by the lookahead decoder task")]
     lookahead: Option<LookaheadFileContext>,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
@@ -1261,11 +1263,8 @@ impl RowGroupsPrunedParquetOpen {
         let output_schema = Arc::clone(&prepared.output_schema);
         let files_ranges_pruned_statistics =
             prepared.file_metrics.files_ranges_pruned_statistics.clone();
-        let stream = PushDecoderStreamState {
-            decoder,
-            pending_decoders,
+        let output = PushDecoderOutputState {
             remaining_limit,
-            reader: prepared.async_file_reader,
             projector,
             output_schema,
             replace_schema,
@@ -1273,8 +1272,25 @@ impl RowGroupsPrunedParquetOpen {
             predicate_cache_inner_records,
             predicate_cache_records,
             baseline_metrics: prepared.baseline_metrics,
-        }
-        .into_stream();
+        };
+        let stream = if let Some(lookahead) = prepared.lookahead {
+            LookaheadPushDecoderStreamState::new(
+                decoder,
+                pending_decoders,
+                prepared.async_file_reader,
+                output,
+                lookahead,
+            )
+            .into_stream()
+        } else {
+            PushDecoderStreamState {
+                decoder,
+                pending_decoders,
+                reader: prepared.async_file_reader,
+                output,
+            }
+            .into_stream()
+        };
 
         // Wrap the stream so a dynamic filter can stop the file scan early.
         if let Some(file_pruner) = prepared.file_pruner {

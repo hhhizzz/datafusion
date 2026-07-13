@@ -20,21 +20,10 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub(crate) const MAX_IN_FLIGHT_RANGES: usize = 24;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the lookahead decoder task")
-)]
 pub(crate) const MAX_RANGES_PER_FILE_FETCH: usize = 4;
 pub(crate) const MAX_SPECULATIVE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "permits are consumed by the lookahead decoder task"
-    )
-)]
 pub(crate) struct ParquetLookaheadCoordinator {
     pub(crate) range_permits: Arc<Semaphore>,
     byte_permits: Arc<Semaphore>,
@@ -72,10 +61,6 @@ impl LookaheadFileContext {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the lookahead decoder task")
-    )]
     pub(crate) fn try_reserve(&self, bytes: usize) -> Option<SpeculativeLease> {
         let permit_count = u32::try_from(bytes).ok()?;
         let byte_permit = Arc::clone(&self.coordinator.byte_permits)

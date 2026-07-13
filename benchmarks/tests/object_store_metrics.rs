@@ -79,3 +79,32 @@ async fn configurable_gap_can_disable_range_merging() {
     assert_eq!(snapshot.body_bytes, 4);
     assert_eq!(snapshot.range_overfetch_bytes, 0);
 }
+
+#[tokio::test]
+async fn coalescing_only_store_does_not_collect_metrics() {
+    let wire_store = MetricsObjectStore::new(InMemory::new());
+    let wire_metrics = wire_store.metrics();
+    let store = MetricsObjectStore::new_coalescing(wire_store, 0);
+    let path = Path::from("data.parquet");
+    store
+        .put(&path, PutPayload::from_static(b"abcdef"))
+        .await
+        .unwrap();
+
+    let outer_metrics = store.metrics();
+    outer_metrics.reset();
+    wire_metrics.reset();
+    let result = store.get_ranges(&path, &[0..2, 4..6]).await.unwrap();
+
+    assert_eq!(
+        result,
+        vec![Bytes::from_static(b"ab"), Bytes::from_static(b"ef")]
+    );
+    let outer_snapshot = outer_metrics.snapshot();
+    assert_eq!(outer_snapshot.logical_ranges, 0);
+    assert_eq!(outer_snapshot.range_get_requests, 0);
+
+    let wire_snapshot = wire_metrics.snapshot();
+    assert_eq!(wire_snapshot.range_get_requests, 2);
+    assert_eq!(wire_snapshot.response_range_bytes, 4);
+}

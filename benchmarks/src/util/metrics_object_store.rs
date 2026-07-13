@@ -35,8 +35,8 @@ use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
     MultipartUpload, OBJECT_STORE_COALESCE_DEFAULT, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
-    coalesce_ranges,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions, Result, coalesce_ranges,
 };
 use serde::Serialize;
 
@@ -371,6 +371,7 @@ pub struct MetricsObjectStore<T: ObjectStore> {
     inner: T,
     metrics: ObjectStoreMetrics,
     coalesce_gap_bytes: u64,
+    metrics_enabled: bool,
 }
 
 impl<T: ObjectStore> MetricsObjectStore<T> {
@@ -379,6 +380,14 @@ impl<T: ObjectStore> MetricsObjectStore<T> {
     }
 
     pub fn new_with_coalesce_gap(inner: T, coalesce_gap_bytes: u64) -> Self {
+        Self::new_inner(inner, coalesce_gap_bytes, true)
+    }
+
+    pub fn new_coalescing(inner: T, coalesce_gap_bytes: u64) -> Self {
+        Self::new_inner(inner, coalesce_gap_bytes, false)
+    }
+
+    fn new_inner(inner: T, coalesce_gap_bytes: u64, metrics_enabled: bool) -> Self {
         let metrics = ObjectStoreMetrics::default();
         metrics
             .state
@@ -388,6 +397,7 @@ impl<T: ObjectStore> MetricsObjectStore<T> {
             inner,
             metrics,
             coalesce_gap_bytes,
+            metrics_enabled,
         }
     }
 
@@ -459,6 +469,9 @@ impl<T: ObjectStore> MetricsObjectStore<T> {
         location: &Path,
         range: Range<u64>,
     ) -> Result<Bytes> {
+        if !self.metrics_enabled {
+            return self.inner.get_range(location, range).await;
+        }
         let options = GetOptions::new().with_range(Some(range));
         self.instrumented_get_opts(location, options, false)
             .await?
@@ -493,7 +506,11 @@ impl<T: ObjectStore> ObjectStore for MetricsObjectStore<T> {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        self.instrumented_get_opts(location, options, true).await
+        if self.metrics_enabled {
+            self.instrumented_get_opts(location, options, true).await
+        } else {
+            self.inner.get_opts(location, options).await
+        }
     }
 
     async fn get_ranges(
@@ -501,18 +518,20 @@ impl<T: ObjectStore> ObjectStore for MetricsObjectStore<T> {
         location: &Path,
         ranges: &[Range<u64>],
     ) -> Result<Vec<Bytes>> {
-        self.metrics
-            .state
-            .get_ranges_calls
-            .fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .state
-            .logical_ranges
-            .fetch_add(ranges.len() as u64, Ordering::Relaxed);
-        self.metrics.state.logical_range_bytes.fetch_add(
-            ranges.iter().map(|range| range.end - range.start).sum(),
-            Ordering::Relaxed,
-        );
+        if self.metrics_enabled {
+            self.metrics
+                .state
+                .get_ranges_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .state
+                .logical_ranges
+                .fetch_add(ranges.len() as u64, Ordering::Relaxed);
+            self.metrics.state.logical_range_bytes.fetch_add(
+                ranges.iter().map(|range| range.end - range.start).sum(),
+                Ordering::Relaxed,
+            );
+        }
         coalesce_ranges(
             ranges,
             |range| self.get_coalesced_range(location, range),
@@ -529,18 +548,22 @@ impl<T: ObjectStore> ObjectStore for MetricsObjectStore<T> {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.metrics
-            .state
-            .list_requests
-            .fetch_add(1, Ordering::Relaxed);
+        if self.metrics_enabled {
+            self.metrics
+                .state
+                .list_requests
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        self.metrics
-            .state
-            .list_requests
-            .fetch_add(1, Ordering::Relaxed);
+        if self.metrics_enabled {
+            self.metrics
+                .state
+                .list_requests
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.inner.list_with_delimiter(prefix).await
     }
 

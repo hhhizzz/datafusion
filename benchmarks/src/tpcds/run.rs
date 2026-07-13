@@ -493,7 +493,7 @@ fn parse_bool_flag(value: &str) -> bool {
 }
 
 fn q39_reuse_control_enabled(query_id: usize, value: Option<&str>) -> bool {
-    query_id == 39 && value == Some("true")
+    query_id == 39 && value.is_some_and(parse_bool_flag)
 }
 
 fn object_store_coalesce_gap_from_env() -> Result<Option<u64>> {
@@ -558,10 +558,18 @@ mod tests {
     }
 
     #[test]
-    fn enables_q39_reuse_control_only_for_query_39_with_true_flag() {
-        assert!(q39_reuse_control_enabled(39, Some("true")));
+    fn enables_q39_reuse_control_only_for_query_39_with_truthy_flag() {
+        for value in ["true", "TRUE", "1", "yes", "YES"] {
+            assert!(q39_reuse_control_enabled(39, Some(value)));
+        }
 
-        for value in [None, Some("false"), Some("TRUE"), Some("1"), Some("yes")] {
+        for value in [
+            None,
+            Some("false"),
+            Some("0"),
+            Some("no"),
+            Some("unexpected"),
+        ] {
             assert!(!q39_reuse_control_enabled(39, value));
         }
 

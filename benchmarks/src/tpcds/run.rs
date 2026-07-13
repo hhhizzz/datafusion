@@ -466,10 +466,11 @@ fn register_s3_object_store(
         .with_bucket_name(bucket_name)
         .build()?;
 
-    if std::env::var("TPCDS_OBJECT_STORE_METRICS")
-        .is_ok_and(|value| parse_bool_flag(&value))
-    {
-        let coalesce_gap = object_store_coalesce_gap_from_env()?;
+    let metrics_enabled = std::env::var("TPCDS_OBJECT_STORE_METRICS")
+        .is_ok_and(|value| parse_bool_flag(&value));
+    let coalesce_gap = object_store_coalesce_gap_from_env()?;
+
+    if metrics_enabled {
         let effective_gap = coalesce_gap.unwrap_or(OBJECT_STORE_COALESCE_DEFAULT);
         let store = match coalesce_gap {
             Some(gap) => MetricsObjectStore::new_with_coalesce_gap(store, gap),
@@ -482,6 +483,14 @@ fn register_s3_object_store(
              coalesce_gap_bytes={effective_gap}"
         );
         Ok(Some(metrics))
+    } else if let Some(coalesce_gap) = coalesce_gap {
+        let store = MetricsObjectStore::new_coalescing(store, coalesce_gap);
+        ctx.register_object_store(object_store_url_ref, Arc::new(store));
+        println!(
+            "Registered coalescing S3 object store for {object_store_url} \
+             coalesce_gap_bytes={coalesce_gap} metrics=false"
+        );
+        Ok(None)
     } else {
         ctx.register_object_store(object_store_url_ref, Arc::new(store));
         println!("Registered S3 object store for {object_store_url}");

@@ -1,0 +1,18 @@
+[patch.crates-io]
+arrow = { path = "../arrow-latest-row-group-api-20260715/arrow" }
+arrow-arith = { path = "../arrow-latest-row-group-api-20260715/arrow-arith" }
+arrow-array = { path = "../arrow-latest-row-group-api-20260715/arrow-array" }
+arrow-avro = { path = "../arrow-latest-row-group-api-20260715/arrow-avro" }
+arrow-buffer = { path = "../arrow-latest-row-group-api-20260715/arrow-buffer" }
+arrow-cast = { path = "../arrow-latest-row-group-api-20260715/arrow-cast" }
+arrow-csv = { path = "../arrow-latest-row-group-api-20260715/arrow-csv" }
+arrow-data = { path = "../arrow-latest-row-group-api-20260715/arrow-data" }
+arrow-flight = { path = "../arrow-latest-row-group-api-20260715/arrow-flight" }
+arrow-ipc = { path = "../arrow-latest-row-group-api-20260715/arrow-ipc" }
+arrow-json = { path = "../arrow-latest-row-group-api-20260715/arrow-json" }
+arrow-ord = { path = "../arrow-latest-row-group-api-20260715/arrow-ord" }
+arrow-row = { path = "../arrow-latest-row-group-api-20260715/arrow-row" }
+arrow-schema = { path = "../arrow-latest-row-group-api-20260715/arrow-schema" }
+arrow-select = { path = "../arrow-latest-row-group-api-20260715/arrow-select" }
+arrow-string = { path = "../arrow-latest-row-group-api-20260715/arrow-string" }
+parquet = { path = "../arrow-latest-row-group-api-20260715/parquet" }

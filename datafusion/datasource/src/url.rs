@@ -273,7 +273,8 @@ impl ListingTableUrl {
             )
             .await?
         } else {
-            match store.head(&full_prefix).await {
+            match head_with_cache(ctx, store, self.table_ref.as_ref(), &full_prefix).await
+            {
                 Ok(meta) => futures::stream::once(async { Ok(meta) })
                     .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))
                     .boxed(),
@@ -357,6 +358,34 @@ impl ListingTableUrl {
     pub fn get_table_ref(&self) -> &Option<TableReference> {
         &self.table_ref
     }
+}
+
+/// Fetches metadata for an exact file path, reusing the listing cache when enabled.
+async fn head_with_cache(
+    ctx: &dyn Session,
+    store: &dyn ObjectStore,
+    table_ref: Option<&TableReference>,
+    path: &Path,
+) -> object_store::Result<ObjectMeta> {
+    let Some(cache) = ctx.runtime_env().cache_manager.get_list_files_cache() else {
+        return store.head(path).await;
+    };
+
+    let key = TableScopedPath {
+        table: table_ref.cloned(),
+        path: path.clone(),
+    };
+    if let Some(cached) = cache.get(&key)
+        && cached.files.len() == 1
+        && cached.files[0].location == *path
+    {
+        debug!("Hit exact file metadata cache");
+        return Ok(cached.files[0].clone());
+    }
+
+    let meta = store.head(path).await?;
+    cache.put(&key, vec![meta.clone()].into());
+    Ok(meta)
 }
 
 /// Lists files with cache support, using prefix-aware lookups.

@@ -79,8 +79,7 @@ async fn query_single_csv_file() {
     +---------+-------+-------+
     ------- Object Store Request Summary -------
     RequestCountingObjectStore()
-    Total Requests: 2
-    - GET  (opts) path=csv_table.csv head=true
+    Total Requests: 1
     - GET  (opts) path=csv_table.csv
     "
     );
@@ -243,8 +242,7 @@ async fn query_multi_csv_file() {
 /// the last range (start scan + data) = 7 data GETs total.  Additionally,
 /// adjacent ranges share a boundary position, so each shared boundary is scanned
 /// twice — once as the left range's end and again as the right range's start —
-/// producing the duplicate GETs visible in the snapshot.  Add the 1 HEAD for
-/// file-size metadata = **8 total**.
+/// producing the duplicate GETs visible in the snapshot = **7 total**.
 ///
 /// This differs from the JSON reader which uses [`AlignedBoundaryStream`] and
 /// needs only 1 GET per range.
@@ -275,8 +273,7 @@ async fn query_csv_file_with_byte_range_partitions() {
     +---------+-------+-------+
     ------- Object Store Request Summary -------
     RequestCountingObjectStore()
-    Total Requests: 8
-    - GET  (opts) path=csv_range_table.csv head=true
+    Total Requests: 7
     - GET  (opts) path=csv_range_table.csv range=42-129
     - GET  (opts) path=csv_range_table.csv range=0-49
     - GET  (opts) path=csv_range_table.csv range=42-129
@@ -433,8 +430,7 @@ async fn query_single_json_file() {
     +---------+-------+-------+
     ------- Object Store Request Summary -------
     RequestCountingObjectStore()
-    Total Requests: 2
-    - GET  (opts) path=json_table.json head=true
+    Total Requests: 1
     - GET  (opts) path=json_table.json
     "
     );
@@ -703,7 +699,7 @@ async fn query_partitioned_json_file() {
 /// With a single file and `target_partitions=3`, the repartitioner produces
 /// exactly 3 ranges.  Each range is served by a single [`AlignedBoundaryStream`]
 /// which issues exactly one bounded `get_opts` call, so there are 3 data GETs
-/// plus 1 HEAD (to determine file size) = **4 total**.
+/// total.
 ///
 /// This differs from the CSV reader, which needs multiple GETs per range.
 ///
@@ -733,8 +729,7 @@ async fn query_json_file_with_byte_range_partitions() {
     +---------+-------+------+
     ------- Object Store Request Summary -------
     RequestCountingObjectStore()
-    Total Requests: 4
-    - GET  (opts) path=json_range_table.json head=true
+    Total Requests: 3
     - GET  (opts) path=json_range_table.json range=0-216
     - GET  (opts) path=json_range_table.json range=71-216
     - GET  (opts) path=json_range_table.json range=143-216
@@ -901,8 +896,7 @@ async fn query_single_parquet_file_with_single_predicate() {
     +----------------------+----------------------+
     ------- Object Store Request Summary -------
     RequestCountingObjectStore()
-    Total Requests: 2
-    - GET  (opts) path=parquet_table.parquet head=true
+    Total Requests: 1
     - GET  (ranges) path=parquet_table.parquet ranges=1064-1481,1481-1594,1594-2011,2011-2124
     "
     );
@@ -925,8 +919,7 @@ async fn query_single_parquet_file_multi_row_groups_multiple_predicates() {
     +----------------------+----------------------+
     ------- Object Store Request Summary -------
     RequestCountingObjectStore()
-    Total Requests: 3
-    - GET  (opts) path=parquet_table.parquet head=true
+    Total Requests: 2
     - GET  (ranges) path=parquet_table.parquet ranges=4-421,421-534,534-951,951-1064
     - GET  (ranges) path=parquet_table.parquet ranges=1064-1481,1481-1594,1594-2011,2011-2124
     "

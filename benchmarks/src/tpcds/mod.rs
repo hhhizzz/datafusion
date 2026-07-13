@@ -15,5 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod q39_reuse;
+
 mod run;
 pub use run::RunOpt;

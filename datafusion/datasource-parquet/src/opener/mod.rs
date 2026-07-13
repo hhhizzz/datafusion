@@ -24,6 +24,7 @@ use self::early_stop::EarlyStoppingStream;
 #[cfg(feature = "parquet_encryption")]
 use self::encryption::EncryptionContext;
 use crate::access_plan::PreparedAccessPlan;
+use crate::lookahead::{LookaheadFileContext, LookaheadScanContext};
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{DecoderBuilderConfig, PushDecoderStreamState};
 use crate::row_filter::{RowFilterGenerator, build_projection_read_plan};
@@ -50,6 +51,7 @@ use datafusion_common::encryption::FileDecryptionProperties;
 use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, Result, ScalarValue, Statistics, exec_err};
 use datafusion_datasource::{PartitionedFile, TableSchema};
+use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::{
@@ -141,6 +143,8 @@ pub(super) struct ParquetMorselizer {
     pub reverse_row_groups: bool,
     /// Optional sort order used to reorder row groups by their min/max statistics.
     pub sort_order_for_reorder: Option<LexOrdering>,
+    /// Optional scan-scoped resources for speculative row-group reads.
+    pub lookahead: Option<LookaheadScanContext>,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -294,6 +298,8 @@ struct PreparedParquetOpen {
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
+    #[expect(dead_code, reason = "consumed by the lookahead decoder task")]
+    lookahead: Option<LookaheadFileContext>,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
 }
@@ -545,6 +551,8 @@ impl ParquetMorselizer {
         let file_range = partitioned_file.range.clone();
         let extensions = partitioned_file.extensions.clone();
         let file_name = partitioned_file.object_meta.location.to_string();
+        let lookahead =
+            create_lookahead_file_context(self.lookahead.as_ref(), &file_name);
         let file_metrics =
             ParquetFileMetrics::new(self.partition_index, &file_name, &self.metrics);
         let baseline_metrics = BaselineMetrics::new(&self.metrics, self.partition_index);
@@ -665,10 +673,22 @@ impl ParquetMorselizer {
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             preserve_order: self.preserve_order,
+            lookahead,
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties: None,
         })
     }
+}
+
+fn create_lookahead_file_context(
+    scan_context: Option<&LookaheadScanContext>,
+    file_name: &str,
+) -> Option<LookaheadFileContext> {
+    scan_context.map(|context| {
+        let reservation = MemoryConsumer::new(format!("ParquetLookahead[{file_name}]"))
+            .register(&context.memory_pool);
+        LookaheadFileContext::new(Arc::clone(&context.coordinator), Arc::new(reservation))
+    })
 }
 
 impl PreparedParquetOpen {
@@ -1420,6 +1440,7 @@ async fn load_page_index<T: AsyncFileReader>(
 mod test {
     use super::*;
     use super::{ConstantColumns, ParquetMorselizer, constant_columns_from_stats};
+    use crate::lookahead::{LookaheadScanContext, ParquetLookaheadCoordinator};
     use crate::{DefaultParquetFileReaderFactory, RowGroupAccess};
     use arrow::array::RecordBatch;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -1430,6 +1451,7 @@ mod test {
     };
     use datafusion_datasource::morsel::{Morsel, Morselizer};
     use datafusion_datasource::{PartitionedFile, TableSchema};
+    use datafusion_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
     use datafusion_expr::{col, lit};
     use datafusion_physical_expr::{
         PhysicalExpr,
@@ -1448,6 +1470,29 @@ mod test {
     use parquet::file::properties::WriterProperties;
     use std::collections::VecDeque;
     use std::sync::Arc;
+
+    #[test]
+    fn lookahead_file_context_is_named_and_opt_in() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+        let scan_context = LookaheadScanContext {
+            coordinator: Arc::clone(&coordinator),
+            memory_pool: Arc::clone(&pool),
+        };
+
+        assert!(create_lookahead_file_context(None, "bucket/file.parquet").is_none());
+
+        let file_context =
+            create_lookahead_file_context(Some(&scan_context), "bucket/file.parquet")
+                .expect("enabled scan context should create file context");
+
+        assert!(Arc::ptr_eq(&file_context.coordinator, &coordinator));
+        assert_eq!(file_context.reservation.size(), 0);
+        assert_eq!(
+            file_context.reservation.consumer().name(),
+            "ParquetLookahead[bucket/file.parquet]"
+        );
+    }
 
     /// Builder for creating [`ParquetMorselizer`] instances with sensible defaults for tests.
     /// This helps reduce code duplication and makes it clear what differs between test cases.
@@ -1623,6 +1668,7 @@ mod test {
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
                 sort_order_for_reorder: None,
+                lookahead: None,
             }
         }
     }

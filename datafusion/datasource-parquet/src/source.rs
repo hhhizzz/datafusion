@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::DefaultParquetFileReaderFactory;
 use crate::ParquetFileReaderFactory;
+use crate::lookahead::{LookaheadScanContext, ParquetLookaheadCoordinator};
 use crate::opener::ParquetMorselizer;
 use crate::opener::build_pruning_predicates;
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
@@ -37,8 +38,9 @@ use arrow::datatypes::TimeUnit;
 use datafusion_common::DataFusionError;
 use datafusion_common::config::TableParquetOptions;
 use datafusion_datasource::TableSchema;
-use datafusion_datasource::file::FileSource;
+use datafusion_datasource::file::{FileSource, FileSourceExecutionState};
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_execution::TaskContext;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{EquivalenceProperties, conjunction};
 use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
@@ -527,23 +529,24 @@ impl From<ParquetSource> for Arc<dyn FileSource> {
     }
 }
 
-impl FileSource for ParquetSource {
-    fn create_file_opener(
-        &self,
-        _object_store: Arc<dyn ObjectStore>,
-        _base_config: &FileScanConfig,
-        _partition: usize,
-    ) -> datafusion_common::Result<Arc<dyn FileOpener>> {
-        datafusion_common::internal_err!(
-            "ParquetSource::create_file_opener called but it supports the Morsel API, please use that instead"
-        )
-    }
+fn lookahead_context(
+    state: Option<FileSourceExecutionState>,
+    context: &TaskContext,
+) -> Option<LookaheadScanContext> {
+    let coordinator = state?.downcast::<ParquetLookaheadCoordinator>().ok()?;
+    Some(LookaheadScanContext {
+        coordinator,
+        memory_pool: Arc::clone(context.memory_pool()),
+    })
+}
 
-    fn create_morselizer(
+impl ParquetSource {
+    fn create_morselizer_internal(
         &self,
         object_store: Arc<dyn ObjectStore>,
         base_config: &FileScanConfig,
         partition: usize,
+        lookahead: Option<LookaheadScanContext>,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
         let expr_adapter_factory = base_config
             .expr_adapter_factory
@@ -613,7 +616,49 @@ impl FileSource for ParquetSource {
             max_predicate_cache_size: self.max_predicate_cache_size(),
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
+            lookahead,
         }))
+    }
+}
+
+impl FileSource for ParquetSource {
+    fn create_file_opener(
+        &self,
+        _object_store: Arc<dyn ObjectStore>,
+        _base_config: &FileScanConfig,
+        _partition: usize,
+    ) -> datafusion_common::Result<Arc<dyn FileOpener>> {
+        datafusion_common::internal_err!(
+            "ParquetSource::create_file_opener called but it supports the Morsel API, please use that instead"
+        )
+    }
+
+    fn create_execution_state(&self) -> Option<FileSourceExecutionState> {
+        self.table_parquet_options
+            .global
+            .row_group_lookahead
+            .then(|| Arc::new(ParquetLookaheadCoordinator::new()) as _)
+    }
+
+    fn create_morselizer(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+        self.create_morselizer_internal(object_store, base_config, partition, None)
+    }
+
+    fn create_morselizer_with_context(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+        context: Arc<TaskContext>,
+        state: Option<FileSourceExecutionState>,
+    ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+        let lookahead = lookahead_context(state, context.as_ref());
+        self.create_morselizer_internal(object_store, base_config, partition, lookahead)
     }
 
     fn reorder_files(
@@ -965,8 +1010,44 @@ impl FileSource for ParquetSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lookahead::ParquetLookaheadCoordinator;
     use arrow::datatypes::Schema;
+    use datafusion_execution::TaskContext;
     use datafusion_physical_expr::expressions::lit;
+
+    #[test]
+    fn lookahead_execution_state_is_opt_in() {
+        let schema = Arc::new(Schema::empty());
+        let default_source = ParquetSource::new(Arc::clone(&schema));
+        assert!(default_source.create_execution_state().is_none());
+
+        let mut options = TableParquetOptions::default();
+        options.global.row_group_lookahead = true;
+        let enabled_source =
+            ParquetSource::new(schema).with_table_parquet_options(options);
+
+        let state = enabled_source
+            .create_execution_state()
+            .expect("enabled lookahead should create scan state");
+        assert!(state.downcast::<ParquetLookaheadCoordinator>().is_ok());
+    }
+
+    #[test]
+    fn lookahead_context_requires_correctly_typed_execution_state() {
+        let context = TaskContext::default();
+        assert!(lookahead_context(None, &context).is_none());
+
+        let wrong_state: FileSourceExecutionState = Arc::new(());
+        assert!(lookahead_context(Some(wrong_state), &context).is_none());
+
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+        let state: FileSourceExecutionState = coordinator.clone();
+        let lookahead = lookahead_context(Some(state), &context)
+            .expect("correctly typed state should enable lookahead");
+
+        assert!(Arc::ptr_eq(&lookahead.coordinator, &coordinator));
+        assert!(Arc::ptr_eq(&lookahead.memory_pool, context.memory_pool()));
+    }
 
     #[test]
     #[expect(deprecated)]

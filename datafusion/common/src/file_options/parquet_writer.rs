@@ -235,6 +235,7 @@ impl ParquetOptions {
             skip_metadata: _,
             metadata_size_hint: _,
             pushdown_filters: _,
+            row_group_lookahead: _,
             reorder_filters: _,
             force_filter_selections: _, // not used for writer props
             allow_single_file_parallelism: _,

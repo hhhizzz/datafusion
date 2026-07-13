@@ -27,6 +27,7 @@
 pub mod access_plan;
 mod bloom_filter;
 pub mod file_format;
+mod lookahead;
 pub mod metadata;
 mod metrics;
 mod opener;

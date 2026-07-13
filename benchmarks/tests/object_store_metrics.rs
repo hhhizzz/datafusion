@@ -52,3 +52,30 @@ async fn records_logical_ranges_and_coalesced_wire_gets() {
     assert_eq!(snapshot.paths[0].response_range_bytes, 6);
     assert_eq!(snapshot.paths[0].body_bytes, 6);
 }
+
+#[tokio::test]
+async fn configurable_gap_can_disable_range_merging() {
+    let store = MetricsObjectStore::new_with_coalesce_gap(InMemory::new(), 0);
+    let path = Path::from("data.parquet");
+    store
+        .put(&path, PutPayload::from_static(b"abcdef"))
+        .await
+        .unwrap();
+
+    let metrics = store.metrics();
+    metrics.reset();
+    let result = store.get_ranges(&path, &[0..2, 4..6]).await.unwrap();
+
+    assert_eq!(
+        result,
+        vec![Bytes::from_static(b"ab"), Bytes::from_static(b"ef")]
+    );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.coalesce_gap_bytes, 0);
+    assert_eq!(snapshot.logical_ranges, 2);
+    assert_eq!(snapshot.logical_range_bytes, 4);
+    assert_eq!(snapshot.range_get_requests, 2);
+    assert_eq!(snapshot.response_range_bytes, 4);
+    assert_eq!(snapshot.body_bytes, 4);
+    assert_eq!(snapshot.range_overfetch_bytes, 0);
+}

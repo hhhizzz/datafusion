@@ -24,10 +24,11 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use datafusion_common::instant::Instant;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use object_store::path::Path;
@@ -63,6 +64,7 @@ struct PathMetrics {
 
 #[derive(Debug, Default)]
 struct MetricsState {
+    coalesce_gap_bytes: AtomicU64,
     get_ranges_calls: AtomicU64,
     logical_ranges: AtomicU64,
     logical_range_bytes: AtomicU64,
@@ -107,6 +109,7 @@ pub struct PathMetricsSnapshot {
 /// Serializable metrics collected since the last reset.
 #[derive(Debug, Serialize)]
 pub struct ObjectStoreMetricsSnapshot {
+    pub coalesce_gap_bytes: u64,
     pub get_ranges_calls: u64,
     pub logical_ranges: u64,
     pub logical_range_bytes: u64,
@@ -234,6 +237,7 @@ impl ObjectStoreMetrics {
         let response_range_bytes =
             self.state.response_range_bytes.load(Ordering::Relaxed);
         ObjectStoreMetricsSnapshot {
+            coalesce_gap_bytes: self.state.coalesce_gap_bytes.load(Ordering::Relaxed),
             get_ranges_calls: self.state.get_ranges_calls.load(Ordering::Relaxed),
             logical_ranges: self.state.logical_ranges.load(Ordering::Relaxed),
             logical_range_bytes,
@@ -366,13 +370,24 @@ impl ObjectStoreMetrics {
 pub struct MetricsObjectStore<T: ObjectStore> {
     inner: T,
     metrics: ObjectStoreMetrics,
+    coalesce_gap_bytes: u64,
 }
 
 impl<T: ObjectStore> MetricsObjectStore<T> {
     pub fn new(inner: T) -> Self {
+        Self::new_with_coalesce_gap(inner, OBJECT_STORE_COALESCE_DEFAULT)
+    }
+
+    pub fn new_with_coalesce_gap(inner: T, coalesce_gap_bytes: u64) -> Self {
+        let metrics = ObjectStoreMetrics::default();
+        metrics
+            .state
+            .coalesce_gap_bytes
+            .store(coalesce_gap_bytes, Ordering::Relaxed);
         Self {
             inner,
-            metrics: ObjectStoreMetrics::default(),
+            metrics,
+            coalesce_gap_bytes,
         }
     }
 
@@ -501,7 +516,7 @@ impl<T: ObjectStore> ObjectStore for MetricsObjectStore<T> {
         coalesce_ranges(
             ranges,
             |range| self.get_coalesced_range(location, range),
-            OBJECT_STORE_COALESCE_DEFAULT,
+            self.coalesce_gap_bytes,
         )
         .await
     }

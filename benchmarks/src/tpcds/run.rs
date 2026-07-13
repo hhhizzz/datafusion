@@ -37,6 +37,7 @@ use datafusion::prelude::*;
 use datafusion_common::instant::Instant;
 use datafusion_common::utils::get_available_parallelism;
 use datafusion_common::{DEFAULT_PARQUET_EXTENSION, DataFusionError, plan_err};
+use object_store::OBJECT_STORE_COALESCE_DEFAULT;
 use object_store::aws::AmazonS3Builder;
 use url::Url;
 
@@ -47,6 +48,7 @@ use log::info;
 type BoolDefaultTrue = bool;
 pub const TPCDS_QUERY_START_ID: usize = 1;
 pub const TPCDS_QUERY_END_ID: usize = 99;
+const OBJECT_STORE_COALESCE_GAP_ENV: &str = "TPCDS_OBJECT_STORE_COALESCE_GAP_BYTES";
 
 pub const TPCDS_TABLES: &[&str] = &[
     "call_center",
@@ -408,10 +410,18 @@ fn register_s3_object_store(
     if std::env::var("TPCDS_OBJECT_STORE_METRICS")
         .is_ok_and(|value| parse_bool_flag(&value))
     {
-        let store = MetricsObjectStore::new(store);
+        let coalesce_gap = object_store_coalesce_gap_from_env()?;
+        let effective_gap = coalesce_gap.unwrap_or(OBJECT_STORE_COALESCE_DEFAULT);
+        let store = match coalesce_gap {
+            Some(gap) => MetricsObjectStore::new_with_coalesce_gap(store, gap),
+            None => MetricsObjectStore::new(store),
+        };
         let metrics = store.metrics();
         ctx.register_object_store(object_store_url_ref, Arc::new(store));
-        println!("Registered instrumented S3 object store for {object_store_url}");
+        println!(
+            "Registered instrumented S3 object store for {object_store_url} \
+             coalesce_gap_bytes={effective_gap}"
+        );
         Ok(Some(metrics))
     } else {
         ctx.register_object_store(object_store_url_ref, Arc::new(store));
@@ -422,6 +432,30 @@ fn register_s3_object_store(
 
 fn parse_bool_flag(value: &str) -> bool {
     matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+}
+
+fn object_store_coalesce_gap_from_env() -> Result<Option<u64>> {
+    match std::env::var(OBJECT_STORE_COALESCE_GAP_ENV) {
+        Ok(value) => parse_object_store_coalesce_gap(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(DataFusionError::Configuration(format!(
+                "{OBJECT_STORE_COALESCE_GAP_ENV} must contain a UTF-8 u64 byte value"
+            )))
+        }
+    }
+}
+
+fn parse_object_store_coalesce_gap(value: Option<&str>) -> Result<Option<u64>> {
+    value
+        .map(|value| {
+            value.parse::<u64>().map_err(|error| {
+                DataFusionError::Configuration(format!(
+                    "invalid {OBJECT_STORE_COALESCE_GAP_ENV} value '{value}': {error}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 fn s3_object_store_url(path: &str) -> Result<Option<ObjectStoreUrl>> {
@@ -459,5 +493,22 @@ mod tests {
         for disabled in ["false", "0", "no", "", "unexpected"] {
             assert!(!parse_bool_flag(disabled));
         }
+    }
+
+    #[test]
+    fn parses_object_store_coalesce_gap() {
+        assert_eq!(parse_object_store_coalesce_gap(None).unwrap(), None);
+        assert_eq!(parse_object_store_coalesce_gap(Some("0")).unwrap(), Some(0));
+        assert_eq!(
+            parse_object_store_coalesce_gap(Some("65536")).unwrap(),
+            Some(65536)
+        );
+
+        let error = parse_object_store_coalesce_gap(Some("invalid")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("TPCDS_OBJECT_STORE_COALESCE_GAP_BYTES")
+        );
     }
 }

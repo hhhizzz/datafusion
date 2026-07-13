@@ -34,7 +34,10 @@ async fn records_logical_ranges_and_coalesced_wire_gets() {
     metrics.reset();
     let result = store.get_ranges(&path, &[0..2, 4..6]).await.unwrap();
 
-    assert_eq!(result, vec![Bytes::from_static(b"ab"), Bytes::from_static(b"ef")]);
+    assert_eq!(
+        result,
+        vec![Bytes::from_static(b"ab"), Bytes::from_static(b"ef")]
+    );
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.get_ranges_calls, 1);
     assert_eq!(snapshot.logical_ranges, 2);
@@ -43,4 +46,9 @@ async fn records_logical_ranges_and_coalesced_wire_gets() {
     assert_eq!(snapshot.response_range_bytes, 6);
     assert_eq!(snapshot.body_bytes, 6);
     assert_eq!(snapshot.peak_in_flight, 1);
+    assert_eq!(snapshot.paths.len(), 1);
+    assert_eq!(snapshot.paths[0].path, "data.parquet");
+    assert_eq!(snapshot.paths[0].range_get_requests, 1);
+    assert_eq!(snapshot.paths[0].response_range_bytes, 6);
+    assert_eq!(snapshot.paths[0].body_bytes, 6);
 }

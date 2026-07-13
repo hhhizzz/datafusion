@@ -22,9 +22,13 @@ pub(crate) mod sort_pushdown;
 
 use crate::file_groups::FileGroup;
 use crate::{
-    PartitionedFile, display::FileGroupsDisplay, file::FileSource,
-    file_compression_type::FileCompressionType, file_stream::FileStreamBuilder,
-    file_stream::work_source::SharedWorkSource, source::DataSource,
+    PartitionedFile,
+    display::FileGroupsDisplay,
+    file::{FileSource, FileSourceExecutionState},
+    file_compression_type::FileCompressionType,
+    file_stream::FileStreamBuilder,
+    file_stream::work_source::SharedWorkSource,
+    source::DataSource,
     statistics::MinMaxStatistics,
 };
 use arrow::datatypes::FieldRef;
@@ -58,6 +62,11 @@ use datafusion_physical_plan::{
 use log::{debug, warn};
 use std::any::Any;
 use std::{fmt::Debug, fmt::Formatter, fmt::Result as FmtResult, sync::Arc};
+
+struct FileScanExecutionState {
+    shared_work_source: Option<SharedWorkSource>,
+    file_source_state: Option<FileSourceExecutionState>,
+}
 
 /// [`FileScanConfig`] represents scanning data from a group of files
 ///
@@ -593,15 +602,27 @@ impl DataSource for FileScanConfig {
 
         let source = self.file_source.with_batch_size(batch_size);
 
-        let morselizer = source.create_morselizer(object_store, self, partition)?;
-
-        // Extract the shared work source from the sibling state if it exists.
-        // This allows multiple sibling streams to steal work from a single
-        // shared queue of unopened files.
-        let shared_work_source = sibling_state
+        let execution_state = sibling_state
             .as_ref()
-            .and_then(|state| state.downcast_ref::<SharedWorkSource>())
-            .cloned();
+            .and_then(|state| state.downcast_ref::<FileScanExecutionState>());
+        let shared_work_source = execution_state
+            .and_then(|state| state.shared_work_source.clone())
+            .or_else(|| {
+                sibling_state
+                    .as_ref()
+                    .and_then(|state| state.downcast_ref::<SharedWorkSource>())
+                    .cloned()
+            });
+        let file_source_state =
+            execution_state.and_then(|state| state.file_source_state.clone());
+
+        let morselizer = source.create_morselizer_with_context(
+            object_store,
+            self,
+            partition,
+            context,
+            file_source_state,
+        )?;
 
         let stream = FileStreamBuilder::new(self)
             .with_partition(partition)
@@ -1037,15 +1058,29 @@ impl DataSource for FileScanConfig {
     /// Create any shared state that should be passed between sibling streams
     /// during one execution.
     ///
-    /// This returns `None` when sibling streams must not share work, such as
-    /// when file order must be preserved or the file groups define the output
-    /// partitioning needed for the rest of the plan
+    /// This returns `None` when neither the file source nor sibling streams
+    /// need shared execution state.
     fn create_sibling_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-        if self.preserve_order || self.partitioned_by_file_group {
-            return None;
-        }
+        let shared_work_source = if self.preserve_order || self.partitioned_by_file_group
+        {
+            None
+        } else {
+            Some(SharedWorkSource::from_config(self))
+        };
+        let file_source_state = self.file_source.create_execution_state();
 
-        Some(Arc::new(SharedWorkSource::from_config(self)) as Arc<dyn Any + Send + Sync>)
+        match (shared_work_source, file_source_state) {
+            (None, None) => None,
+            (Some(shared_work_source), None) => {
+                Some(Arc::new(shared_work_source) as Arc<dyn Any + Send + Sync>)
+            }
+            (shared_work_source, file_source_state) => {
+                Some(Arc::new(FileScanExecutionState {
+                    shared_work_source,
+                    file_source_state,
+                }) as Arc<dyn Any + Send + Sync>)
+            }
+        }
     }
 }
 
@@ -1421,6 +1456,7 @@ pub fn wrap_partition_value_in_dict(val: ScalarValue) -> ScalarValue {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::TableSchema;
@@ -1499,6 +1535,130 @@ mod tests {
             Ok(SortOrderPushdownResult::Inexact {
                 inner: Arc::new(self.clone()) as Arc<dyn FileSource>,
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct ExecutionStateTestSource {
+        metrics: ExecutionPlanMetricsSet,
+        observed_context: Arc<Mutex<Option<ObservedMorselizerContext>>>,
+        table_schema: TableSchema,
+    }
+
+    #[derive(Debug)]
+    struct ExecutionStateMarker;
+
+    struct ObservedMorselizerContext {
+        context: Arc<TaskContext>,
+        state_is_marker: bool,
+    }
+
+    impl ExecutionStateTestSource {
+        fn new(table_schema: TableSchema) -> Self {
+            Self {
+                metrics: ExecutionPlanMetricsSet::new(),
+                observed_context: Arc::new(Mutex::new(None)),
+                table_schema,
+            }
+        }
+    }
+
+    impl FileSource for ExecutionStateTestSource {
+        fn create_file_opener(
+            &self,
+            _object_store: Arc<dyn ObjectStore>,
+            _base_config: &FileScanConfig,
+            _partition: usize,
+        ) -> Result<Arc<dyn crate::file_stream::FileOpener>> {
+            unimplemented!()
+        }
+
+        fn create_execution_state(&self) -> Option<FileSourceExecutionState> {
+            Some(Arc::new(ExecutionStateMarker))
+        }
+
+        fn create_morselizer_with_context(
+            &self,
+            _object_store: Arc<dyn ObjectStore>,
+            _base_config: &FileScanConfig,
+            _partition: usize,
+            context: Arc<TaskContext>,
+            state: Option<FileSourceExecutionState>,
+        ) -> Result<Box<dyn crate::morsel::Morselizer>> {
+            *self.observed_context.lock().unwrap() = Some(ObservedMorselizerContext {
+                context,
+                state_is_marker: state
+                    .is_some_and(|state| state.is::<ExecutionStateMarker>()),
+            });
+            Ok(Box::new(crate::morsel::mocks::MockMorselizer::default()))
+        }
+
+        fn table_schema(&self) -> &TableSchema {
+            &self.table_schema
+        }
+
+        fn with_batch_size(&self, _batch_size: usize) -> Arc<dyn FileSource> {
+            Arc::new(self.clone())
+        }
+
+        fn metrics(&self) -> &ExecutionPlanMetricsSet {
+            &self.metrics
+        }
+
+        fn file_type(&self) -> &str {
+            "execution-state-test"
+        }
+    }
+
+    fn execution_state_test_config(
+        source: Arc<dyn FileSource>,
+        preserve_order: bool,
+        partitioned_by_file_group: bool,
+    ) -> FileScanConfig {
+        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+            .with_file_group(FileGroup::new(vec![]))
+            .with_preserve_order(preserve_order)
+            .with_partitioned_by_file_group(partitioned_by_file_group)
+            .build()
+    }
+
+    #[test]
+    fn file_source_execution_state_reaches_contextual_morselizer() -> Result<()> {
+        let table_schema = TableSchema::new(Arc::new(Schema::empty()), vec![]);
+        let source = ExecutionStateTestSource::new(table_schema);
+        let observed_context = Arc::clone(&source.observed_context);
+        let config = execution_state_test_config(Arc::new(source), false, false);
+        let context = Arc::new(TaskContext::default());
+        let sibling_state = DataSource::create_sibling_state(&config);
+
+        config.open_with_args(
+            OpenArgs::new(0, Arc::clone(&context)).with_shared_state(sibling_state),
+        )?;
+
+        let observed_context = observed_context.lock().unwrap().take().unwrap();
+        assert!(observed_context.state_is_marker);
+        assert!(Arc::ptr_eq(&observed_context.context, &context));
+        Ok(())
+    }
+
+    #[test]
+    fn execution_state_does_not_enable_work_stealing_when_order_or_file_groups_matter() {
+        let table_schema = TableSchema::new(Arc::new(Schema::empty()), vec![]);
+
+        for (preserve_order, partitioned_by_file_group) in [(true, false), (false, true)]
+        {
+            let config = execution_state_test_config(
+                Arc::new(ExecutionStateTestSource::new(table_schema.clone())),
+                preserve_order,
+                partitioned_by_file_group,
+            );
+            let sibling_state = DataSource::create_sibling_state(&config).unwrap();
+            let state = sibling_state
+                .downcast_ref::<FileScanExecutionState>()
+                .unwrap();
+
+            assert!(state.shared_work_source.is_none());
+            assert!(state.file_source_state.is_some());
         }
     }
 

@@ -30,6 +30,7 @@ use crate::morsel::{FileOpenerMorselizer, Morselizer};
 use crate::schema_adapter::SchemaAdapterFactory;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, not_impl_err};
+use datafusion_execution::TaskContext;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::DisplayFormatType;
@@ -39,6 +40,9 @@ use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use object_store::ObjectStore;
+
+/// Per-execution state created by a [`FileSource`] and shared by its sibling streams.
+pub type FileSourceExecutionState = Arc<dyn Any + Send + Sync>;
 
 /// Helper function to convert any type implementing [`FileSource`] to `Arc<dyn FileSource>`
 pub fn as_file_source<T: FileSource + 'static>(source: T) -> Arc<dyn FileSource> {
@@ -89,6 +93,26 @@ pub trait FileSource: Any + Send + Sync {
     ) -> Result<Box<dyn Morselizer>> {
         let opener = self.create_file_opener(object_store, base_config, partition)?;
         Ok(Box::new(FileOpenerMorselizer::new(opener)))
+    }
+
+    /// Creates optional state shared by sibling streams during one execution.
+    fn create_execution_state(&self) -> Option<FileSourceExecutionState> {
+        None
+    }
+
+    /// Creates a [`Morselizer`] with execution context and optional shared state.
+    ///
+    /// The default implementation preserves the legacy [`Self::create_morselizer`]
+    /// entry point for existing file sources.
+    fn create_morselizer_with_context(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+        _context: Arc<TaskContext>,
+        _state: Option<FileSourceExecutionState>,
+    ) -> Result<Box<dyn Morselizer>> {
+        self.create_morselizer(object_store, base_config, partition)
     }
 
     /// Returns the table schema for the overall table (including partition columns, if any)

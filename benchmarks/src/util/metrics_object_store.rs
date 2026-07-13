@@ -290,7 +290,6 @@ impl ObjectStoreMetrics {
         RequestTracker {
             metrics: self.clone(),
             path: path.to_string(),
-            kind,
             started: Instant::now(),
             body_bytes: 0,
             failed: false,
@@ -552,7 +551,6 @@ impl<T: ObjectStore> ObjectStore for MetricsObjectStore<T> {
 struct RequestTracker {
     metrics: ObjectStoreMetrics,
     path: String,
-    kind: RequestKind,
     started: Instant,
     body_bytes: u64,
     failed: bool,

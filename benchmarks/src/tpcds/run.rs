@@ -414,4 +414,14 @@ mod tests {
     fn ignores_local_path_for_s3_registration() {
         assert!(s3_object_store_url("/tmp/tpcds_sf10").unwrap().is_none());
     }
+
+    #[test]
+    fn parses_object_store_metrics_flag() {
+        for enabled in ["true", "TRUE", "1", "yes", "YES"] {
+            assert!(parse_bool_flag(enabled));
+        }
+        for disabled in ["false", "0", "no", "", "unexpected"] {
+            assert!(!parse_bool_flag(disabled));
+        }
+    }
 }

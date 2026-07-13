@@ -878,8 +878,7 @@ async fn query_single_parquet_file() {
     +---------------------------------+------------------------+
     ------- Object Store Request Summary -------
     RequestCountingObjectStore()
-    Total Requests: 3
-    - GET  (opts) path=parquet_table.parquet head=true
+    Total Requests: 2
     - GET  (ranges) path=parquet_table.parquet ranges=4-534,534-1064
     - GET  (ranges) path=parquet_table.parquet ranges=1064-1594,1594-2124
     "

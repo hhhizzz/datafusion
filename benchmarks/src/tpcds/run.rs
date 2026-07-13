@@ -19,6 +19,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::q39_reuse::{self, Q39_REUSE_TABLE};
 use crate::util::metrics_object_store::{MetricsObjectStore, ObjectStoreMetrics};
 use crate::util::{BenchmarkRun, CommonOpt, QueryResult, print_memory_stats};
 
@@ -49,6 +50,7 @@ type BoolDefaultTrue = bool;
 pub const TPCDS_QUERY_START_ID: usize = 1;
 pub const TPCDS_QUERY_END_ID: usize = 99;
 const OBJECT_STORE_COALESCE_GAP_ENV: &str = "TPCDS_OBJECT_STORE_COALESCE_GAP_BYTES";
+const Q39_REUSE_CONTROL_ENV: &str = "TPCDS_Q39_REUSE_CONTROL";
 
 pub const TPCDS_TABLES: &[&str] = &[
     "call_center",
@@ -224,6 +226,11 @@ impl RunOpt {
             println!("=== SQL for query {query_id} ===\n{}\n", sql.join(";\n"));
         }
 
+        let q39_reuse_control = q39_reuse_control_enabled(
+            query_id,
+            std::env::var(Q39_REUSE_CONTROL_ENV).ok().as_deref(),
+        );
+
         for i in 0..self.iterations() {
             if let Some(metrics) = object_store_metrics {
                 metrics.reset();
@@ -232,11 +239,18 @@ impl RunOpt {
 
             // query 15 is special, with 3 statements. the second statement is the one from which we
             // want to capture the results
-            let mut result = vec![];
+            let result = if q39_reuse_control {
+                self.execute_q39_reuse_consumers(ctx, i, &q39_reuse::consumer_sql())
+                    .await?
+            } else {
+                let mut result = vec![];
 
-            for query in sql {
-                result = self.execute_query(ctx, query).await?;
-            }
+                for query in sql {
+                    result = self.execute_query(ctx, query).await?;
+                }
+
+                result
+            };
 
             let elapsed = start.elapsed();
             if let Some(metrics) = object_store_metrics {
@@ -327,6 +341,41 @@ impl RunOpt {
             }
         }
         Ok(result)
+    }
+
+    async fn execute_q39_reuse_consumers(
+        &self,
+        ctx: &SessionContext,
+        iteration: usize,
+        consumers: &[String],
+    ) -> Result<Vec<RecordBatch>> {
+        let materialized = q39_reuse::materialize(ctx).await?;
+        ctx.register_table(Q39_REUSE_TABLE, materialized.table)?;
+        println!(
+            "TPCDS_Q39_REUSE_CONTROL iteration={iteration} rows={} batches={} bytes={}",
+            materialized.stats.rows,
+            materialized.stats.batches,
+            materialized.stats.estimated_bytes,
+        );
+
+        let execution = async {
+            let mut result = vec![];
+            for query in consumers {
+                result = self.execute_query(ctx, query).await?;
+            }
+            Ok(result)
+        }
+        .await;
+        let cleanup = ctx.deregister_table(Q39_REUSE_TABLE).map(|_| ());
+
+        match (execution, cleanup) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(execution), Ok(())) => Err(execution),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(execution), Err(cleanup)) => {
+                Err(DataFusionError::Collection(vec![execution, cleanup]))
+            }
+        }
     }
 
     async fn get_table(
@@ -443,6 +492,10 @@ fn parse_bool_flag(value: &str) -> bool {
     matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
 }
 
+fn q39_reuse_control_enabled(query_id: usize, value: Option<&str>) -> bool {
+    query_id == 39 && value == Some("true")
+}
+
 fn object_store_coalesce_gap_from_env() -> Result<Option<u64>> {
     match std::env::var(OBJECT_STORE_COALESCE_GAP_ENV) {
         Ok(value) => parse_object_store_coalesce_gap(Some(&value)),
@@ -505,6 +558,35 @@ mod tests {
     }
 
     #[test]
+    fn enables_q39_reuse_control_only_for_query_39_with_true_flag() {
+        assert!(q39_reuse_control_enabled(39, Some("true")));
+
+        for value in [None, Some("false"), Some("TRUE"), Some("1"), Some("yes")] {
+            assert!(!q39_reuse_control_enabled(39, value));
+        }
+
+        assert!(!q39_reuse_control_enabled(38, Some("true")));
+        assert!(!q39_reuse_control_enabled(40, Some("true")));
+    }
+
+    #[tokio::test]
+    async fn q39_reuse_consumer_failure_deregisters_temporary_table() {
+        let ctx = SessionContext::new();
+        register_q39_fixture(&ctx).await.unwrap();
+
+        let result = q39_reuse_runner()
+            .execute_q39_reuse_consumers(
+                &ctx,
+                0,
+                &["SELECT * FROM missing_q39_reuse_input".to_string()],
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(ctx.table(Q39_REUSE_TABLE).await.is_err());
+    }
+
+    #[test]
     fn parses_object_store_coalesce_gap() {
         assert_eq!(parse_object_store_coalesce_gap(None).unwrap(), None);
         assert_eq!(parse_object_store_coalesce_gap(Some("0")).unwrap(), Some(0));
@@ -519,5 +601,54 @@ mod tests {
                 .to_string()
                 .contains("TPCDS_OBJECT_STORE_COALESCE_GAP_BYTES")
         );
+    }
+
+    fn q39_reuse_runner() -> RunOpt {
+        RunOpt {
+            query: Some(39),
+            common: CommonOpt {
+                iterations: 1,
+                partitions: Some(1),
+                batch_size: None,
+                mem_pool_type: "fair".to_string(),
+                memory_limit: None,
+                sort_spill_reservation_bytes: None,
+                debug: false,
+                simulate_latency: false,
+            },
+            path: PathBuf::new(),
+            query_path: PathBuf::new(),
+            mem_table: false,
+            output_path: None,
+            disable_statistics: false,
+            prefer_hash_join: true,
+            enable_piecewise_merge_join: false,
+            sorted: false,
+            hash_join_buffering_capacity: 0,
+        }
+    }
+
+    async fn register_q39_fixture(ctx: &SessionContext) -> Result<()> {
+        for sql in [
+            "CREATE TABLE inventory (\
+             inv_item_sk BIGINT, inv_warehouse_sk BIGINT, inv_date_sk BIGINT, \
+             inv_quantity_on_hand BIGINT) AS VALUES \
+             (10, 1, 1, 0), (10, 1, 2, 0), (10, 1, 3, 3), \
+             (10, 1, 4, 0), (10, 1, 5, 0), (10, 1, 6, 3), \
+             (20, 1, 7, 0), (20, 1, 8, 2), \
+             (20, 1, 9, 0), (20, 1, 10, 2)",
+            "CREATE TABLE item (i_item_sk BIGINT) AS VALUES (10), (20)",
+            "CREATE TABLE warehouse (w_warehouse_sk BIGINT, w_warehouse_name VARCHAR) \
+             AS VALUES (1, 'warehouse 1')",
+            "CREATE TABLE date_dim (d_date_sk BIGINT, d_year BIGINT, d_moy BIGINT) \
+             AS VALUES \
+             (1, 1998, 4), (2, 1998, 4), (3, 1998, 4), \
+             (4, 1998, 5), (5, 1998, 5), (6, 1998, 5), \
+             (7, 1998, 4), (8, 1998, 4), (9, 1998, 5), (10, 1998, 5)",
+        ] {
+            ctx.sql(sql).await?.collect().await?;
+        }
+
+        Ok(())
     }
 }

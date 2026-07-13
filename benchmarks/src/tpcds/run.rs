@@ -19,6 +19,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::util::metrics_object_store::{MetricsObjectStore, ObjectStoreMetrics};
 use crate::util::{BenchmarkRun, CommonOpt, QueryResult, print_memory_stats};
 
 use arrow::datatypes::Schema;
@@ -232,14 +233,20 @@ impl RunOpt {
         let rt = self.common.build_runtime()?;
         let ctx = SessionContext::new_with_config_rt(config, rt);
 
-        register_s3_object_store(&ctx, self.path.to_str().unwrap())?;
+        let object_store_metrics =
+            register_s3_object_store(&ctx, self.path.to_str().unwrap())?;
 
         // register tables
         self.register_tables(&ctx).await?;
+        if let Some(metrics) = object_store_metrics.as_ref() {
+            metrics.reset();
+        }
 
         for query_id in query_range {
             benchmark_run.start_new_case(&format!("Query {query_id}"));
-            let query_run = self.benchmark_query(query_id, &ctx).await;
+            let query_run = self
+                .benchmark_query(query_id, &ctx, object_store_metrics.as_ref())
+                .await;
             match query_run {
                 Ok(query_results) => {
                     for iter in query_results {
@@ -261,6 +268,7 @@ impl RunOpt {
         &self,
         query_id: usize,
         ctx: &SessionContext,
+        object_store_metrics: Option<&ObjectStoreMetrics>,
     ) -> Result<Vec<QueryResult>> {
         let mut millis = vec![];
         // run benchmark
@@ -273,6 +281,9 @@ impl RunOpt {
         }
 
         for i in 0..self.iterations() {
+            if let Some(metrics) = object_store_metrics {
+                metrics.reset();
+            }
             let start = Instant::now();
 
             // query 15 is special, with 3 statements. the second statement is the one from which we
@@ -284,6 +295,14 @@ impl RunOpt {
             }
 
             let elapsed = start.elapsed();
+            if let Some(metrics) = object_store_metrics {
+                let snapshot = metrics.snapshot();
+                let json = serde_json::to_string(&snapshot)
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                println!(
+                    "TPCDS_OBJECT_STORE_METRICS query={query_id} iteration={i} {json}"
+                );
+            }
             let ms = elapsed.as_secs_f64() * 1000.0;
             millis.push(ms);
             info!("output:\n\n{}\n\n", pretty_format_batches(&result)?);
@@ -428,9 +447,12 @@ impl RunOpt {
     }
 }
 
-fn register_s3_object_store(ctx: &SessionContext, path: &str) -> Result<()> {
+fn register_s3_object_store(
+    ctx: &SessionContext,
+    path: &str,
+) -> Result<Option<ObjectStoreMetrics>> {
     let Some(object_store_url) = s3_object_store_url(path)? else {
-        return Ok(());
+        return Ok(None);
     };
 
     let object_store_url_ref: &Url = object_store_url.as_ref();
@@ -442,9 +464,23 @@ fn register_s3_object_store(ctx: &SessionContext, path: &str) -> Result<()> {
         .with_bucket_name(bucket_name)
         .build()?;
 
-    ctx.register_object_store(object_store_url_ref, Arc::new(store));
-    println!("Registered S3 object store for {object_store_url}");
-    Ok(())
+    if std::env::var("TPCDS_OBJECT_STORE_METRICS")
+        .is_ok_and(|value| parse_bool_flag(&value))
+    {
+        let store = MetricsObjectStore::new(store);
+        let metrics = store.metrics();
+        ctx.register_object_store(object_store_url_ref, Arc::new(store));
+        println!("Registered instrumented S3 object store for {object_store_url}");
+        Ok(Some(metrics))
+    } else {
+        ctx.register_object_store(object_store_url_ref, Arc::new(store));
+        println!("Registered S3 object store for {object_store_url}");
+        Ok(None)
+    }
+}
+
+fn parse_bool_flag(value: &str) -> bool {
+    matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
 }
 
 fn s3_object_store_url(path: &str) -> Result<Option<ObjectStoreUrl>> {

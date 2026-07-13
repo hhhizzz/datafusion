@@ -37,3 +37,20 @@ Implementation commit SHA: `83cbe14f8d5797eb7f0e92c660467ac3edd9a626`
 
 - `estimated_bytes` is based on Arrow's in-memory batch size estimate and can
   differ from a serialized or deduplicated-buffer footprint.
+
+## Review Follow-Up
+
+- `consumer_sql()` now returns `[String; 2]` and derives both table references
+  in each statement from `Q39_REUSE_TABLE`.
+- Added a focused API test that requires the owned-string return type and
+  verifies both table references per statement.
+- RED: `cargo test --offline -p datafusion-benchmarks q39_reuse -- --nocapture`
+  exited 101 because the prior API returned `[&str; 2]`.
+- GREEN: `cargo test --offline -p datafusion-benchmarks q39_reuse -- --nocapture`
+  exited 0: 2 passed, 121 filtered out.
+
+## Constrained Verification
+
+- No local CPU or memory enforcement was attempted. The controller verified
+  that macOS rejects the virtual-memory `ulimit` with `Invalid argument`.
+  Constrained verification remains for the controller's remote Linux run.

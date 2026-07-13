@@ -77,23 +77,26 @@ pub async fn materialize(ctx: &SessionContext) -> Result<MaterializedInv> {
     })
 }
 
-pub fn consumer_sql() -> [&'static str; 2] {
+pub fn consumer_sql() -> [String; 2] {
     [
-        r#"
+        format!(
+            r#"
 SELECT inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,
        inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov
-FROM q39_reuse_inv inv1, q39_reuse_inv inv2
+FROM {Q39_REUSE_TABLE} inv1, {Q39_REUSE_TABLE} inv2
 WHERE inv1.i_item_sk = inv2.i_item_sk
   AND inv1.w_warehouse_sk = inv2.w_warehouse_sk
   AND inv1.d_moy = 4
   AND inv2.d_moy = 4 + 1
 ORDER BY inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,
          inv2.d_moy, inv2.mean, inv2.cov
-"#,
-        r#"
+"#
+        ),
+        format!(
+            r#"
 SELECT inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,
        inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov
-FROM q39_reuse_inv inv1, q39_reuse_inv inv2
+FROM {Q39_REUSE_TABLE} inv1, {Q39_REUSE_TABLE} inv2
 WHERE inv1.i_item_sk = inv2.i_item_sk
   AND inv1.w_warehouse_sk = inv2.w_warehouse_sk
   AND inv1.d_moy = 4
@@ -101,7 +104,8 @@ WHERE inv1.i_item_sk = inv2.i_item_sk
   AND inv1.cov > 1.5
 ORDER BY inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,
          inv2.d_moy, inv2.mean, inv2.cov
-"#,
+"#
+        ),
     ]
 }
 
@@ -116,6 +120,15 @@ mod tests {
 
     const CANONICAL_Q39_SQL: &str =
         include_str!("../../../datafusion/core/tests/tpc-ds/39.sql");
+
+    #[test]
+    fn consumer_sql_uses_q39_reuse_table() {
+        let statements: [String; 2] = consumer_sql();
+
+        for statement in statements {
+            assert_eq!(statement.matches(Q39_REUSE_TABLE).count(), 2);
+        }
+    }
 
     #[tokio::test]
     async fn materialized_consumers_match_canonical_q39_results() -> Result<()> {
@@ -142,7 +155,7 @@ mod tests {
 
         let mut consumer_results = Vec::with_capacity(2);
         for sql in consumer_sql() {
-            consumer_results.push(formatted_result(&ctx, sql).await?);
+            consumer_results.push(formatted_result(&ctx, &sql).await?);
         }
 
         assert_eq!(canonical_results.len(), consumer_results.len());

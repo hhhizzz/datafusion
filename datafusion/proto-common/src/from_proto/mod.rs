@@ -1224,17 +1224,22 @@ impl TryFrom<&protobuf::TableParquetOptions> for TableParquetOptions {
             }
         }
         let opts = TableParquetOptions {
-            global: value
-                .global
-                .as_ref()
-                .map(|v| v.try_into())
-                .unwrap()
-                .unwrap(),
+            global: table_parquet_global_options(
+                value.global.as_ref(),
+                ParquetOptions::try_from,
+            )?,
             column_specific_options,
             ..Default::default()
         };
         Ok(opts)
     }
+}
+
+fn table_parquet_global_options<T>(
+    global: Option<T>,
+    try_from: impl FnOnce(T) -> datafusion_common::Result<ParquetOptions>,
+) -> datafusion_common::Result<ParquetOptions> {
+    Ok(global.map(try_from).transpose()?.unwrap_or_default())
 }
 
 impl TryFrom<&protobuf::JsonOptions> for JsonOptions {
@@ -1445,6 +1450,64 @@ mod tests {
             assert_eq!(recovered.row_group_lookahead_depth, usize::MAX);
             assert!(
                 recovered.row_group_lookahead_depth > 4,
+                "large wire values must remain invalid depths"
+            );
+        }
+    }
+
+    #[test]
+    fn table_parquet_options_defaults_missing_global_options() {
+        let proto = crate::protobuf_common::TableParquetOptions::default();
+
+        let recovered = TableParquetOptions::try_from(&proto).expect("from_proto");
+
+        assert_eq!(recovered.global, ParquetOptions::default());
+    }
+
+    #[test]
+    fn table_parquet_global_options_propagates_conversion_errors() {
+        let error = super::table_parquet_global_options(Some(()), |_| {
+            Err(datafusion_common::DataFusionError::Configuration(
+                "test conversion error".to_string(),
+            ))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("test conversion error"));
+    }
+
+    #[test]
+    fn table_parquet_options_propagates_global_depth_conversion_errors() {
+        let usize_max = u64::try_from(usize::MAX).expect("usize must fit in u64");
+        let mut global: crate::protobuf_common::ParquetOptions =
+            (&ParquetOptions::default()).try_into().expect("to_proto");
+        let mut proto = crate::protobuf_common::TableParquetOptions {
+            global: Some(global.clone()),
+            ..Default::default()
+        };
+
+        if let Some(overflow) = usize_max.checked_add(1) {
+            global.row_group_lookahead_depth_opt = Some(
+                crate::protobuf_common::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(
+                    overflow,
+                ),
+            );
+            proto.global = Some(global);
+
+            let error = TableParquetOptions::try_from(&proto).unwrap_err();
+            assert!(error.to_string().contains("does not fit in usize"));
+        } else {
+            global.row_group_lookahead_depth_opt = Some(
+                crate::protobuf_common::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(
+                    u64::MAX,
+                ),
+            );
+            proto.global = Some(global);
+
+            let recovered = TableParquetOptions::try_from(&proto).expect("from_proto");
+            assert_eq!(recovered.global.row_group_lookahead_depth, usize::MAX);
+            assert!(
+                recovered.global.row_group_lookahead_depth > 4,
                 "large wire values must remain invalid depths"
             );
         }

@@ -647,7 +647,7 @@ impl<T: ObjectStore> MetricsObjectStore<T> {
                 MetricsStream {
                     inner: stream,
                     tracker,
-                    _request_permit: request_permit,
+                    request_permit: Some(request_permit),
                 }
                 .boxed(),
             ),
@@ -897,7 +897,7 @@ impl Drop for RequestTracker {
 struct MetricsStream {
     inner: BoxStream<'static, Result<Bytes>>,
     tracker: Option<RequestTracker>,
-    _request_permit: OwnedSemaphorePermit,
+    request_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Stream for MetricsStream {
@@ -923,6 +923,7 @@ impl Stream for MetricsStream {
                 if let Some(mut tracker) = this.tracker.take() {
                     tracker.finish();
                 }
+                drop(this.request_permit.take());
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,

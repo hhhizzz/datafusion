@@ -58,5 +58,33 @@ fn from_env() {
         env::remove_var(env_key);
         let config = ConfigOptions::from_env().unwrap();
         assert_eq!(config.execution.batch_size, 8192); // set to its default value
+
+        let env_key =
+            "DATAFUSION_OPTIMIZER_REPARTITION_FILE_SCAN_RANGE_INTERLEAVE_FACTOR";
+        assert_eq!(
+            ConfigOptions::from_env()
+                .unwrap()
+                .optimizer
+                .repartition_file_scan_range_interleave_factor,
+            1
+        );
+
+        env::set_var(env_key, "4");
+        let config = ConfigOptions::from_env().unwrap();
+        assert_eq!(
+            config
+                .optimizer
+                .repartition_file_scan_range_interleave_factor,
+            4
+        );
+
+        env::remove_var(env_key);
+        assert_eq!(
+            ConfigOptions::from_env()
+                .unwrap()
+                .optimizer
+                .repartition_file_scan_range_interleave_factor,
+            1
+        );
     }
 }

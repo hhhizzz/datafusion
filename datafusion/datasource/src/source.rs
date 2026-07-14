@@ -367,11 +367,22 @@ impl ExecutionPlan for DataSourceExec {
         target_partitions: usize,
         config: &ConfigOptions,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let data_source = self.data_source.repartitioned(
-            target_partitions,
-            config.optimizer.repartition_file_min_size,
-            self.properties().eq_properties.output_ordering(),
-        )?;
+        let output_ordering = self.properties().eq_properties.output_ordering();
+        let data_source = if let Some(file_scan_config) =
+            self.data_source.downcast_ref::<FileScanConfig>()
+        {
+            file_scan_config.repartitioned_with_options(
+                target_partitions,
+                config,
+                output_ordering,
+            )?
+        } else {
+            self.data_source.repartitioned(
+                target_partitions,
+                config.optimizer.repartition_file_min_size,
+                output_ordering,
+            )?
+        };
 
         Ok(data_source.map(|source| {
             let output_partitioning = source.output_partitioning();

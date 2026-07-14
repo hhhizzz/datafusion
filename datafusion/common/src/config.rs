@@ -1092,6 +1092,12 @@ config_namespace! {
         /// Minimum total files size in bytes to perform file scan repartitioning.
         pub repartition_file_min_size: usize, default = 10 * 1024 * 1024
 
+        /// Number of byte ranges to create per target file-scan partition before
+        /// assigning successive ranges round-robin across partitions. Values greater
+        /// than one can expose more I/O concurrency after selective pruning. The file
+        /// partitioner normalizes this value to the supported range `1..=64`.
+        pub repartition_file_scan_range_interleave_factor: usize, default = 1
+
         /// Should DataFusion repartition data using the join keys to execute joins in parallel
         /// using the provided `target_partitions` level
         pub repartition_joins: bool, default = true

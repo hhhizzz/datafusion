@@ -215,6 +215,9 @@ pub struct FileScanConfig {
     /// If the number of file partitions > target_partitions, the file partitions will be grouped
     /// in a round-robin fashion such that number of file partitions = target_partitions.
     pub partitioned_by_file_group: bool,
+    /// Number of byte ranges created per target partition before assigning
+    /// successive ranges round-robin. This is injected by the physical optimizer.
+    file_range_interleave_factor: usize,
 }
 
 /// A builder for [`FileScanConfig`]'s.
@@ -285,6 +288,7 @@ pub struct FileScanConfigBuilder {
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     partitioned_by_file_group: bool,
+    file_range_interleave_factor: usize,
 }
 
 impl FileScanConfigBuilder {
@@ -311,6 +315,7 @@ impl FileScanConfigBuilder {
             batch_size: None,
             expr_adapter_factory: None,
             partitioned_by_file_group: false,
+            file_range_interleave_factor: 1,
         }
     }
 
@@ -532,6 +537,7 @@ impl FileScanConfigBuilder {
             batch_size,
             expr_adapter_factory: expr_adapter,
             partitioned_by_file_group,
+            file_range_interleave_factor,
         } = self;
 
         let constraints = constraints.unwrap_or_default();
@@ -557,6 +563,7 @@ impl FileScanConfigBuilder {
             expr_adapter_factory: expr_adapter,
             statistics,
             partitioned_by_file_group,
+            file_range_interleave_factor,
         }
     }
 }
@@ -576,6 +583,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
             partitioned_by_file_group: config.partitioned_by_file_group,
+            file_range_interleave_factor: config.file_range_interleave_factor,
         }
     }
 }
@@ -1085,6 +1093,30 @@ impl DataSource for FileScanConfig {
 }
 
 impl FileScanConfig {
+    /// Return the configured byte-range interleave factor for file scan
+    /// repartitioning.
+    pub fn file_range_interleave_factor(&self) -> usize {
+        self.file_range_interleave_factor
+    }
+
+    pub(crate) fn repartitioned_with_options(
+        &self,
+        target_partitions: usize,
+        options: &ConfigOptions,
+        output_ordering: Option<LexOrdering>,
+    ) -> Result<Option<Arc<dyn DataSource>>> {
+        let mut config = self.clone();
+        config.file_range_interleave_factor = options
+            .optimizer
+            .repartition_file_scan_range_interleave_factor;
+        DataSource::repartitioned(
+            &config,
+            target_partitions,
+            options.optimizer.repartition_file_min_size,
+            output_ordering,
+        )
+    }
+
     /// Returns only the output orderings that are validated against actual
     /// file group statistics.
     ///

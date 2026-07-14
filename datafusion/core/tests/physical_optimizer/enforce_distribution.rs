@@ -621,6 +621,13 @@ impl TestConfig {
         self
     }
 
+    fn with_file_scan_range_interleave_factor(mut self, factor: usize) -> Self {
+        self.config
+            .optimizer
+            .repartition_file_scan_range_interleave_factor = factor;
+        self
+    }
+
     /// Set the preferred target partitions for query execution concurrency.
     fn with_query_execution_partitions(mut self, target_partitions: usize) -> Self {
         self.config.execution.target_partitions = target_partitions;
@@ -2620,6 +2627,27 @@ fn parallelization_single_partition() -> Result<()> {
     ");
     let plan_csv_sort = test_config.to_plan(plan_csv, &SORT_DISTRIB_DISTRIB);
     assert_plan!(plan_csv_distrib, plan_csv_sort);
+
+    Ok(())
+}
+
+#[test]
+fn parallelization_single_partition_interleaves_file_ranges() -> Result<()> {
+    let alias = vec![("a".to_string(), "a".to_string())];
+    let plan = aggregate_exec_with_alias(parquet_exec(), alias);
+    let test_config = TestConfig::default()
+        .with_prefer_repartition_file_scans(10)
+        .with_query_execution_partitions(2)
+        .with_file_scan_range_interleave_factor(2);
+
+    let optimized = test_config.to_plan(plan, &DISTRIB_DISTRIB_SORT);
+    assert_plan!(optimized,
+                                                                                        @r"
+    AggregateExec: mode=FinalPartitioned, gby=[a@0 as a], aggr=[]
+      RepartitionExec: partitioning=Hash([a@0], 2), input_partitions=2
+        AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[]
+          DataSourceExec: file_groups={2 groups: [[x:0..25, x:50..75], [x:25..50, x:75..100]]}, projection=[a, b, c, d, e], file_type=parquet
+    ");
 
     Ok(())
 }

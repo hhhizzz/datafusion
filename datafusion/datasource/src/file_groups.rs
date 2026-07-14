@@ -29,6 +29,8 @@ use std::mem;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::sync::Arc;
 
+const MAX_RANGE_INTERLEAVE_FACTOR: usize = 64;
+
 /// Repartition input files into `target_partitions` partitions, if total file size exceed
 /// `repartition_file_min_size`
 ///
@@ -135,6 +137,9 @@ pub struct FileGroupPartitioner {
     repartition_file_min_size: usize,
     /// if the order when reading the files must be preserved
     preserve_order_within_groups: bool,
+    /// how many byte ranges to create per target partition before assigning
+    /// successive ranges round-robin across partitions
+    range_interleave_factor: usize,
 }
 
 impl Default for FileGroupPartitioner {
@@ -148,11 +153,13 @@ impl FileGroupPartitioner {
     /// 1. `target_partitions = 1`
     /// 2. `repartition_file_min_size = 10MB`
     /// 3. `preserve_order_within_groups = false`
+    /// 4. `range_interleave_factor = 1`
     pub fn new() -> Self {
         Self {
             target_partitions: 1,
             repartition_file_min_size: 10 * 1024 * 1024,
             preserve_order_within_groups: false,
+            range_interleave_factor: 1,
         }
     }
 
@@ -180,6 +187,20 @@ impl FileGroupPartitioner {
         self
     }
 
+    /// Set how many byte ranges to create per target partition before
+    /// assigning successive ranges round-robin across partitions.
+    ///
+    /// Values are clamped to `1..=64`. Interleaving is ignored when tuple
+    /// order must be preserved.
+    pub fn with_range_interleave_factor(
+        mut self,
+        range_interleave_factor: usize,
+    ) -> Self {
+        self.range_interleave_factor =
+            range_interleave_factor.clamp(1, MAX_RANGE_INTERLEAVE_FACTOR);
+        self
+    }
+
     /// Repartition input files according to the settings on this [`FileGroupPartitioner`].
     ///
     /// If no repartitioning is needed or possible, return `None`.
@@ -187,16 +208,79 @@ impl FileGroupPartitioner {
         &self,
         file_groups: &[FileGroup],
     ) -> Option<Vec<FileGroup>> {
-        if file_groups.is_empty() {
+        if file_groups.is_empty() || self.target_partitions == 0 {
             return None;
         }
 
         //  special case when order must be preserved
         if self.preserve_order_within_groups {
             self.repartition_preserving_order(file_groups)
+        } else if self.range_interleave_factor > 1 {
+            self.repartition_interleaved_by_size(file_groups)
         } else {
             self.repartition_evenly_by_size(file_groups)
         }
+    }
+
+    /// Split the flattened logical byte stream into more ranges than target
+    /// partitions, then assign successive ranges round-robin. This spreads a
+    /// contiguous cluster of row groups across multiple file streams while
+    /// keeping the execution partition count fixed.
+    fn repartition_interleaved_by_size(
+        &self,
+        file_groups: &[FileGroup],
+    ) -> Option<Vec<FileGroup>> {
+        let target_partitions = self.target_partitions;
+        let flattened_files = file_groups.iter().flat_map(FileGroup::iter).collect_vec();
+        let total_size = flattened_files
+            .iter()
+            .map(|f| f.effective_size())
+            .sum::<u64>();
+
+        if total_size < (self.repartition_file_min_size as u64) || total_size == 0 {
+            return None;
+        }
+
+        let target_range_count = target_partitions
+            .saturating_mul(self.range_interleave_factor)
+            .max(1) as u64;
+        let target_range_size = total_size.div_ceil(target_range_count).max(1);
+        let mut repartitioned_files =
+            repeat_with(Vec::new).take(target_partitions).collect_vec();
+        let mut current_range_index = 0;
+        let mut current_range_size = 0;
+
+        for source_file in flattened_files {
+            let (mut range_start, file_end) = source_file.range();
+            while range_start < file_end {
+                let remaining_range_size = target_range_size - current_range_size;
+                let range_end =
+                    min(range_start.saturating_add(remaining_range_size), file_end);
+
+                let mut produced_file = source_file.clone();
+                produced_file.range = Some(FileRange {
+                    start: range_start as i64,
+                    end: range_end as i64,
+                });
+                repartitioned_files[current_range_index % target_partitions]
+                    .push(produced_file);
+
+                current_range_size += range_end - range_start;
+                if current_range_size >= target_range_size {
+                    current_range_index += 1;
+                    current_range_size = 0;
+                }
+                range_start = range_end;
+            }
+        }
+
+        Some(
+            repartitioned_files
+                .into_iter()
+                .filter(|files| !files.is_empty())
+                .map(FileGroup::new)
+                .collect_vec(),
+        )
     }
 
     /// Evenly repartition files across partitions by size, ignoring any
@@ -760,9 +844,7 @@ mod test {
 
     #[test]
     fn repartition_interleaved_ranges_preserve_source_bounds() {
-        let input = vec![FileGroup::new(vec![
-            pfile("a", 160).with_range(20, 100),
-        ])];
+        let input = vec![FileGroup::new(vec![pfile("a", 160).with_range(20, 100)])];
 
         let actual = FileGroupPartitioner::new()
             .with_target_partitions(4)
@@ -792,6 +874,30 @@ mod test {
     }
 
     #[test]
+    fn repartition_interleaved_ranges_cover_multiple_files() {
+        let input = vec![FileGroup::new(vec![pfile("a", 30), pfile("b", 50)])];
+
+        let actual = FileGroupPartitioner::new()
+            .with_target_partitions(2)
+            .with_repartition_file_min_size(10)
+            .with_range_interleave_factor(2)
+            .repartition_file_groups(&input);
+
+        let expected = Some(vec![
+            FileGroup::new(vec![
+                pfile("a", 30).with_range(0, 20),
+                pfile("b", 50).with_range(10, 30),
+            ]),
+            FileGroup::new(vec![
+                pfile("a", 30).with_range(20, 30),
+                pfile("b", 50).with_range(0, 10),
+                pfile("b", 50).with_range(30, 50),
+            ]),
+        ]);
+        assert_partitioned_files(expected, actual);
+    }
+
+    #[test]
     fn repartition_range_interleave_factor_one_is_unchanged() {
         let input = vec![
             FileGroup::new(vec![pfile("a", 40)]),
@@ -808,7 +914,55 @@ mod test {
             .with_range_interleave_factor(1)
             .repartition_file_groups(&input);
 
-        assert_eq!(default, explicit_one);
+        let expected = Some(vec![
+            FileGroup::new(vec![pfile("a", 40).with_range(0, 34)]),
+            FileGroup::new(vec![
+                pfile("a", 40).with_range(34, 40),
+                pfile("b", 60).with_range(0, 28),
+            ]),
+            FileGroup::new(vec![pfile("b", 60).with_range(28, 60)]),
+        ]);
+        assert_partitioned_files(expected.clone(), default);
+        assert_partitioned_files(expected, explicit_one);
+    }
+
+    #[test]
+    fn repartition_range_interleave_factor_is_bounded() {
+        let zero_factor = FileGroupPartitioner::new()
+            .with_target_partitions(2)
+            .with_repartition_file_min_size(0)
+            .with_range_interleave_factor(0)
+            .repartition_file_groups(&[FileGroup::new(vec![pfile("a", 100)])]);
+        let zero_expected = Some(vec![
+            FileGroup::new(vec![pfile("a", 100).with_range(0, 50)]),
+            FileGroup::new(vec![pfile("a", 100).with_range(50, 100)]),
+        ]);
+        assert_partitioned_files(zero_expected, zero_factor);
+
+        let maximum_factor = FileGroupPartitioner::new()
+            .with_target_partitions(4)
+            .with_repartition_file_min_size(0)
+            .with_range_interleave_factor(usize::MAX)
+            .repartition_file_groups(&[FileGroup::new(vec![pfile("a", 8)])]);
+        let maximum_expected = Some(vec![
+            FileGroup::new(vec![
+                pfile("a", 8).with_range(0, 1),
+                pfile("a", 8).with_range(4, 5),
+            ]),
+            FileGroup::new(vec![
+                pfile("a", 8).with_range(1, 2),
+                pfile("a", 8).with_range(5, 6),
+            ]),
+            FileGroup::new(vec![
+                pfile("a", 8).with_range(2, 3),
+                pfile("a", 8).with_range(6, 7),
+            ]),
+            FileGroup::new(vec![
+                pfile("a", 8).with_range(3, 4),
+                pfile("a", 8).with_range(7, 8),
+            ]),
+        ]);
+        assert_partitioned_files(maximum_expected, maximum_factor);
     }
 
     #[test]

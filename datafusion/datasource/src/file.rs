@@ -194,6 +194,7 @@ pub trait FileSource: Any + Send + Sync {
             .with_target_partitions(target_partitions)
             .with_repartition_file_min_size(repartition_file_min_size)
             .with_preserve_order_within_groups(output_ordering.is_some())
+            .with_range_interleave_factor(config.file_range_interleave_factor())
             .repartition_file_groups(&config.file_groups);
 
         if let Some(repartitioned_file_groups) = repartitioned_file_groups_option {

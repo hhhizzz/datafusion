@@ -909,6 +909,10 @@ pub struct ParquetOptions {
     /// `Timestamp(<coerce_int96>, None)`. No effect when `coerce_int96` is unset.
     #[prost(oneof = "parquet_options::CoerceInt96TzOpt", tags = "36")]
     pub coerce_int96_tz_opt: ::core::option::Option<parquet_options::CoerceInt96TzOpt>,
+    #[prost(oneof = "parquet_options::RowGroupLookaheadDepthOpt", tags = "38")]
+    pub row_group_lookahead_depth_opt: ::core::option::Option<
+        parquet_options::RowGroupLookaheadDepthOpt,
+    >,
 }
 /// Nested message and enum types in `ParquetOptions`.
 pub mod parquet_options {
@@ -975,6 +979,11 @@ pub mod parquet_options {
     pub enum CoerceInt96TzOpt {
         #[prost(string, tag = "36")]
         CoerceInt96Tz(::prost::alloc::string::String),
+    }
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum RowGroupLookaheadDepthOpt {
+        #[prost(uint64, tag = "38")]
+        RowGroupLookaheadDepth(u64),
     }
 }
 /// Content-defined chunking (CDC) options for writing parquet files.

@@ -405,6 +405,11 @@ mod parquet {
                 }),
                 pushdown_filters: global_options.global.pushdown_filters,
                 row_group_lookahead: global_options.global.row_group_lookahead,
+                row_group_lookahead_depth_opt: Some(
+                    parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(
+                        global_options.global.row_group_lookahead_depth as u64,
+                    ),
+                ),
                 reorder_filters: global_options.global.reorder_filters,
                 force_filter_selections: global_options.global.force_filter_selections,
                 data_pagesize_limit: global_options.global.data_pagesize_limit as u64,
@@ -511,6 +516,13 @@ mod parquet {
             }),
             pushdown_filters: proto.pushdown_filters,
             row_group_lookahead: proto.row_group_lookahead,
+            row_group_lookahead_depth: proto
+                .row_group_lookahead_depth_opt
+                .as_ref()
+                .map(|opt| match opt {
+                    parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(value) => *value as usize,
+                })
+                .unwrap_or(1),
             reorder_filters: proto.reorder_filters,
             force_filter_selections: proto.force_filter_selections,
             data_pagesize_limit: proto.data_pagesize_limit as usize,

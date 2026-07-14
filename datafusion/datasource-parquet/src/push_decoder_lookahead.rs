@@ -866,7 +866,7 @@ mod tests {
             &self,
             pool: Arc<dyn MemoryPool>,
         ) -> (Arc<ParquetLookaheadCoordinator>, LookaheadFileContext) {
-            let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+            let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
             let reservation = Arc::new(
                 MemoryConsumer::new("push-decoder-lookahead-test").register(&pool),
             );

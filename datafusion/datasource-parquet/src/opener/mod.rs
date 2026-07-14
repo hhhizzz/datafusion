@@ -1576,7 +1576,7 @@ mod test {
     #[test]
     fn lookahead_file_context_is_named_and_opt_in() {
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
         let scan_context = LookaheadScanContext {
             coordinator: Arc::clone(&coordinator),
             memory_pool: Arc::clone(&pool),
@@ -2085,7 +2085,7 @@ mod test {
         let lookahead_factory = Arc::new(RecordingReaderFactory::new(data));
         let lookahead_metrics = ExecutionPlanMetricsSet::new();
         let pool = Arc::new(UnboundedMemoryPool::default());
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
         let lookahead_opener = lookahead_integration_opener(
             Arc::clone(&store),
             Arc::clone(&logical_schema),
@@ -2201,7 +2201,7 @@ mod test {
             }],
         }));
         let pool = Arc::new(UnboundedMemoryPool::default());
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
         let mut opener = ParquetMorselizerBuilder::new()
             .with_store(Arc::clone(&store))
             .with_schema(Arc::clone(&schema))
@@ -3028,7 +3028,7 @@ mod test {
         {
             let predicate = logical2physical(&col("a").gt_eq(lit(3)), &schema);
             let pool = Arc::new(UnboundedMemoryPool::default());
-            let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+            let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
             let mut opener = ParquetMorselizerBuilder::new()
                 .with_store(Arc::clone(&store))
                 .with_schema(Arc::clone(&schema))

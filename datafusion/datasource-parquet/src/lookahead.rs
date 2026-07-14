@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::DataFusionError;
 use datafusion_execution::memory_pool::{MemoryPool, MemoryReservation};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -27,14 +28,30 @@ pub(crate) const MAX_SPECULATIVE_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) struct ParquetLookaheadCoordinator {
     pub(crate) range_permits: Arc<Semaphore>,
     byte_permits: Arc<Semaphore>,
+    depth: usize,
 }
 
 impl ParquetLookaheadCoordinator {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(depth: usize) -> Self {
         Self {
             range_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_RANGES)),
             byte_permits: Arc::new(Semaphore::new(MAX_SPECULATIVE_BYTES)),
+            depth,
         }
+    }
+
+    pub(crate) fn validate(&self) -> datafusion_common::Result<()> {
+        if !(1..=4).contains(&self.depth) {
+            return Err(DataFusionError::Configuration(format!(
+                "datafusion.execution.parquet.row_group_lookahead_depth must be between 1 and 4 when row_group_lookahead is enabled, got {}",
+                self.depth
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn depth(&self) -> usize {
+        self.depth
     }
 }
 
@@ -75,6 +92,14 @@ impl LookaheadFileContext {
             _byte_permit: byte_permit,
         })
     }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Consumed by the bounded queue in Task 2.")
+    )]
+    pub(crate) fn depth(&self) -> usize {
+        self.coordinator.depth()
+    }
 }
 
 #[derive(Debug)]
@@ -103,11 +128,13 @@ mod tests {
     const ENV_TEST_CHILD: &str = "DATAFUSION_ROW_GROUP_LOOKAHEAD_ENV_TEST_CHILD";
     const ROW_GROUP_LOOKAHEAD_ENV: &str =
         "DATAFUSION_EXECUTION_PARQUET_ROW_GROUP_LOOKAHEAD";
+    const ROW_GROUP_LOOKAHEAD_DEPTH_ENV: &str =
+        "DATAFUSION_EXECUTION_PARQUET_ROW_GROUP_LOOKAHEAD_DEPTH";
 
     fn context_with_pool(
         pool: Arc<dyn MemoryPool>,
     ) -> (Arc<ParquetLookaheadCoordinator>, LookaheadFileContext) {
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
         let reservation = Arc::new(MemoryConsumer::new("lookahead-test").register(&pool));
         let context = LookaheadFileContext::new(Arc::clone(&coordinator), reservation);
         (coordinator, context)
@@ -120,6 +147,17 @@ mod tests {
                 .execution
                 .parquet
                 .row_group_lookahead
+        );
+    }
+
+    #[test]
+    fn row_group_lookahead_depth_defaults_to_one() {
+        assert_eq!(
+            ConfigOptions::default()
+                .execution
+                .parquet
+                .row_group_lookahead_depth,
+            1
         );
     }
 
@@ -153,8 +191,52 @@ mod tests {
     }
 
     #[test]
+    fn row_group_lookahead_depth_parses_from_env() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("row_group_lookahead_depth_parses_from_env_child")
+            .arg("--nocapture")
+            .env(ENV_TEST_CHILD, "1")
+            .env(ROW_GROUP_LOOKAHEAD_DEPTH_ENV, "4")
+            .output()
+            .expect("failed to run isolated environment test");
+
+        assert!(
+            output.status.success(),
+            "isolated environment test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn row_group_lookahead_depth_parses_from_env_child() {
+        if std::env::var_os(ENV_TEST_CHILD).is_none() {
+            return;
+        }
+
+        let options = ConfigOptions::from_env().unwrap();
+
+        assert_eq!(options.execution.parquet.row_group_lookahead_depth, 4);
+    }
+
+    #[test]
+    fn row_group_lookahead_depth_rejects_values_outside_one_through_four() {
+        assert!(ParquetLookaheadCoordinator::new(0).validate().is_err());
+        assert!(ParquetLookaheadCoordinator::new(5).validate().is_err());
+
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(4));
+        coordinator.validate().unwrap();
+        assert_eq!(coordinator.depth(), 4);
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = Arc::new(MemoryConsumer::new("lookahead-test").register(&pool));
+        let context = LookaheadFileContext::new(coordinator, reservation);
+        assert_eq!(context.depth(), 4);
+    }
+
+    #[test]
     fn coordinator_has_exact_fixed_budgets() {
-        let coordinator = ParquetLookaheadCoordinator::new();
+        let coordinator = ParquetLookaheadCoordinator::new(1);
 
         assert_eq!(MAX_IN_FLIGHT_RANGES, 24);
         assert_eq!(MAX_RANGES_PER_FILE_FETCH, 4);

@@ -1062,6 +1062,13 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 .unwrap_or(None),
             pushdown_filters: value.pushdown_filters,
             row_group_lookahead: value.row_group_lookahead,
+            row_group_lookahead_depth: value
+                .row_group_lookahead_depth_opt
+                .as_ref()
+                .map(|opt| match opt {
+                    protobuf::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(value) => *value as usize,
+                })
+                .unwrap_or(1),
             reorder_filters: value.reorder_filters,
             force_filter_selections: value.force_filter_selections,
             data_pagesize_limit: value.data_pagesize_limit as usize,
@@ -1379,16 +1386,28 @@ mod tests {
 
     #[test]
     fn test_parquet_options_row_group_lookahead_round_trip() {
-        for expected in [false, true] {
+        for (expected_lookahead, expected_depth) in [(false, 1), (true, 4)] {
             let opts = ParquetOptions {
-                row_group_lookahead: expected,
+                row_group_lookahead: expected_lookahead,
+                row_group_lookahead_depth: expected_depth,
                 ..ParquetOptions::default()
             };
 
             let recovered = parquet_options_proto_round_trip(opts);
 
-            assert_eq!(recovered.row_group_lookahead, expected);
+            assert_eq!(recovered.row_group_lookahead, expected_lookahead);
+            assert_eq!(recovered.row_group_lookahead_depth, expected_depth);
         }
+    }
+
+    #[test]
+    fn test_parquet_options_row_group_lookahead_depth_defaults_to_one_when_absent() {
+        let mut proto: crate::protobuf_common::ParquetOptions =
+            (&ParquetOptions::default()).try_into().expect("to_proto");
+        proto.row_group_lookahead_depth_opt = None;
+        let recovered = ParquetOptions::try_from(&proto).expect("from_proto");
+
+        assert_eq!(recovered.row_group_lookahead_depth, 1);
     }
 
     #[test]

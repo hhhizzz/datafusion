@@ -638,6 +638,10 @@ message ParquetOptions {
   }
 
   bool row_group_lookahead = 37; // default = false
+
+  oneof row_group_lookahead_depth_opt {
+    uint64 row_group_lookahead_depth = 38;
+  }
 }
 
 // Content-defined chunking (CDC) options for writing parquet files.

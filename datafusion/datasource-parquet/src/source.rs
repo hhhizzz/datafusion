@@ -532,12 +532,18 @@ impl From<ParquetSource> for Arc<dyn FileSource> {
 fn lookahead_context(
     state: Option<FileSourceExecutionState>,
     context: &TaskContext,
-) -> Option<LookaheadScanContext> {
-    let coordinator = state?.downcast::<ParquetLookaheadCoordinator>().ok()?;
-    Some(LookaheadScanContext {
+) -> datafusion_common::Result<Option<LookaheadScanContext>> {
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let Ok(coordinator) = state.downcast::<ParquetLookaheadCoordinator>() else {
+        return Ok(None);
+    };
+    coordinator.validate()?;
+    Ok(Some(LookaheadScanContext {
         coordinator,
         memory_pool: Arc::clone(context.memory_pool()),
-    })
+    }))
 }
 
 impl ParquetSource {
@@ -637,7 +643,11 @@ impl FileSource for ParquetSource {
         self.table_parquet_options
             .global
             .row_group_lookahead
-            .then(|| Arc::new(ParquetLookaheadCoordinator::new()) as _)
+            .then(|| {
+                Arc::new(ParquetLookaheadCoordinator::new(
+                    self.table_parquet_options.global.row_group_lookahead_depth,
+                )) as _
+            })
     }
 
     fn create_morselizer(
@@ -657,7 +667,7 @@ impl FileSource for ParquetSource {
         context: Arc<TaskContext>,
         state: Option<FileSourceExecutionState>,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
-        let lookahead = lookahead_context(state, context.as_ref());
+        let lookahead = lookahead_context(state, context.as_ref())?;
         self.create_morselizer_internal(object_store, base_config, partition, lookahead)
     }
 
@@ -1035,18 +1045,34 @@ mod tests {
     #[test]
     fn lookahead_context_requires_correctly_typed_execution_state() {
         let context = TaskContext::default();
-        assert!(lookahead_context(None, &context).is_none());
+        assert!(lookahead_context(None, &context).unwrap().is_none());
 
         let wrong_state: FileSourceExecutionState = Arc::new(());
-        assert!(lookahead_context(Some(wrong_state), &context).is_none());
+        assert!(
+            lookahead_context(Some(wrong_state), &context)
+                .unwrap()
+                .is_none()
+        );
 
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new());
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
         let state: FileSourceExecutionState = coordinator.clone();
         let lookahead = lookahead_context(Some(state), &context)
+            .unwrap()
             .expect("correctly typed state should enable lookahead");
 
         assert!(Arc::ptr_eq(&lookahead.coordinator, &coordinator));
         assert!(Arc::ptr_eq(&lookahead.memory_pool, context.memory_pool()));
+    }
+
+    #[test]
+    fn lookahead_context_rejects_invalid_depth_before_file_io() {
+        let context = TaskContext::default();
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(0));
+        let state: FileSourceExecutionState = coordinator;
+
+        let error = lookahead_context(Some(state), &context).unwrap_err();
+
+        assert!(matches!(error, DataFusionError::Configuration(_)));
     }
 
     #[test]

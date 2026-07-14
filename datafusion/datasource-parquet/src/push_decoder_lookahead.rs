@@ -68,9 +68,11 @@ pub(crate) struct PrefetchPlanQueue {
 }
 
 struct PrefetchedReader {
-    reader: ParquetRecordBatchReader,
+    // Drop guards before the record reader so queue teardown releases staged
+    // and exact resources before the reader that may still own their Bytes.
+    staged_window_lease: Option<Arc<StagedWindowLease>>,
     resources: SpeculativeResources,
-    staged_window: Option<StagedWindowFinalResources>,
+    reader: ParquetRecordBatchReader,
 }
 
 #[derive(Default)]
@@ -128,31 +130,33 @@ impl Drop for StagedReservation {
     }
 }
 
-/// The complete reservation for one non-overlapping staged row-group window.
-struct StagedWindowResources {
-    remaining_row_groups: VecDeque<usize>,
+/// Owns a coalesced staged window until the state and every queued reader have
+/// released their lease.
+struct StagedWindowLease {
     resources: SpeculativeResources,
-    staged_bytes: usize,
-    useful_bytes_by_row_group: BTreeMap<usize, usize>,
-    useful_staged_bytes: usize,
-    reservation: StagedReservation,
-    gate: StagedWindowGate,
-}
-
-struct StagedWindowFinalResources {
-    resources: SpeculativeResources,
-    unused_staged_bytes: usize,
-    metrics: RowGroupPrefetchMetrics,
     _reservation: StagedReservation,
     _gate: StagedWindowGate,
 }
 
-impl Drop for StagedWindowFinalResources {
+impl Drop for StagedWindowLease {
     fn drop(&mut self) {
-        self.metrics
-            .record_unused_staged_bytes(self.unused_staged_bytes);
         self.resources.release();
     }
+}
+
+/// State owned by the decoder while it is still building a staged window.
+struct StagedWindowResources {
+    remaining_row_groups: VecDeque<usize>,
+    staged_bytes: usize,
+    useful_bytes_by_row_group: BTreeMap<usize, usize>,
+    useful_staged_bytes: usize,
+    lease: Arc<StagedWindowLease>,
+}
+
+#[derive(Default)]
+struct StagedReaderProgress {
+    reader_lease: Option<Arc<StagedWindowLease>>,
+    retired_lease: Option<Arc<StagedWindowLease>>,
 }
 
 struct StagingRequest {
@@ -274,40 +278,47 @@ impl PrefetchRunState {
             .record_prefetch(request.ranges.len(), request.staged_bytes);
         self.staged_window = Some(StagedWindowResources {
             remaining_row_groups: request.row_groups.into(),
-            resources,
             staged_bytes: request.staged_bytes,
             useful_bytes_by_row_group: request.useful_bytes_by_row_group,
             useful_staged_bytes: 0,
-            reservation: self.tracker.reserve(request.staged_bytes),
-            gate: StagedWindowGate {
-                active: Arc::clone(&self.staged_window_active),
-            },
+            lease: Arc::new(StagedWindowLease {
+                resources,
+                _reservation: self.tracker.reserve(request.staged_bytes),
+                _gate: StagedWindowGate {
+                    active: Arc::clone(&self.staged_window_active),
+                },
+            }),
         });
     }
 
-    fn reader_ready(
-        &mut self,
-        row_group_index: usize,
-    ) -> Option<StagedWindowFinalResources> {
-        let window = self.staged_window.as_mut()?;
-        if window.remaining_row_groups.front().copied() != Some(row_group_index) {
-            return None;
-        }
-        window.remaining_row_groups.pop_front();
-        let useful_bytes = window
-            .useful_bytes_by_row_group
-            .remove(&row_group_index)
-            .unwrap_or_default();
-        window.useful_staged_bytes = window
-            .useful_staged_bytes
-            .saturating_add(useful_bytes)
-            .min(window.staged_bytes);
-        self.metrics.record_useful_staged_bytes(useful_bytes);
+    fn reader_ready(&mut self, row_group_index: usize) -> StagedReaderProgress {
+        let (reader_lease, window_completed) = {
+            let Some(window) = self.staged_window.as_mut() else {
+                return StagedReaderProgress::default();
+            };
+            if window.remaining_row_groups.front().copied() != Some(row_group_index) {
+                return StagedReaderProgress::default();
+            }
+            let reader_lease = Arc::clone(&window.lease);
+            window.remaining_row_groups.pop_front();
+            let useful_bytes = window
+                .useful_bytes_by_row_group
+                .remove(&row_group_index)
+                .unwrap_or_default();
+            window.useful_staged_bytes = window
+                .useful_staged_bytes
+                .saturating_add(useful_bytes)
+                .min(window.staged_bytes);
+            self.metrics.record_useful_staged_bytes(useful_bytes);
+            (reader_lease, window.remaining_row_groups.is_empty())
+        };
 
-        if !window.remaining_row_groups.is_empty() {
-            return None;
+        StagedReaderProgress {
+            reader_lease: Some(reader_lease),
+            retired_lease: window_completed
+                .then(|| self.finish_staged_window())
+                .flatten(),
         }
-        self.finish_staged_window()
     }
 
     /// Drops staged members that the decoder skipped before returning
@@ -316,7 +327,7 @@ impl PrefetchRunState {
     fn advance_to_row_group(
         &mut self,
         row_group_index: usize,
-    ) -> Option<StagedWindowFinalResources> {
+    ) -> Option<Arc<StagedWindowLease>> {
         let next_position = self
             .plan
             .row_group_order()
@@ -352,27 +363,18 @@ impl PrefetchRunState {
         None
     }
 
-    fn finish_staged_window(&mut self) -> Option<StagedWindowFinalResources> {
+    fn finish_staged_window(&mut self) -> Option<Arc<StagedWindowLease>> {
         let window = self.staged_window.take()?;
-        Some(StagedWindowFinalResources {
-            resources: window.resources,
-            unused_staged_bytes: window
+        self.metrics.record_unused_staged_bytes(
+            window
                 .staged_bytes
                 .saturating_sub(window.useful_staged_bytes),
-            metrics: self.metrics.clone(),
-            _reservation: window.reservation,
-            _gate: window.gate,
-        })
+        );
+        Some(window.lease)
     }
 
     fn discard_staged_window(&mut self) {
-        if let Some(window) = self.staged_window.take() {
-            self.metrics.record_unused_staged_bytes(
-                window
-                    .staged_bytes
-                    .saturating_sub(window.useful_staged_bytes),
-            );
-        }
+        drop(self.finish_staged_window());
     }
 }
 
@@ -392,7 +394,7 @@ struct NextReaderOutcome {
 enum NextReaderResult {
     Reader {
         reader: Box<ParquetRecordBatchReader>,
-        staged_window: Option<StagedWindowFinalResources>,
+        staged_window_lease: Option<Arc<StagedWindowLease>>,
     },
     Finished,
     Denied,
@@ -506,13 +508,13 @@ impl LookaheadPushDecoderStreamState {
             if self.active_reader.is_none() {
                 if let Some(prefetched) = self.prefetched_readers.pop_front() {
                     let PrefetchedReader {
-                        reader,
+                        staged_window_lease,
                         resources,
-                        staged_window,
+                        reader,
                     } = prefetched;
                     self.active_reader = Some(reader);
                     drop(resources);
-                    drop(staged_window);
+                    drop(staged_window_lease);
                     continue;
                 }
 
@@ -628,14 +630,14 @@ impl LookaheadPushDecoderStreamState {
         match result {
             NextReaderResult::Reader {
                 reader: next_reader,
-                staged_window,
+                staged_window_lease,
             } => {
                 self.decoder = Some(decoder);
                 self.reader = Some(reader);
                 self.prefetched_readers.push_back(PrefetchedReader {
-                    reader: *next_reader,
+                    staged_window_lease,
                     resources,
-                    staged_window,
+                    reader: *next_reader,
                 });
             }
             NextReaderResult::Finished => {
@@ -717,31 +719,36 @@ impl LookaheadPushDecoderStreamState {
                     row_group_index,
                     data: reader,
                 } => {
-                    let skipped_staged_window =
+                    let skipped_staged_lease =
                         self.active_prefetch_plan.as_ref().and_then(|state| {
                             state
                                 .lock()
                                 .expect("prefetch run state must not be poisoned")
                                 .advance_to_row_group(row_group_index)
                         });
-                    let staged_window =
-                        self.active_prefetch_plan.as_ref().and_then(|state| {
+                    let staged_reader = self
+                        .active_prefetch_plan
+                        .as_ref()
+                        .map(|state| {
                             state
                                 .lock()
                                 .expect("prefetch run state must not be poisoned")
                                 .reader_ready(row_group_index)
-                        });
-                    if skipped_staged_window.is_some() || staged_window.is_some() {
+                        })
+                        .unwrap_or_default();
+                    let retired_staged_lease =
+                        skipped_staged_lease.or(staged_reader.retired_lease);
+                    if retired_staged_lease.is_some() {
                         clear_decoder_staged_buffers(
                             self.decoder
                                 .as_mut()
                                 .expect("foreground decoder must be present"),
                         );
                     }
-                    drop(skipped_staged_window);
+                    drop(retired_staged_lease);
                     self.active_reader = Some(reader);
                     self.foreground_resources = SpeculativeResources::default();
-                    drop(staged_window);
+                    drop(staged_reader.reader_lease);
                     return Ok(ForegroundProgress::ReaderReady);
                 }
                 RowGroupReaderResult::Finished => {
@@ -795,9 +802,9 @@ impl LookaheadPushDecoderStreamState {
         if let Some(decoder) = self.decoder.as_mut() {
             clear_decoder_staged_buffers(decoder);
         }
-        self.prefetched_readers.clear();
-        self.active_reader = None;
         self.foreground_resources.release();
+        self.active_reader = None;
+        self.drop_prefetched_readers();
         self.next_reader_future = None;
         if let Some(prefetch_plan) = self.active_prefetch_plan.as_ref() {
             prefetch_plan
@@ -812,6 +819,19 @@ impl LookaheadPushDecoderStreamState {
         self.pending_prefetch_plans.clear();
         self.deferred_error = None;
         self.run_finished = false;
+    }
+
+    fn drop_prefetched_readers(&mut self) {
+        while let Some(PrefetchedReader {
+            staged_window_lease,
+            mut resources,
+            reader,
+        }) = self.prefetched_readers.pop_front()
+        {
+            drop(staged_window_lease);
+            resources.release();
+            drop(reader);
+        }
     }
 }
 
@@ -1004,25 +1024,30 @@ async fn drive_speculative_next_reader(
                 row_group_index,
                 data: reader,
             }) => {
-                let skipped_staged_window = prefetch_plan.as_ref().and_then(|state| {
+                let skipped_staged_lease = prefetch_plan.as_ref().and_then(|state| {
                     state
                         .lock()
                         .expect("prefetch run state must not be poisoned")
                         .advance_to_row_group(row_group_index)
                 });
-                let staged_window = prefetch_plan.as_ref().and_then(|state| {
-                    state
-                        .lock()
-                        .expect("prefetch run state must not be poisoned")
-                        .reader_ready(row_group_index)
-                });
-                if skipped_staged_window.is_some() || staged_window.is_some() {
+                let staged_reader = prefetch_plan
+                    .as_ref()
+                    .map(|state| {
+                        state
+                            .lock()
+                            .expect("prefetch run state must not be poisoned")
+                            .reader_ready(row_group_index)
+                    })
+                    .unwrap_or_default();
+                let retired_staged_lease =
+                    skipped_staged_lease.or(staged_reader.retired_lease);
+                if retired_staged_lease.is_some() {
                     clear_decoder_staged_buffers(driver.decoder_mut());
                 }
-                drop(skipped_staged_window);
+                drop(retired_staged_lease);
                 break NextReaderResult::Reader {
                     reader: Box::new(reader),
-                    staged_window,
+                    staged_window_lease: staged_reader.reader_lease,
                 };
             }
             Ok(RowGroupReaderResult::Finished) => {
@@ -1350,12 +1375,6 @@ mod tests {
                         > self.inner.successful_requests_before_failure
             })
         }
-
-        fn should_corrupt(&self, row_groups: &[usize]) -> bool {
-            self.inner
-                .corrupted_row_group
-                .is_some_and(|row_group| row_groups.contains(&row_group))
-        }
     }
 
     struct ActiveFetchGuard {
@@ -1468,6 +1487,7 @@ mod tests {
             let row_groups = ranges_by_row_group.keys().copied().collect::<Vec<_>>();
             let data = self.data.clone();
             let control = self.control.clone();
+            let row_group_spans = Arc::clone(&self.row_group_spans);
             async move {
                 let _active_fetch = control.record_fetch(ranges_by_row_group);
                 for row_group in &row_groups {
@@ -1482,7 +1502,12 @@ mod tests {
                 Ok(ranges
                     .into_iter()
                     .map(|range| {
-                        if control.should_corrupt(&row_groups) {
+                        let corrupt =
+                            control.inner.corrupted_row_group.is_some_and(|row_group| {
+                                let span = &row_group_spans[row_group];
+                                range.start >= span.start && range.end <= span.end
+                            });
+                        if corrupt {
                             let len = usize::try_from(range.end - range.start).unwrap();
                             Bytes::from(vec![0_u8; len])
                         } else {
@@ -1635,6 +1660,92 @@ mod tests {
                 300_000,
                 filter_columns,
             )
+        }
+
+        fn dense_prefetch_with_row_group_values(
+            row_group_values: &[i32],
+            rows_per_group: usize,
+            filter_columns: &[&'static str],
+        ) -> Self {
+            let schema = Arc::new(Schema::new(
+                FILTER_COLUMNS
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Int32, false))
+                    .collect::<Vec<_>>(),
+            ));
+            let row_count = row_group_values.len() * rows_per_group;
+            let mut state = 0x9e37_79b9_u32;
+            let projection_values =
+                Arc::new(Int32Array::from_iter_values((0..row_count).map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    state as i32
+                }))) as ArrayRef;
+            let filter_values = Arc::new(Int32Array::from_iter_values(
+                row_group_values.iter().flat_map(|value| {
+                    (0..rows_per_group).map(move |offset| {
+                        let magnitude = i32::try_from(offset + 1).unwrap();
+                        if *value > 0 { magnitude } else { -magnitude }
+                    })
+                }),
+            )) as ArrayRef;
+            let columns = std::iter::once(projection_values)
+                .chain((1..FILTER_COLUMNS.len()).map(|_| Arc::clone(&filter_values)))
+                .collect::<Vec<_>>();
+            let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+            let properties = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(rows_per_group))
+                .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+                .set_encoding(parquet::basic::Encoding::PLAIN)
+                .build();
+            let mut output = Vec::new();
+            let mut writer =
+                ArrowWriter::try_new(&mut output, schema, Some(properties)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+
+            let data = Bytes::from(output);
+            let metadata = Arc::new(
+                ParquetMetaDataReader::new()
+                    .parse_and_finish(&data)
+                    .unwrap(),
+            );
+            assert_eq!(metadata.num_row_groups(), row_group_values.len());
+            let row_group_spans = Arc::new(
+                metadata
+                    .row_groups()
+                    .iter()
+                    .map(|row_group| {
+                        let start = row_group
+                            .columns()
+                            .iter()
+                            .map(|column| column.byte_range().0)
+                            .min()
+                            .unwrap();
+                        let end = row_group
+                            .columns()
+                            .iter()
+                            .map(|column| {
+                                let (start, length) = column.byte_range();
+                                start + length
+                            })
+                            .max()
+                            .unwrap();
+                        start..end
+                    })
+                    .collect(),
+            );
+            Self {
+                data,
+                metadata,
+                row_group_spans,
+                output_schema: Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int32,
+                    false,
+                )])),
+                filter_columns: filter_columns.to_vec(),
+                rows_per_group,
+            }
         }
 
         fn dense_prefetch_with_rows_and_filter_columns(
@@ -1929,6 +2040,86 @@ mod tests {
             .into_stream()
             .try_collect()
             .await
+            .unwrap()
+        }
+
+        async fn serial_oracle_without_filter_in_order(
+            &self,
+            row_group_order: Vec<usize>,
+        ) -> Vec<RecordBatch> {
+            let control = ScriptControl::new(None);
+            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+            let decoder = self.decoder_for_row_groups_with_filter_and_batch_size(
+                Some(row_group_order),
+                &arrow_reader_metrics,
+                None,
+                self.rows_per_group,
+            );
+            PushDecoderStreamState {
+                decoder,
+                pending_decoders: VecDeque::new(),
+                reader: self.reader(control),
+                output: self.output_state(arrow_reader_metrics),
+            }
+            .into_stream()
+            .try_collect()
+            .await
+            .unwrap()
+        }
+
+        async fn serial_oracle_with_filter_and_batch_size(
+            &self,
+            row_group_order: Vec<usize>,
+            batch_size: usize,
+        ) -> Vec<RecordBatch> {
+            let control = ScriptControl::new(None);
+            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+            let decoder = self.decoder_for_row_groups_with_filter_and_batch_size(
+                Some(row_group_order),
+                &arrow_reader_metrics,
+                Some(0),
+                batch_size,
+            );
+            PushDecoderStreamState {
+                decoder,
+                pending_decoders: VecDeque::new(),
+                reader: self.reader(control),
+                output: self.output_state(arrow_reader_metrics),
+            }
+            .into_stream()
+            .try_collect()
+            .await
+            .unwrap()
+        }
+
+        fn staged_state_with_filter_and_batch_size(
+            &self,
+            control: ScriptControl,
+            context: LookaheadFileContext,
+            row_group_order: Vec<usize>,
+            batch_size: usize,
+            metrics: RowGroupPrefetchMetrics,
+        ) -> LookaheadPushDecoderStreamState {
+            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+            let decoder = self.decoder_for_row_groups_with_filter_and_batch_size(
+                Some(row_group_order.clone()),
+                &arrow_reader_metrics,
+                Some(0),
+                batch_size,
+            );
+            LookaheadPushDecoderStreamState::new_with_prefetch_plans(
+                decoder,
+                VecDeque::new(),
+                PrefetchPlanQueue {
+                    active: self.prefetch_plan(row_group_order),
+                    pending: VecDeque::new(),
+                    metrics,
+                    staging_enabled: true,
+                },
+                self.reader(control),
+                self.output_state(arrow_reader_metrics),
+                context,
+            )
             .unwrap()
         }
 
@@ -2254,6 +2445,242 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filtered_final_staged_member_keeps_queued_reader_window_live() {
+        let rows_per_group = 300_000;
+        let batch_size = 100_000;
+        let row_group_order = vec![0, 1, 2, 3, 4];
+        let fixture = ThreeRowGroupFixture::dense_prefetch_with_row_group_values(
+            &[1, 1, 0, 1, 1],
+            rows_per_group,
+            &DISJOINT_FILTER_COLUMNS,
+        );
+        let serial = fixture
+            .serial_oracle_with_filter_and_batch_size(row_group_order.clone(), batch_size)
+            .await;
+        let control = ScriptControl::new(None);
+        let (coordinator, context) =
+            fixture.lookahead_context_with_depth_and_window(2, 2);
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut state = fixture.staged_state_with_filter_and_batch_size(
+            control.clone(),
+            context,
+            row_group_order,
+            batch_size,
+            fixture.prefetch_metrics_for(&metrics_set),
+        );
+        let prefetch_state = Arc::clone(
+            state
+                .active_prefetch_plan
+                .as_ref()
+                .expect("prefetch plan must be active"),
+        );
+
+        let (first, next_state) = state.transition().await.unwrap();
+        state = next_state;
+        let (second, next_state) = state.transition().await.unwrap();
+        state = next_state;
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.num_rows(), batch_size);
+        assert_eq!(second.num_rows(), batch_size);
+        assert_eq!(state.prefetched_readers.len(), 2);
+
+        let (window_is_none, gate_is_active, staged_bytes) = {
+            let prefetch = prefetch_state.lock().unwrap();
+            (
+                prefetch.staged_window.is_none(),
+                prefetch.staged_window_active.load(Ordering::SeqCst),
+                prefetch.tracker.staged_bytes.load(Ordering::SeqCst),
+            )
+        };
+        assert!(window_is_none);
+        assert!(
+            gate_is_active,
+            "staged leases: {:?}",
+            state
+                .prefetched_readers
+                .iter()
+                .map(|reader| reader.staged_window_lease.is_some())
+                .collect::<Vec<_>>(),
+        );
+        assert!(staged_bytes > 0);
+        assert!(control.has_request_for(1));
+        assert!(control.has_request_for(2));
+        assert!(!control.has_request_for(4));
+        assert_eq!(metric_value(&metrics_set, "prefetch_windows"), 1);
+
+        let (third, next_state) = state.transition().await.unwrap();
+        state = next_state;
+        let third = third.unwrap();
+        assert_eq!(third.num_rows(), batch_size);
+        let (first_queued_reader_batch, next_state) = state.transition().await.unwrap();
+        state = next_state;
+        let first_queued_reader_batch = first_queued_reader_batch.unwrap();
+        assert_eq!(first_queued_reader_batch.num_rows(), batch_size);
+        let (gate_is_active, staged_bytes) = {
+            let prefetch = prefetch_state.lock().unwrap();
+            (
+                prefetch.staged_window_active.load(Ordering::SeqCst),
+                prefetch.tracker.staged_bytes.load(Ordering::SeqCst),
+            )
+        };
+        assert!(!gate_is_active);
+        assert_eq!(staged_bytes, 0);
+
+        let mut staged_output = vec![];
+        while let Some((batch, next_state)) = state.transition().await {
+            staged_output.push(batch.unwrap());
+            state = next_state;
+        }
+        let mut actual = vec![first, second, third, first_queued_reader_batch];
+        actual.extend(staged_output);
+        assert_eq!(actual, serial);
+        assert!(metric_value(&metrics_set, "useful_staged_bytes") > 0);
+        assert!(metric_value(&metrics_set, "unused_staged_bytes") > 0);
+        assert_shared_budgets_released(&coordinator);
+    }
+
+    #[tokio::test]
+    async fn staged_member_decode_error_keeps_queued_reader_window_live() {
+        let rows_per_group = 300_000;
+        let batch_size = 100_000;
+        let row_group_order = vec![0, 1, 2];
+        let fixture = ThreeRowGroupFixture::dense_prefetch_with_row_group_values(
+            &[1, 1, 1],
+            rows_per_group,
+            &DISJOINT_FILTER_COLUMNS,
+        );
+        let serial = fixture
+            .serial_oracle_with_filter_and_batch_size(row_group_order.clone(), batch_size)
+            .await;
+        let control = ScriptControl::corrupting(2);
+        let (coordinator, context) =
+            fixture.lookahead_context_with_depth_and_window(2, 2);
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut state = fixture.staged_state_with_filter_and_batch_size(
+            control,
+            context,
+            row_group_order,
+            batch_size,
+            fixture.prefetch_metrics_for(&metrics_set),
+        );
+        let prefetch_state = Arc::clone(
+            state
+                .active_prefetch_plan
+                .as_ref()
+                .expect("prefetch plan must be active"),
+        );
+
+        let (first, next_state) = state.transition().await.unwrap();
+        state = next_state;
+        let (second, next_state) = state.transition().await.unwrap();
+        state = next_state;
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(state.deferred_error.is_some());
+        assert_eq!(state.prefetched_readers.len(), 1);
+        let (gate_is_active, staged_bytes) = {
+            let prefetch = prefetch_state.lock().unwrap();
+            (
+                prefetch.staged_window_active.load(Ordering::SeqCst),
+                prefetch.tracker.staged_bytes.load(Ordering::SeqCst),
+            )
+        };
+        assert!(gate_is_active);
+        assert!(staged_bytes > 0);
+
+        let (third, next_state) = state.transition().await.unwrap();
+        state = next_state;
+        let third = third.unwrap();
+        let (first_queued_reader_batch, next_state) = state.transition().await.unwrap();
+        state = next_state;
+        let first_queued_reader_batch = first_queued_reader_batch.unwrap();
+        let (gate_is_active, staged_bytes) = {
+            let prefetch = prefetch_state.lock().unwrap();
+            (
+                prefetch.staged_window_active.load(Ordering::SeqCst),
+                prefetch.tracker.staged_bytes.load(Ordering::SeqCst),
+            )
+        };
+        assert!(!gate_is_active);
+        assert_eq!(staged_bytes, 0);
+
+        let mut actual = vec![first, second, third, first_queued_reader_batch];
+        let error = loop {
+            let Some((batch, next_state)) = state.transition().await else {
+                panic!("the deferred staged decode error must be delivered")
+            };
+            state = next_state;
+            match batch {
+                Ok(batch) => actual.push(batch),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(actual, serial[..6]);
+        assert!(error.to_string().contains("Parquet error"));
+        assert!(metric_value(&metrics_set, "useful_staged_bytes") > 0);
+        assert!(metric_value(&metrics_set, "unused_staged_bytes") > 0);
+        assert_shared_budgets_released(&coordinator);
+    }
+
+    #[tokio::test]
+    async fn terminating_active_and_queued_staged_readers_releases_resources_first() {
+        let fixture = ThreeRowGroupFixture::dense_prefetch_with_row_group_values(
+            &[1, 1, 1],
+            300_000,
+            &DISJOINT_FILTER_COLUMNS,
+        );
+        let control = ScriptControl::new(None);
+        let (coordinator, context) =
+            fixture.lookahead_context_with_depth_and_window(2, 2);
+        let reservation = Arc::clone(&context.reservation);
+        let probe = ReaderDropProbe::new(context.clone());
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let decoder = fixture.decoder_for_row_groups_with_filter_and_batch_size(
+            Some(vec![0, 1, 2]),
+            &arrow_reader_metrics,
+            Some(0),
+            100_000,
+        );
+        let mut state = LookaheadPushDecoderStreamState::new_with_prefetch_plans(
+            decoder,
+            VecDeque::new(),
+            PrefetchPlanQueue {
+                active: fixture.prefetch_plan(vec![0, 1, 2]),
+                pending: VecDeque::new(),
+                metrics: fixture.prefetch_metrics_for(&metrics_set),
+                staging_enabled: true,
+            },
+            fixture.reader_with_drop_probe(control, Some(probe.clone())),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .unwrap();
+
+        let (batch, next_state) = state.transition().await.unwrap();
+        state = next_state;
+        assert_eq!(batch.unwrap().num_rows(), 100_000);
+        assert!(state.active_reader.is_some());
+        assert_eq!(state.prefetched_readers.len(), 1);
+        assert!(state.prefetched_readers[0].staged_window_lease.is_some());
+        assert!(reservation.size() > 0);
+
+        state.terminate();
+
+        assert!(state.active_reader.is_none());
+        assert!(state.prefetched_readers.is_empty());
+        assert_eq!(reservation.size(), 0);
+        assert!(probe.reader_dropped.load(Ordering::SeqCst));
+        assert!(
+            probe
+                .resources_released_before_reader_drop
+                .load(Ordering::SeqCst)
+        );
+        assert_shared_budgets_released(&coordinator);
+    }
+
+    #[tokio::test]
     async fn dense_window_four_fetches_the_next_four_row_groups_before_exact_needs() {
         let fixture = ThreeRowGroupFixture::dense_prefetch(5);
         let control = ScriptControl::new(None);
@@ -2330,11 +2757,10 @@ mod tests {
                     row_group_index,
                     data: _,
                 } => {
-                    final_resources = prefetch_plan
-                        .lock()
-                        .unwrap()
-                        .reader_ready(row_group_index)
-                        .or(final_resources);
+                    let staged_reader =
+                        prefetch_plan.lock().unwrap().reader_ready(row_group_index);
+                    final_resources = staged_reader.retired_lease.or(final_resources);
+                    drop(staged_reader.reader_lease);
                     if final_resources.is_some() {
                         break;
                     }
@@ -2427,11 +2853,10 @@ mod tests {
                     row_group_index,
                     data: _,
                 } => {
-                    final_resources = prefetch_plan
-                        .lock()
-                        .unwrap()
-                        .reader_ready(row_group_index)
-                        .or(final_resources);
+                    let staged_reader =
+                        prefetch_plan.lock().unwrap().reader_ready(row_group_index);
+                    final_resources = staged_reader.retired_lease.or(final_resources);
+                    drop(staged_reader.reader_lease);
                     if final_resources.is_some() {
                         break;
                     }
@@ -2496,7 +2921,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2]
         );
-        let final_resources = state.reader_ready(2).unwrap();
+        let staged_reader = state.reader_ready(2);
+        let final_resources = staged_reader.retired_lease.unwrap();
+        drop(staged_reader.reader_lease);
         assert!(state.staged_window.is_none());
         assert!(state.tracker.staged_bytes.load(Ordering::SeqCst) > 0);
         drop(final_resources);
@@ -2527,6 +2954,45 @@ mod tests {
         assert!(state.staged_window.is_none());
         assert!(state.tracker.staged_bytes.load(Ordering::SeqCst) > 0);
         drop(skipped_window);
+        assert_eq!(state.tracker.staged_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn retired_staged_window_waits_for_queued_reader_lease() {
+        let fixture = ThreeRowGroupFixture::dense_prefetch(4);
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let plan = fixture.prefetch_plan(vec![0, 1, 2, 3]);
+        let ranges = plan.ranges_for(&[1, 2]);
+        let staged_bytes = checked_range_bytes(&ranges).unwrap();
+        let useful_bytes_by_row_group = plan.staged_window_useful_bytes(&[1, 2], &ranges);
+        let mut state = PrefetchRunState::new(
+            plan,
+            fixture.prefetch_metrics_for(&metrics_set),
+            2,
+            true,
+        );
+        state.add_staged_window(
+            StagingRequest {
+                row_groups: vec![1, 2],
+                ranges,
+                staged_bytes,
+                useful_bytes_by_row_group,
+            },
+            SpeculativeResources::default(),
+        );
+
+        let queued_reader_lease = state.reader_ready(1).reader_lease.unwrap();
+        let retired_state_lease = state.advance_to_row_group(3).unwrap();
+        assert!(state.staged_window.is_none());
+        drop(retired_state_lease);
+
+        assert!(state.staged_window_active.load(Ordering::SeqCst));
+        assert!(state.tracker.staged_bytes.load(Ordering::SeqCst) > 0);
+        assert!(state.observe_exact_ranges(3, &[]).is_none());
+        assert!(metric_value(&metrics_set, "unused_staged_bytes") > 0);
+
+        drop(queued_reader_lease);
+        assert!(!state.staged_window_active.load(Ordering::SeqCst));
         assert_eq!(state.tracker.staged_bytes.load(Ordering::SeqCst), 0);
     }
 
@@ -2628,22 +3094,27 @@ mod tests {
     #[tokio::test]
     async fn staged_windows_follow_reverse_row_group_order() {
         let fixture = ThreeRowGroupFixture::dense_prefetch(3);
+        let row_group_order = vec![2, 1, 0];
+        let serial = fixture
+            .serial_oracle_without_filter_in_order(row_group_order.clone())
+            .await;
         let control = ScriptControl::new(None);
         let (_, context) = fixture.lookahead_context_with_depth_and_window(2, 2);
-        let mut stream = fixture.staged_stream_without_filter_with_options(
-            control.clone(),
-            context,
-            vec![2, 1, 0],
-            None,
-            true,
-        );
+        let staged = fixture
+            .staged_stream_without_filter_with_options(
+                control.clone(),
+                context,
+                row_group_order,
+                None,
+                true,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
 
-        let first = stream.next().await.unwrap().unwrap();
-
-        assert_eq!(first.num_rows(), fixture.rows_per_group);
+        assert_eq!(staged, serial);
         assert!(control.has_request_for(1));
         assert!(control.has_request_for(0));
-        drop(stream);
     }
 
     #[tokio::test]

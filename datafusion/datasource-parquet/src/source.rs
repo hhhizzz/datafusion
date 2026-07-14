@@ -551,6 +551,15 @@ fn lookahead_context(
 }
 
 impl ParquetSource {
+    fn validate_lookahead_config(&self) -> datafusion_common::Result<()> {
+        let options = &self.table_parquet_options.global;
+        ParquetLookaheadCoordinator::validate_options(
+            options.row_group_lookahead,
+            options.row_group_lookahead_depth,
+            options.row_group_prefetch_window,
+        )
+    }
+
     fn create_morselizer_internal(
         &self,
         object_store: Arc<dyn ObjectStore>,
@@ -650,6 +659,7 @@ impl FileSource for ParquetSource {
             .then(|| {
                 Arc::new(ParquetLookaheadCoordinator::new(
                     self.table_parquet_options.global.row_group_lookahead_depth,
+                    self.table_parquet_options.global.row_group_prefetch_window,
                 )) as _
             })
     }
@@ -660,6 +670,7 @@ impl FileSource for ParquetSource {
         base_config: &FileScanConfig,
         partition: usize,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+        self.validate_lookahead_config()?;
         self.create_morselizer_internal(object_store, base_config, partition, None)
     }
 
@@ -671,6 +682,7 @@ impl FileSource for ParquetSource {
         context: Arc<TaskContext>,
         state: Option<FileSourceExecutionState>,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+        self.validate_lookahead_config()?;
         let lookahead = lookahead_context(state, context.as_ref())?;
         self.create_morselizer_internal(object_store, base_config, partition, lookahead)
     }
@@ -1059,9 +1071,19 @@ mod tests {
         depth: usize,
         factory: Arc<ReaderFactorySentinel>,
     ) -> ParquetSource {
+        source_with_lookahead_window(enabled, depth, 0, factory)
+    }
+
+    fn source_with_lookahead_window(
+        enabled: bool,
+        depth: usize,
+        window: usize,
+        factory: Arc<ReaderFactorySentinel>,
+    ) -> ParquetSource {
         let mut options = TableParquetOptions::default();
         options.global.row_group_lookahead = enabled;
         options.global.row_group_lookahead_depth = depth;
+        options.global.row_group_prefetch_window = window;
 
         let mut source = ParquetSource::new(Arc::new(Schema::empty()))
             .with_table_parquet_options(options)
@@ -1116,7 +1138,7 @@ mod tests {
         let error = lookahead_context(Some(wrong_state), &context).unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
 
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1, 0));
         let state: FileSourceExecutionState = coordinator.clone();
         let lookahead = lookahead_context(Some(state), &context)
             .unwrap()
@@ -1129,7 +1151,7 @@ mod tests {
     #[test]
     fn lookahead_context_rejects_invalid_depth_before_file_io() {
         let context = TaskContext::default();
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(0));
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(0, 0));
         let state: FileSourceExecutionState = coordinator;
 
         let error = lookahead_context(Some(state), &context).unwrap_err();
@@ -1161,6 +1183,26 @@ mod tests {
 
         assert!(matches!(error, DataFusionError::Configuration(_)));
         assert_eq!(factory.create_reader_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn create_morselizer_rejects_invalid_prefetch_windows_before_reader_io() {
+        for (enabled, depth, window) in [(true, 4, 1), (true, 2, 4), (false, 4, 2)] {
+            let factory = Arc::new(ReaderFactorySentinel::default());
+            let source = source_with_lookahead_window(
+                enabled,
+                depth,
+                window,
+                Arc::clone(&factory),
+            );
+
+            let error =
+                create_morselizer_with_context(&source, source.create_execution_state())
+                    .unwrap_err();
+
+            assert!(matches!(error, DataFusionError::Configuration(_)));
+            assert_eq!(factory.create_reader_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

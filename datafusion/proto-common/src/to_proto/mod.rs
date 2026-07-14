@@ -916,6 +916,11 @@ impl TryFrom<&ParquetOptions> for protobuf::ParquetOptions {
                     value.row_group_lookahead_depth as u64,
                 ),
             ),
+            row_group_prefetch_window_opt: Some(
+                protobuf::parquet_options::RowGroupPrefetchWindowOpt::RowGroupPrefetchWindow(
+                    value.row_group_prefetch_window as u64,
+                ),
+            ),
             reorder_filters: value.reorder_filters,
             force_filter_selections: value.force_filter_selections,
             data_pagesize_limit: value.data_pagesize_limit as u64,

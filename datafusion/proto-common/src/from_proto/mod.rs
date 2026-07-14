@@ -1072,6 +1072,16 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 })
                 .transpose()?
                 .unwrap_or(1),
+            row_group_prefetch_window: value
+                .row_group_prefetch_window_opt
+                .as_ref()
+                .map(|opt| match opt {
+                    protobuf::parquet_options::RowGroupPrefetchWindowOpt::RowGroupPrefetchWindow(value) => {
+                        row_group_prefetch_window_from_u64(*value)
+                    }
+                })
+                .transpose()?
+                .unwrap_or(0),
             reorder_filters: value.reorder_filters,
             force_filter_selections: value.force_filter_selections,
             data_pagesize_limit: value.data_pagesize_limit as usize,
@@ -1150,6 +1160,14 @@ fn row_group_lookahead_depth_from_u64(value: u64) -> datafusion_common::Result<u
     usize::try_from(value).map_err(|_| {
         DataFusionError::Configuration(format!(
             "Parquet row_group_lookahead_depth value {value} does not fit in usize"
+        ))
+    })
+}
+
+fn row_group_prefetch_window_from_u64(value: u64) -> datafusion_common::Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        DataFusionError::Configuration(format!(
+            "Parquet row_group_prefetch_window value {value} does not fit in usize"
         ))
     })
 }
@@ -1402,10 +1420,13 @@ mod tests {
 
     #[test]
     fn test_parquet_options_row_group_lookahead_round_trip() {
-        for (expected_lookahead, expected_depth) in [(false, 1), (true, 4)] {
+        for (expected_lookahead, expected_depth, expected_window) in
+            [(false, 1, 0), (true, 4, 2), (true, 4, 4)]
+        {
             let opts = ParquetOptions {
                 row_group_lookahead: expected_lookahead,
                 row_group_lookahead_depth: expected_depth,
+                row_group_prefetch_window: expected_window,
                 ..ParquetOptions::default()
             };
 
@@ -1413,6 +1434,7 @@ mod tests {
 
             assert_eq!(recovered.row_group_lookahead, expected_lookahead);
             assert_eq!(recovered.row_group_lookahead_depth, expected_depth);
+            assert_eq!(recovered.row_group_prefetch_window, expected_window);
         }
     }
 
@@ -1421,9 +1443,26 @@ mod tests {
         let mut proto: crate::protobuf_common::ParquetOptions =
             (&ParquetOptions::default()).try_into().expect("to_proto");
         proto.row_group_lookahead_depth_opt = None;
+        proto.row_group_prefetch_window_opt = None;
         let recovered = ParquetOptions::try_from(&proto).expect("from_proto");
 
         assert_eq!(recovered.row_group_lookahead_depth, 1);
+        assert_eq!(recovered.row_group_prefetch_window, 0);
+    }
+
+    #[test]
+    fn parquet_prefetch_window_wire_value_is_checked_without_truncation() {
+        let usize_max = u64::try_from(usize::MAX).expect("usize must fit in u64");
+        let mut proto: crate::protobuf_common::ParquetOptions =
+            (&ParquetOptions::default()).try_into().expect("to_proto");
+
+        if let Some(overflow) = usize_max.checked_add(1) {
+            proto.row_group_prefetch_window_opt = Some(
+                crate::protobuf_common::parquet_options::RowGroupPrefetchWindowOpt::RowGroupPrefetchWindow(overflow),
+            );
+            let error = ParquetOptions::try_from(&proto).unwrap_err();
+            assert!(error.to_string().contains("does not fit in usize"));
+        }
     }
 
     #[test]

@@ -99,10 +99,6 @@ impl RowGroupPrefetchPlan {
     }
 
     /// Returns deterministic physical ranges for the requested row groups.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 5 fetches admitted spans.")
-    )]
     pub(crate) fn ranges_for(&self, row_group_indexes: &[usize]) -> Vec<Range<u64>> {
         let requested = row_group_indexes.iter().copied().collect::<BTreeSet<_>>();
         let mut ranges = requested
@@ -128,6 +124,69 @@ impl RowGroupPrefetchPlan {
                 .collect(),
         );
         DensityAdmission::new(candidate_ranges)
+    }
+
+    /// Creates admission state for exact requests from one file-level row group.
+    pub(crate) fn density_admission_for(
+        &self,
+        row_group_index: usize,
+    ) -> DensityAdmission {
+        DensityAdmission::new(
+            self.ranges_by_row_group
+                .get(&row_group_index)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Returns the next unclaimed row groups after `row_group_index` in final
+    /// decoder order, preserving reverse scans.
+    pub(crate) fn next_window_after(
+        &self,
+        row_group_index: usize,
+        window: usize,
+        claimed: &BTreeSet<usize>,
+    ) -> Vec<usize> {
+        self.row_group_order
+            .iter()
+            .position(|index| *index == row_group_index)
+            .map(|position| {
+                self.row_group_order[position + 1..]
+                    .iter()
+                    .copied()
+                    .filter(|index| !claimed.contains(index))
+                    .take(window)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns the part of staged physical ranges attributable to each row
+    /// group. Coalescing gaps remain unused staged bytes.
+    pub(crate) fn staged_window_useful_bytes(
+        &self,
+        row_group_indexes: &[usize],
+        staged_ranges: &[Range<u64>],
+    ) -> BTreeMap<usize, usize> {
+        row_group_indexes
+            .iter()
+            .copied()
+            .map(|row_group_index| {
+                let bytes = self
+                    .ranges_by_row_group
+                    .get(&row_group_index)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|candidate| {
+                        staged_ranges.iter().filter_map(move |staged| {
+                            let start = candidate.start.max(staged.start);
+                            let end = candidate.end.min(staged.end);
+                            (start < end).then_some(start..end)
+                        })
+                    });
+                (row_group_index, unique_range_bytes(bytes))
+            })
+            .collect()
     }
 }
 
@@ -306,10 +365,6 @@ impl RowGroupPrefetchMetrics {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 5 records exact coverage.")
-    )]
     pub(crate) fn record_observed_exact_bytes(&self, bytes: usize) {
         self.observed_exact_bytes.add(bytes);
     }
@@ -318,28 +373,16 @@ impl RowGroupPrefetchMetrics {
         self.candidate_bytes.add(bytes);
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 5 records prefetch windows.")
-    )]
     pub(crate) fn record_prefetch(&self, range_count: usize, bytes: usize) {
         self.prefetch_windows.add(1);
         self.prefetched_ranges.add(range_count);
         self.prefetched_bytes.add(bytes);
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 5 records staged-byte use.")
-    )]
     pub(crate) fn record_useful_staged_bytes(&self, bytes: usize) {
         self.useful_staged_bytes.add(bytes);
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 5 records staged-byte release.")
-    )]
     pub(crate) fn record_unused_staged_bytes(&self, bytes: usize) {
         self.unused_staged_bytes.add(bytes);
     }
@@ -351,10 +394,6 @@ impl RowGroupPrefetchMetrics {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 5 records staged-byte peaks.")
-    )]
     pub(crate) fn record_peak_staged_bytes(&self, bytes: usize) {
         self.peak_staged_bytes.set_max(bytes);
     }
@@ -425,6 +464,7 @@ fn merge_ranges_without_gap(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use parquet::arrow::ProjectionMask;
@@ -576,6 +616,26 @@ mod tests {
             observe_single(&mut admission, 0..MIB),
             Some(AdmissionDecision::Denied)
         );
+    }
+
+    #[test]
+    fn density_is_scoped_to_the_exact_row_group_and_windows_follow_plan_order() {
+        const MIB: u64 = 1024 * 1024;
+        let metadata = metadata_with_leaf_ranges(vec![
+            0..(MIB * 5 / 4),
+            (MIB * 2)..(MIB * 3),
+            (MIB * 4)..(MIB * 5),
+            (MIB * 6)..(MIB * 7),
+        ]);
+        let plan = leaf_plan(&metadata, vec![3, 2, 1, 0]);
+        let mut admission = plan.density_admission_for(3);
+
+        assert_eq!(
+            observe_single(&mut admission, (MIB * 6)..(MIB * 7)),
+            Some(AdmissionDecision::Enabled)
+        );
+        assert_eq!(plan.next_window_after(3, 2, &BTreeSet::new()), vec![2, 1]);
+        assert_eq!(plan.next_window_after(2, 4, &BTreeSet::from([1])), vec![0]);
     }
 
     #[test]

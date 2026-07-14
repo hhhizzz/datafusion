@@ -29,14 +29,16 @@ pub(crate) struct ParquetLookaheadCoordinator {
     pub(crate) range_permits: Arc<Semaphore>,
     byte_permits: Arc<Semaphore>,
     depth: usize,
+    prefetch_window: usize,
 }
 
 impl ParquetLookaheadCoordinator {
-    pub(crate) fn new(depth: usize) -> Self {
+    pub(crate) fn new(depth: usize, prefetch_window: usize) -> Self {
         Self {
             range_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_RANGES)),
             byte_permits: Arc::new(Semaphore::new(MAX_SPECULATIVE_BYTES)),
             depth,
+            prefetch_window,
         }
     }
 
@@ -47,11 +49,48 @@ impl ParquetLookaheadCoordinator {
                 self.depth
             )));
         }
+        if !matches!(self.prefetch_window, 0 | 2 | 4) {
+            return Err(DataFusionError::Configuration(format!(
+                "datafusion.execution.parquet.row_group_prefetch_window must be one of 0, 2, or 4, got {}",
+                self.prefetch_window
+            )));
+        }
+        if self.prefetch_window > self.depth {
+            return Err(DataFusionError::Configuration(format!(
+                "datafusion.execution.parquet.row_group_prefetch_window ({}) must not exceed row_group_lookahead_depth ({})",
+                self.prefetch_window, self.depth
+            )));
+        }
         Ok(())
     }
 
     pub(crate) fn depth(&self) -> usize {
         self.depth
+    }
+
+    pub(crate) fn prefetch_window(&self) -> usize {
+        self.prefetch_window
+    }
+
+    pub(crate) fn validate_options(
+        row_group_lookahead: bool,
+        depth: usize,
+        prefetch_window: usize,
+    ) -> datafusion_common::Result<()> {
+        if prefetch_window > 0 && !row_group_lookahead {
+            return Err(DataFusionError::Configuration(
+                "datafusion.execution.parquet.row_group_prefetch_window requires row_group_lookahead=true".to_string(),
+            ));
+        }
+        if row_group_lookahead {
+            Self::new(depth, prefetch_window).validate()
+        } else if matches!(prefetch_window, 0 | 2 | 4) {
+            Ok(())
+        } else {
+            Err(DataFusionError::Configuration(format!(
+                "datafusion.execution.parquet.row_group_prefetch_window must be one of 0, 2, or 4, got {prefetch_window}"
+            )))
+        }
     }
 }
 
@@ -96,6 +135,10 @@ impl LookaheadFileContext {
     pub(crate) fn depth(&self) -> usize {
         self.coordinator.depth()
     }
+
+    pub(crate) fn prefetch_window(&self) -> usize {
+        self.coordinator.prefetch_window()
+    }
 }
 
 #[derive(Debug)]
@@ -126,11 +169,13 @@ mod tests {
         "DATAFUSION_EXECUTION_PARQUET_ROW_GROUP_LOOKAHEAD";
     const ROW_GROUP_LOOKAHEAD_DEPTH_ENV: &str =
         "DATAFUSION_EXECUTION_PARQUET_ROW_GROUP_LOOKAHEAD_DEPTH";
+    const ROW_GROUP_PREFETCH_WINDOW_ENV: &str =
+        "DATAFUSION_EXECUTION_PARQUET_ROW_GROUP_PREFETCH_WINDOW";
 
     fn context_with_pool(
         pool: Arc<dyn MemoryPool>,
     ) -> (Arc<ParquetLookaheadCoordinator>, LookaheadFileContext) {
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1, 0));
         let reservation = Arc::new(MemoryConsumer::new("lookahead-test").register(&pool));
         let context = LookaheadFileContext::new(Arc::clone(&coordinator), reservation);
         (coordinator, context)
@@ -154,6 +199,17 @@ mod tests {
                 .parquet
                 .row_group_lookahead_depth,
             1
+        );
+    }
+
+    #[test]
+    fn row_group_prefetch_window_defaults_to_zero() {
+        assert_eq!(
+            ConfigOptions::default()
+                .execution
+                .parquet
+                .row_group_prefetch_window,
+            0
         );
     }
 
@@ -216,11 +272,40 @@ mod tests {
     }
 
     #[test]
-    fn row_group_lookahead_depth_rejects_values_outside_one_through_four() {
-        assert!(ParquetLookaheadCoordinator::new(0).validate().is_err());
-        assert!(ParquetLookaheadCoordinator::new(5).validate().is_err());
+    fn row_group_prefetch_window_parses_from_env() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("row_group_prefetch_window_parses_from_env_child")
+            .arg("--nocapture")
+            .env(ENV_TEST_CHILD, "1")
+            .env(ROW_GROUP_PREFETCH_WINDOW_ENV, "4")
+            .output()
+            .expect("failed to run isolated environment test");
 
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(4));
+        assert!(
+            output.status.success(),
+            "isolated environment test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn row_group_prefetch_window_parses_from_env_child() {
+        if std::env::var_os(ENV_TEST_CHILD).is_none() {
+            return;
+        }
+
+        let options = ConfigOptions::from_env().unwrap();
+
+        assert_eq!(options.execution.parquet.row_group_prefetch_window, 4);
+    }
+
+    #[test]
+    fn row_group_lookahead_depth_rejects_values_outside_one_through_four() {
+        assert!(ParquetLookaheadCoordinator::new(0, 0).validate().is_err());
+        assert!(ParquetLookaheadCoordinator::new(5, 0).validate().is_err());
+
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(4, 0));
         coordinator.validate().unwrap();
         assert_eq!(coordinator.depth(), 4);
 
@@ -231,8 +316,18 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_requires_a_supported_prefetch_window_not_exceeding_depth() {
+        assert!(ParquetLookaheadCoordinator::new(4, 1).validate().is_err());
+        assert!(ParquetLookaheadCoordinator::new(2, 4).validate().is_err());
+
+        let coordinator = ParquetLookaheadCoordinator::new(4, 4);
+        coordinator.validate().unwrap();
+        assert_eq!(coordinator.prefetch_window(), 4);
+    }
+
+    #[test]
     fn coordinator_has_exact_fixed_budgets() {
-        let coordinator = ParquetLookaheadCoordinator::new(1);
+        let coordinator = ParquetLookaheadCoordinator::new(1, 0);
 
         assert_eq!(MAX_IN_FLIGHT_RANGES, 24);
         assert_eq!(MAX_RANGES_PER_FILE_FETCH, 4);

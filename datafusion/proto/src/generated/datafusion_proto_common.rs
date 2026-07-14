@@ -913,6 +913,10 @@ pub struct ParquetOptions {
     pub row_group_lookahead_depth_opt: ::core::option::Option<
         parquet_options::RowGroupLookaheadDepthOpt,
     >,
+    #[prost(oneof = "parquet_options::RowGroupPrefetchWindowOpt", tags = "39")]
+    pub row_group_prefetch_window_opt: ::core::option::Option<
+        parquet_options::RowGroupPrefetchWindowOpt,
+    >,
 }
 /// Nested message and enum types in `ParquetOptions`.
 pub mod parquet_options {
@@ -984,6 +988,11 @@ pub mod parquet_options {
     pub enum RowGroupLookaheadDepthOpt {
         #[prost(uint64, tag = "38")]
         RowGroupLookaheadDepth(u64),
+    }
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum RowGroupPrefetchWindowOpt {
+        #[prost(uint64, tag = "39")]
+        RowGroupPrefetchWindow(u64),
     }
 }
 /// Content-defined chunking (CDC) options for writing parquet files.

@@ -67,6 +67,8 @@ use datafusion::functions_window::rank::rank_udwf;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::*;
 use datafusion::test_util::{TestTableFactory, TestTableProvider};
+#[cfg(feature = "json")]
+use datafusion_common::config::ParquetOptions;
 use datafusion_common::config::TableOptions;
 use datafusion_common::format::ExplainFormat;
 use datafusion_common::scalar::ScalarStructBuilder;
@@ -715,6 +717,7 @@ async fn roundtrip_logical_plan_copy_to_parquet() -> Result<()> {
     parquet_format.global.created_by = "test".to_string();
     parquet_format.global.row_group_lookahead = true;
     parquet_format.global.row_group_lookahead_depth = 4;
+    parquet_format.global.row_group_prefetch_window = 4;
 
     let file_type = format_as_file_type(Arc::new(
         ParquetFormatFactory::new_with_options(parquet_format.clone()),
@@ -759,11 +762,44 @@ async fn roundtrip_logical_plan_copy_to_parquet() -> Result<()> {
             assert_eq!(parquet_config.global.created_by, "test".to_string());
             assert!(parquet_config.global.row_group_lookahead);
             assert_eq!(parquet_config.global.row_group_lookahead_depth, 4);
+            assert_eq!(parquet_config.global.row_group_prefetch_window, 4);
         }
         _ => panic!(),
     }
 
     Ok(())
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn parquet_prefetch_window_json_roundtrip_and_absence() {
+    for expected_window in [0, 2, 4] {
+        let options = ParquetOptions {
+            row_group_prefetch_window: expected_window,
+            ..ParquetOptions::default()
+        };
+        let proto: datafusion_proto_common::protobuf_common::ParquetOptions =
+            (&options).try_into().unwrap();
+        let json = serde_json::to_string(&proto).unwrap();
+        let recovered_proto: datafusion_proto_common::protobuf_common::ParquetOptions =
+            serde_json::from_str(&json).unwrap();
+        let recovered = ParquetOptions::try_from(&recovered_proto).unwrap();
+
+        assert_eq!(recovered.row_group_prefetch_window, expected_window);
+    }
+
+    let default_options = ParquetOptions::default();
+    let legacy_proto: datafusion_proto_common::protobuf_common::ParquetOptions =
+        (&default_options).try_into().unwrap();
+    let mut legacy_json = serde_json::to_value(&legacy_proto).unwrap();
+    legacy_json
+        .as_object_mut()
+        .unwrap()
+        .remove("rowGroupPrefetchWindow");
+    let legacy_proto: datafusion_proto_common::protobuf_common::ParquetOptions =
+        serde_json::from_value(legacy_json).unwrap();
+    let recovered = ParquetOptions::try_from(&legacy_proto).unwrap();
+    assert_eq!(recovered.row_group_prefetch_window, 0);
 }
 
 #[tokio::test]

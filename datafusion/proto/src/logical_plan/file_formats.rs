@@ -410,6 +410,11 @@ mod parquet {
                         global_options.global.row_group_lookahead_depth as u64,
                     ),
                 ),
+                row_group_prefetch_window_opt: Some(
+                    parquet_options::RowGroupPrefetchWindowOpt::RowGroupPrefetchWindow(
+                        global_options.global.row_group_prefetch_window as u64,
+                    ),
+                ),
                 reorder_filters: global_options.global.reorder_filters,
                 force_filter_selections: global_options.global.force_filter_selections,
                 data_pagesize_limit: global_options.global.data_pagesize_limit as u64,
@@ -528,6 +533,16 @@ mod parquet {
                 })
                 .transpose()?
                 .unwrap_or(1),
+            row_group_prefetch_window: proto
+                .row_group_prefetch_window_opt
+                .as_ref()
+                .map(|opt| match opt {
+                    parquet_options::RowGroupPrefetchWindowOpt::RowGroupPrefetchWindow(value) => {
+                        row_group_prefetch_window_from_u64(*value)
+                    }
+                })
+                .transpose()?
+                .unwrap_or(0),
             reorder_filters: proto.reorder_filters,
             force_filter_selections: proto.force_filter_selections,
             data_pagesize_limit: proto.data_pagesize_limit as usize,
@@ -597,6 +612,16 @@ mod parquet {
         usize::try_from(value).map_err(|_| {
             datafusion_common::DataFusionError::Configuration(format!(
                 "Parquet row_group_lookahead_depth value {value} does not fit in usize"
+            ))
+        })
+    }
+
+    fn row_group_prefetch_window_from_u64(
+        value: u64,
+    ) -> datafusion_common::Result<usize> {
+        usize::try_from(value).map_err(|_| {
+            datafusion_common::DataFusionError::Configuration(format!(
+                "Parquet row_group_prefetch_window value {value} does not fit in usize"
             ))
         })
     }

@@ -27,8 +27,8 @@ use crate::access_plan::PreparedAccessPlan;
 use crate::lookahead::{LookaheadFileContext, LookaheadScanContext};
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{
-    DecoderBuilderConfig, LookaheadPushDecoderStreamState, PushDecoderOutputState,
-    PushDecoderStreamState,
+    DecoderBuilderConfig, LookaheadPushDecoderStreamState, PrefetchPlanQueue,
+    PushDecoderOutputState, PushDecoderStreamState,
 };
 use crate::row_filter::{RowFilterGenerator, build_projection_read_plan_with_predicate};
 use crate::row_group_filter::{BloomFilterStatistics, RowGroupAccessPlanFilter};
@@ -1191,6 +1191,9 @@ impl RowGroupsPrunedParquetOpen {
             &prepared.file_name,
             &prepared.metrics,
         );
+        // Arrow's peek API does not include the decoder limit budget. Keep all
+        // limited scans exact rather than staging spans that may never be read.
+        let staging_enabled = prepared.limit.is_none();
 
         let (
             decoder,
@@ -1310,8 +1313,12 @@ impl RowGroupsPrunedParquetOpen {
             LookaheadPushDecoderStreamState::new_with_prefetch_plans(
                 decoder,
                 pending_decoders,
-                active_prefetch_plan,
-                pending_prefetch_plans,
+                PrefetchPlanQueue {
+                    active: active_prefetch_plan,
+                    pending: pending_prefetch_plans,
+                    metrics: prefetch_metrics,
+                    staging_enabled,
+                },
                 prepared.async_file_reader,
                 output,
                 lookahead,
@@ -1614,7 +1621,7 @@ mod test {
     #[test]
     fn lookahead_file_context_is_named_and_opt_in() {
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1, 0));
         let scan_context = LookaheadScanContext {
             coordinator: Arc::clone(&coordinator),
             memory_pool: Arc::clone(&pool),
@@ -2123,7 +2130,7 @@ mod test {
         let lookahead_factory = Arc::new(RecordingReaderFactory::new(data));
         let lookahead_metrics = ExecutionPlanMetricsSet::new();
         let pool = Arc::new(UnboundedMemoryPool::default());
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1, 0));
         let lookahead_opener = lookahead_integration_opener(
             Arc::clone(&store),
             Arc::clone(&logical_schema),
@@ -2239,7 +2246,7 @@ mod test {
             }],
         }));
         let pool = Arc::new(UnboundedMemoryPool::default());
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1, 0));
         let mut opener = ParquetMorselizerBuilder::new()
             .with_store(Arc::clone(&store))
             .with_schema(Arc::clone(&schema))
@@ -3066,7 +3073,7 @@ mod test {
         {
             let predicate = logical2physical(&col("a").gt_eq(lit(3)), &schema);
             let pool = Arc::new(UnboundedMemoryPool::default());
-            let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
+            let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1, 0));
             let mut opener = ParquetMorselizerBuilder::new()
                 .with_store(Arc::clone(&store))
                 .with_schema(Arc::clone(&schema))

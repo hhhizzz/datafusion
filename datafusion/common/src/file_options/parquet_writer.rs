@@ -237,6 +237,7 @@ impl ParquetOptions {
             pushdown_filters: _,
             row_group_lookahead: _,
             row_group_lookahead_depth: _,
+            row_group_prefetch_window: _,
             reorder_filters: _,
             force_filter_selections: _, // not used for writer props
             allow_single_file_parallelism: _,
@@ -492,6 +493,7 @@ mod tests {
             pushdown_filters: defaults.pushdown_filters,
             row_group_lookahead: defaults.row_group_lookahead,
             row_group_lookahead_depth: defaults.row_group_lookahead_depth,
+            row_group_prefetch_window: defaults.row_group_prefetch_window,
             reorder_filters: defaults.reorder_filters,
             force_filter_selections: defaults.force_filter_selections,
             allow_single_file_parallelism: defaults.allow_single_file_parallelism,
@@ -611,6 +613,8 @@ mod tests {
                 row_group_lookahead: global_options_defaults.row_group_lookahead,
                 row_group_lookahead_depth: global_options_defaults
                     .row_group_lookahead_depth,
+                row_group_prefetch_window: global_options_defaults
+                    .row_group_prefetch_window,
                 reorder_filters: global_options_defaults.reorder_filters,
                 force_filter_selections: global_options_defaults.force_filter_selections,
                 allow_single_file_parallelism: global_options_defaults

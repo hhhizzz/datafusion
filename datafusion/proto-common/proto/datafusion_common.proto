@@ -642,6 +642,10 @@ message ParquetOptions {
   oneof row_group_lookahead_depth_opt {
     uint64 row_group_lookahead_depth = 38;
   }
+
+  oneof row_group_prefetch_window_opt {
+    uint64 row_group_prefetch_window = 39;
+  }
 }
 
 // Content-defined chunking (CDC) options for writing parquet files.

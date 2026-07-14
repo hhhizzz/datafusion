@@ -6197,6 +6197,9 @@ impl serde::Serialize for ParquetOptions {
         if self.row_group_lookahead_depth_opt.is_some() {
             len += 1;
         }
+        if self.row_group_prefetch_window_opt.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion_common.ParquetOptions", len)?;
         if self.enable_page_index {
             struct_ser.serialize_field("enablePageIndex", &self.enable_page_index)?;
@@ -6384,6 +6387,15 @@ impl serde::Serialize for ParquetOptions {
                 }
             }
         }
+        if let Some(v) = self.row_group_prefetch_window_opt.as_ref() {
+            match v {
+                parquet_options::RowGroupPrefetchWindowOpt::RowGroupPrefetchWindow(v) => {
+                    #[allow(clippy::needless_borrow)]
+                    #[allow(clippy::needless_borrows_for_generic_args)]
+                    struct_ser.serialize_field("rowGroupPrefetchWindow", ToString::to_string(&v).as_str())?;
+                }
+            }
+        }
         struct_ser.end()
     }
 }
@@ -6463,6 +6475,8 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             "coerceInt96Tz",
             "row_group_lookahead_depth",
             "rowGroupLookaheadDepth",
+            "row_group_prefetch_window",
+            "rowGroupPrefetchWindow",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6503,6 +6517,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             MaxPredicateCacheSize,
             CoerceInt96Tz,
             RowGroupLookaheadDepth,
+            RowGroupPrefetchWindow,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6560,6 +6575,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             "maxPredicateCacheSize" | "max_predicate_cache_size" => Ok(GeneratedField::MaxPredicateCacheSize),
                             "coerceInt96Tz" | "coerce_int96_tz" => Ok(GeneratedField::CoerceInt96Tz),
                             "rowGroupLookaheadDepth" | "row_group_lookahead_depth" => Ok(GeneratedField::RowGroupLookaheadDepth),
+                            "rowGroupPrefetchWindow" | "row_group_prefetch_window" => Ok(GeneratedField::RowGroupPrefetchWindow),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6615,6 +6631,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                 let mut max_predicate_cache_size_opt__ = None;
                 let mut coerce_int96_tz_opt__ = None;
                 let mut row_group_lookahead_depth_opt__ = None;
+                let mut row_group_prefetch_window_opt__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::EnablePageIndex => {
@@ -6847,6 +6864,12 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             }
                             row_group_lookahead_depth_opt__ = map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(x.0));
                         }
+                        GeneratedField::RowGroupPrefetchWindow => {
+                            if row_group_prefetch_window_opt__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("rowGroupPrefetchWindow"));
+                            }
+                            row_group_prefetch_window_opt__ = map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| parquet_options::RowGroupPrefetchWindowOpt::RowGroupPrefetchWindow(x.0));
+                        }
                     }
                 }
                 Ok(ParquetOptions {
@@ -6886,6 +6909,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                     max_predicate_cache_size_opt: max_predicate_cache_size_opt__,
                     coerce_int96_tz_opt: coerce_int96_tz_opt__,
                     row_group_lookahead_depth_opt: row_group_lookahead_depth_opt__,
+                    row_group_prefetch_window_opt: row_group_prefetch_window_opt__,
                 })
             }
         }

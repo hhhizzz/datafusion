@@ -796,9 +796,13 @@ config_namespace! {
         /// (reading) If true, enables bounded speculative row-group reads.
         pub row_group_lookahead: bool, default = false
 
-        /// (reading) Maximum number of decoded row-group readers held by bounded
-        /// speculative lookahead. Used only when `row_group_lookahead` is true.
-        pub row_group_lookahead_depth: usize, default = 1
+/// (reading) Maximum number of decoded row-group readers held by bounded
+/// speculative lookahead. Used only when `row_group_lookahead` is true.
+pub row_group_lookahead_depth: usize, default = 1
+
+/// (reading) Number of dense future row groups to stage into the parquet push
+/// decoder. Valid values are 0, 2, and 4. Requires `row_group_lookahead`.
+pub row_group_prefetch_window: usize, default = 0
 
         /// (reading) If true, filter expressions evaluated during the parquet decoding operation
         /// will be reordered heuristically to minimize the cost of evaluation. If false,

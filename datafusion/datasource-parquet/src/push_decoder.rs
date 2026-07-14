@@ -54,7 +54,7 @@ use crate::row_filter::ParquetReadPlan;
 #[path = "push_decoder_lookahead.rs"]
 mod lookahead_driver;
 
-pub(crate) use lookahead_driver::LookaheadPushDecoderStreamState;
+pub(crate) use lookahead_driver::{LookaheadPushDecoderStreamState, PrefetchPlanQueue};
 
 /// Shared options applied to every [`ParquetPushDecoderBuilder`] in a file scan.
 ///

@@ -41,6 +41,7 @@ async fn records_logical_ranges_and_coalesced_wire_gets() {
         vec![Bytes::from_static(b"ab"), Bytes::from_static(b"ef")]
     );
     let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.coalesce_parallelism, 10);
     assert_eq!(snapshot.get_ranges_calls, 1);
     assert_eq!(snapshot.logical_ranges, 2);
     assert_eq!(snapshot.logical_range_bytes, 4);
@@ -152,6 +153,9 @@ async fn configurable_parallelism_bounds_in_flight_range_gets() {
     );
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.coalesce_parallelism, 4);
+    assert_eq!(snapshot.get_ranges_max_logical_ranges, 8);
+    assert_eq!(snapshot.get_ranges_max_coalesced_ranges, 8);
+    assert_eq!(snapshot.get_ranges_parallelism_saturated_calls, 1);
     assert_eq!(snapshot.range_get_requests, 8);
     assert_eq!(snapshot.peak_in_flight, 4);
 }

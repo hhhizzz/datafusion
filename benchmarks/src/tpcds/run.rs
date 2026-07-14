@@ -19,7 +19,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::util::metrics_object_store::{MetricsObjectStore, ObjectStoreMetrics};
+use crate::util::metrics_object_store::{
+    MetricsObjectStore, OBJECT_STORE_COALESCE_PARALLEL_DEFAULT,
+    OBJECT_STORE_COALESCE_PARALLEL_MAX, ObjectStoreMetrics,
+};
 use crate::util::{BenchmarkRun, CommonOpt, QueryResult, print_memory_stats};
 
 use arrow::datatypes::Schema;
@@ -52,6 +55,8 @@ type BoolDefaultTrue = bool;
 pub const TPCDS_QUERY_START_ID: usize = 1;
 pub const TPCDS_QUERY_END_ID: usize = 99;
 const OBJECT_STORE_COALESCE_GAP_ENV: &str = "TPCDS_OBJECT_STORE_COALESCE_GAP_BYTES";
+const OBJECT_STORE_COALESCE_PARALLELISM_ENV: &str =
+    "TPCDS_OBJECT_STORE_COALESCE_PARALLELISM";
 
 pub const TPCDS_TABLES: &[&str] = &[
     "call_center",
@@ -469,26 +474,39 @@ fn register_s3_object_store(
     let metrics_enabled = std::env::var("TPCDS_OBJECT_STORE_METRICS")
         .is_ok_and(|value| parse_bool_flag(&value));
     let coalesce_gap = object_store_coalesce_gap_from_env()?;
+    let coalesce_parallelism = object_store_coalesce_parallelism_from_env()?;
 
     if metrics_enabled {
         let effective_gap = coalesce_gap.unwrap_or(OBJECT_STORE_COALESCE_DEFAULT);
-        let store = match coalesce_gap {
-            Some(gap) => MetricsObjectStore::new_with_coalesce_gap(store, gap),
-            None => MetricsObjectStore::new(store),
-        };
+        let effective_parallelism =
+            coalesce_parallelism.unwrap_or(OBJECT_STORE_COALESCE_PARALLEL_DEFAULT);
+        let store = MetricsObjectStore::new_with_coalesce_options(
+            store,
+            effective_gap,
+            effective_parallelism,
+        );
         let metrics = store.metrics();
         ctx.register_object_store(object_store_url_ref, Arc::new(store));
         println!(
             "Registered instrumented S3 object store for {object_store_url} \
-             coalesce_gap_bytes={effective_gap}"
+             coalesce_gap_bytes={effective_gap} \
+             coalesce_parallelism={effective_parallelism}"
         );
         Ok(Some(metrics))
-    } else if let Some(coalesce_gap) = coalesce_gap {
-        let store = MetricsObjectStore::new_coalescing(store, coalesce_gap);
+    } else if coalesce_gap.is_some() || coalesce_parallelism.is_some() {
+        let effective_gap = coalesce_gap.unwrap_or(OBJECT_STORE_COALESCE_DEFAULT);
+        let effective_parallelism =
+            coalesce_parallelism.unwrap_or(OBJECT_STORE_COALESCE_PARALLEL_DEFAULT);
+        let store = MetricsObjectStore::new_coalescing_with_options(
+            store,
+            effective_gap,
+            effective_parallelism,
+        );
         ctx.register_object_store(object_store_url_ref, Arc::new(store));
         println!(
             "Registered coalescing S3 object store for {object_store_url} \
-             coalesce_gap_bytes={coalesce_gap} metrics=false"
+             coalesce_gap_bytes={effective_gap} \
+             coalesce_parallelism={effective_parallelism} metrics=false"
         );
         Ok(None)
     } else {
@@ -522,6 +540,36 @@ fn parse_object_store_coalesce_gap(value: Option<&str>) -> Result<Option<u64>> {
                     "invalid {OBJECT_STORE_COALESCE_GAP_ENV} value '{value}': {error}"
                 ))
             })
+        })
+        .transpose()
+}
+
+fn object_store_coalesce_parallelism_from_env() -> Result<Option<usize>> {
+    match std::env::var(OBJECT_STORE_COALESCE_PARALLELISM_ENV) {
+        Ok(value) => parse_object_store_coalesce_parallelism(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(DataFusionError::Configuration(format!(
+                "{OBJECT_STORE_COALESCE_PARALLELISM_ENV} must contain a UTF-8 integer between 1 and {OBJECT_STORE_COALESCE_PARALLEL_MAX}"
+            )))
+        }
+    }
+}
+
+fn parse_object_store_coalesce_parallelism(value: Option<&str>) -> Result<Option<usize>> {
+    value
+        .map(|value| {
+            let parallelism = value.parse::<usize>().map_err(|error| {
+                DataFusionError::Configuration(format!(
+                    "invalid {OBJECT_STORE_COALESCE_PARALLELISM_ENV} value '{value}': {error}"
+                ))
+            })?;
+            if !(1..=OBJECT_STORE_COALESCE_PARALLEL_MAX).contains(&parallelism) {
+                return Err(DataFusionError::Configuration(format!(
+                    "invalid {OBJECT_STORE_COALESCE_PARALLELISM_ENV} value '{value}': expected 1..={OBJECT_STORE_COALESCE_PARALLEL_MAX}"
+                )));
+            }
+            Ok(parallelism)
         })
         .transpose()
 }
@@ -592,8 +640,7 @@ mod tests {
         );
 
         for value in ["0", "25", "invalid"] {
-            let error =
-                parse_object_store_coalesce_parallelism(Some(value)).unwrap_err();
+            let error = parse_object_store_coalesce_parallelism(Some(value)).unwrap_err();
             assert!(
                 error
                     .to_string()

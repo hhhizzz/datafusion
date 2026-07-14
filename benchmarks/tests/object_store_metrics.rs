@@ -19,7 +19,9 @@ use bytes::Bytes;
 use datafusion_benchmarks::util::metrics_object_store::MetricsObjectStore;
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use std::time::Duration;
 
 #[tokio::test]
 async fn records_logical_ranges_and_coalesced_wire_gets() {
@@ -116,4 +118,40 @@ async fn coalescing_only_store_does_not_collect_metrics() {
     let wire_snapshot = wire_metrics.snapshot();
     assert_eq!(wire_snapshot.range_get_requests, 2);
     assert_eq!(wire_snapshot.response_range_bytes, 4);
+}
+
+#[tokio::test]
+async fn configurable_parallelism_bounds_in_flight_range_gets() {
+    let inner = ThrottledStore::new(
+        InMemory::new(),
+        ThrottleConfig {
+            wait_get_per_call: Duration::from_millis(50),
+            ..Default::default()
+        },
+    );
+    let store = MetricsObjectStore::new_with_coalesce_options(inner, 0, 4);
+    let path = Path::from("data.parquet");
+    store
+        .put(&path, PutPayload::from_static(b"abcdefgh"))
+        .await
+        .unwrap();
+
+    let metrics = store.metrics();
+    metrics.reset();
+    let result = store
+        .get_ranges(&path, &[0..1, 1..2, 2..3, 3..4, 4..5, 5..6, 6..7, 7..8])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result,
+        b"abcdefgh"
+            .iter()
+            .map(|value| Bytes::copy_from_slice(&[*value]))
+            .collect::<Vec<_>>()
+    );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.coalesce_parallelism, 4);
+    assert_eq!(snapshot.range_get_requests, 8);
+    assert_eq!(snapshot.peak_in_flight, 4);
 }

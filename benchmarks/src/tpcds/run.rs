@@ -611,6 +611,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_object_store_coalesce_parallelism() {
+        assert_eq!(parse_object_store_coalesce_parallelism(None).unwrap(), None);
+        assert_eq!(
+            parse_object_store_coalesce_parallelism(Some("1")).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            parse_object_store_coalesce_parallelism(Some("24")).unwrap(),
+            Some(24)
+        );
+
+        for value in ["0", "25", "invalid"] {
+            let error =
+                parse_object_store_coalesce_parallelism(Some(value)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("TPCDS_OBJECT_STORE_COALESCE_PARALLELISM")
+            );
+        }
+    }
+
     fn q39_reuse_runner() -> RunOpt {
         RunOpt {
             query: Some(39),

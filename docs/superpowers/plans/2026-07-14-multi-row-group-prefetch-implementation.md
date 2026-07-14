@@ -182,7 +182,7 @@ Extend existing depth-one tests so each runs for depths 1 and 4 where applicable
 - [ ] **Step 5: Run tests and commit**
 
 ```bash
-rtk cargo test -p datafusion-datasource-parquet push_decoder_lookahead -- --nocapture
+rtk cargo test -p datafusion-datasource-parquet lookahead_driver -- --nocapture
 rtk cargo clippy -p datafusion-datasource-parquet --all-targets -- -D warnings
 rtk git add datafusion/datasource-parquet/src/push_decoder_lookahead.rs
 rtk git commit -m "feat: queue bounded parquet row-group lookahead"
@@ -384,7 +384,7 @@ reservation merely because an earlier reader becomes active.
 - [ ] **Step 6: Run state-machine tests and commit**
 
 ```bash
-rtk cargo test -p datafusion-datasource-parquet push_decoder_lookahead -- --nocapture
+rtk cargo test -p datafusion-datasource-parquet lookahead_driver -- --nocapture
 rtk cargo test -p datafusion-datasource-parquet row_group_prefetch -- --nocapture
 rtk cargo clippy -p datafusion-datasource-parquet --all-targets -- -D warnings
 rtk git add datafusion/common/src/config.rs datafusion/datasource-parquet datafusion/proto-common datafusion/proto docs/source/user-guide/configs.md

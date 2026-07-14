@@ -310,11 +310,11 @@ impl LookaheadPushDecoderStreamState {
         self.terminated = true;
         self.prefetched_readers.clear();
         self.next_reader_future = None;
+        self.foreground_resources = SpeculativeResources::default();
         self.active_reader = None;
         self.decoder = None;
         self.reader = None;
         self.pending_decoders.clear();
-        self.foreground_resources = SpeculativeResources::default();
         self.deferred_error = None;
         self.run_finished = false;
     }
@@ -636,8 +636,16 @@ mod tests {
         }
 
         fn record_reader_drop(&self) {
-            let byte_budget_released = self
-                .context
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let reservation = Arc::new(
+                MemoryConsumer::new("push-decoder-lookahead-reader-drop-probe")
+                    .register(&pool),
+            );
+            let byte_budget_context = LookaheadFileContext::new(
+                Arc::clone(&self.context.coordinator),
+                reservation,
+            );
+            let byte_budget_released = byte_budget_context
                 .try_reserve(MAX_SPECULATIVE_BYTES)
                 .is_some_and(|lease| {
                     drop(lease);
@@ -1456,6 +1464,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn depth_one_pending_decoder_run_is_not_prefetched_across_boundary() {
+        let fixture = ThreeRowGroupFixture::with_row_group_count_and_filter_columns(
+            5,
+            &LOOKAHEAD_FILTER_COLUMNS,
+        );
+        let (serial, _) = fixture.serial_oracle().await;
+        let control = ScriptControl::new(Some(3));
+        let (_, context) = fixture.lookahead_context_with_depth(1);
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let decoder =
+            fixture.decoder_for_row_groups(Some(vec![0, 1, 2]), &arrow_reader_metrics);
+        let pending_decoder =
+            fixture.decoder_for_row_groups(Some(vec![3, 4]), &arrow_reader_metrics);
+        let mut stream = LookaheadPushDecoderStreamState::new(
+            decoder,
+            VecDeque::from([pending_decoder]),
+            fixture.reader(control.clone()),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .into_stream();
+
+        let mut output = Vec::new();
+        for expected in 1..=8 {
+            let batch = stream.next().await.unwrap().unwrap();
+            assert_eq!(batch_values(&batch), vec![expected]);
+            output.push(batch);
+            assert!(!control.has_request_for(3));
+        }
+        assert!(control.has_request_for(1));
+        assert!(control.has_request_for(2));
+
+        let mut next = Box::pin(stream.next());
+        assert!(matches!(futures::poll!(next.as_mut()), Poll::Pending));
+        assert!(control.has_request_for(3));
+        assert!(!control.has_request_for(4));
+
+        control.release();
+        output.push(next.await.unwrap().unwrap());
+        output.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+        assert_eq!(output, serial);
+    }
+
+    #[tokio::test]
     async fn partial_range_permit_denial_continues_without_duplicate_ranges() {
         let fixture = ThreeRowGroupFixture::new();
         let (serial, serial_control) = fixture.serial_oracle().await;
@@ -1778,6 +1830,56 @@ mod tests {
             coordinator.range_permits.available_permits(),
             MAX_IN_FLIGHT_RANGES
         );
+        assert_shared_budgets_released(&coordinator);
+    }
+
+    #[tokio::test]
+    async fn direct_stream_drop_releases_foreground_resources_before_reader_teardown() {
+        let fixture = ThreeRowGroupFixture::with_disjoint_filter_and_projection();
+        let (_, serial_control) = fixture.serial_oracle().await;
+        let first_chunk_bytes = serial_control.requests_for(1)[0].ranges[..4]
+            .iter()
+            .map(|range| usize::try_from(range.end - range.start).unwrap())
+            .sum();
+        let control = ScriptControl::new(None);
+        let pool = Arc::new(GreedyMemoryPool::new(first_chunk_bytes));
+        let (coordinator, context) =
+            fixture.lookahead_context_with_depth_and_pool(4, pool.clone());
+        let probe = ReaderDropProbe::new(context.clone());
+        let reservation = Arc::clone(&context.reservation);
+        let (decoder, arrow_reader_metrics) = fixture.decoder();
+        let mut stream = LookaheadPushDecoderStreamState::new(
+            decoder,
+            VecDeque::new(),
+            fixture.reader_with_drop_probe(control.clone(), Some(probe.clone())),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .into_stream();
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(batch_values(&first), vec![1]);
+        assert_eq!(
+            control
+                .requests_for(1)
+                .iter()
+                .map(|request| request.ranges.len())
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert!(reservation.size() > 0);
+        assert!(coordinator.range_permits.available_permits() < MAX_IN_FLIGHT_RANGES);
+
+        drop(stream);
+
+        assert!(probe.reader_dropped.load(Ordering::SeqCst));
+        assert!(
+            probe
+                .resources_released_before_reader_drop
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(pool.reserved(), 0);
         assert_shared_budgets_released(&coordinator);
     }
 

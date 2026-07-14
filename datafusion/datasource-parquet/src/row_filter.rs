@@ -720,6 +720,25 @@ pub(crate) fn build_projection_read_plan(
     }
 }
 
+/// Builds a projection plan for output expressions and an optional predicate.
+///
+/// The predicate is chained before either caller moves its expression state so
+/// the resulting leaf mask is the union required for both decoding phases.
+pub(crate) fn build_projection_read_plan_with_predicate(
+    output_exprs: impl IntoIterator<Item = Arc<dyn PhysicalExpr>>,
+    predicate: Option<&Arc<dyn PhysicalExpr>>,
+    file_schema: &Schema,
+    schema_descr: &SchemaDescriptor,
+) -> ParquetReadPlan {
+    build_projection_read_plan(
+        output_exprs
+            .into_iter()
+            .chain(predicate.into_iter().cloned()),
+        file_schema,
+        schema_descr,
+    )
+}
+
 fn leaf_indices_for_roots<I>(
     root_indices: I,
     schema_descr: &SchemaDescriptor,
@@ -2112,6 +2131,47 @@ mod test {
         // all3 Parquet leaves should be in the projection mask
         let expected_mask = ProjectionMask::leaves(schema_descr, [0, 1, 2]);
         assert_eq!(read_plan.projection_mask, expected_mask,);
+    }
+
+    #[test]
+    fn projection_read_plan_includes_predicate_only_leaf() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("output", DataType::Int32, false),
+            Field::new("filter", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+            ],
+        )
+        .unwrap();
+        let file = NamedTempFile::new().unwrap();
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap()).unwrap();
+        let metadata = builder.metadata();
+        let output = Arc::new(PhysicalColumn::new("output", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(PhysicalColumn::new("filter", 1)) as Arc<dyn PhysicalExpr>;
+
+        let read_plan = build_projection_read_plan_with_predicate(
+            [output],
+            Some(&predicate),
+            builder.schema(),
+            metadata.file_metadata().schema_descr(),
+        );
+
+        assert_eq!(
+            read_plan.projection_mask,
+            ProjectionMask::leaves(metadata.file_metadata().schema_descr(), [0, 1]),
+        );
     }
 
     /// Sanity check that the given expression could be evaluated against the given schema without any errors.

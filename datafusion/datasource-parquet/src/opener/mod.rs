@@ -30,8 +30,9 @@ use crate::push_decoder::{
     DecoderBuilderConfig, LookaheadPushDecoderStreamState, PushDecoderOutputState,
     PushDecoderStreamState,
 };
-use crate::row_filter::{RowFilterGenerator, build_projection_read_plan};
+use crate::row_filter::{RowFilterGenerator, build_projection_read_plan_with_predicate};
 use crate::row_group_filter::{BloomFilterStatistics, RowGroupAccessPlanFilter};
+use crate::row_group_prefetch::{RowGroupPrefetchMetrics, RowGroupPrefetchPlan};
 use crate::{
     Int96Coercer, ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
     apply_file_schema_type_coercions,
@@ -1178,13 +1179,26 @@ impl RowGroupsPrunedParquetOpen {
             };
 
         let arrow_reader_metrics = ArrowReaderMetrics::enabled();
-        let read_plan = build_projection_read_plan(
+        let read_plan = build_projection_read_plan_with_predicate(
             prepared.projection.expr_iter(),
+            prepared.predicate.as_ref(),
             &prepared.physical_file_schema,
             reader_metadata.parquet_schema(),
         );
 
-        let (decoder, pending_decoders, remaining_limit) = {
+        let prefetch_metrics = RowGroupPrefetchMetrics::new(
+            prepared.partition_index,
+            &prepared.file_name,
+            &prepared.metrics,
+        );
+
+        let (
+            decoder,
+            pending_decoders,
+            remaining_limit,
+            active_prefetch_plan,
+            pending_prefetch_plans,
+        ) = {
             let pushdown_predicate = prepared
                 .pushdown_filters
                 .then_some(prepared.predicate.as_ref())
@@ -1219,8 +1233,16 @@ impl RowGroupsPrunedParquetOpen {
 
             // Build a decoder per run.
             let mut decoders = VecDeque::with_capacity(runs.len());
+            let mut prefetch_plans = VecDeque::with_capacity(runs.len());
             for run in runs {
                 let prepared_access_plan = prepare_access_plan(run.access_plan)?;
+                let prefetch_plan = RowGroupPrefetchPlan::new(
+                    file_metadata.as_ref(),
+                    &read_plan.projection_mask,
+                    prepared_access_plan.row_group_indexes.clone(),
+                );
+                prefetch_metrics
+                    .record_candidate_bytes(prefetch_plan.projected_payload_bytes());
                 let mut builder =
                     decoder_config.build(prepared_access_plan, reader_metadata.clone());
                 if run.needs_filter {
@@ -1235,13 +1257,28 @@ impl RowGroupsPrunedParquetOpen {
                     }
                 }
                 decoders.push_back(builder.build()?);
+                prefetch_plans.push_back(prefetch_plan);
             }
 
             let decoder = decoders
                 .pop_front()
                 .expect("at least one decoder must be created");
-            (decoder, decoders, remaining_limit)
+            let active_prefetch_plan = prefetch_plans
+                .pop_front()
+                .expect("each decoder run has a prefetch plan");
+            debug_assert_eq!(prefetch_plans.len(), decoders.len());
+            (
+                decoder,
+                decoders,
+                remaining_limit,
+                active_prefetch_plan,
+                prefetch_plans,
+            )
         };
+
+        // Task 5 transfers these plans to the lookahead state with their decoder
+        // counterparts. This task intentionally performs no speculative I/O.
+        drop((active_prefetch_plan, pending_prefetch_plans));
 
         let predicate_cache_inner_records =
             prepared.file_metrics.predicate_cache_inner_records.clone();

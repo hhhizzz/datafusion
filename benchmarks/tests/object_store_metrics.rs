@@ -17,6 +17,7 @@
 
 use bytes::Bytes;
 use datafusion_benchmarks::util::metrics_object_store::MetricsObjectStore;
+use futures::StreamExt;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::throttle::{ThrottleConfig, ThrottledStore};
@@ -196,4 +197,31 @@ async fn global_limit_bounds_concurrent_get_ranges_calls() {
     left_result.unwrap();
     right_result.unwrap();
     assert_eq!(store.metrics().snapshot().peak_in_flight, 3);
+}
+
+#[tokio::test]
+async fn exhausted_stream_releases_global_request_permit() {
+    let store = MetricsObjectStore::new_with_limits(InMemory::new(), 0, 1, 1);
+    let path = Path::from("data.parquet");
+    store
+        .put(&path, PutPayload::from_static(b"abcdef"))
+        .await
+        .unwrap();
+
+    let mut stream = store.get(&path).await.unwrap().into_stream();
+    assert_eq!(
+        stream.next().await.unwrap().unwrap(),
+        Bytes::from_static(b"abcdef")
+    );
+    assert!(stream.next().await.is_none());
+
+    let second = tokio::time::timeout(Duration::from_millis(50), store.get(&path)).await;
+    assert!(
+        second.is_ok(),
+        "an exhausted but retained stream must release its request permit"
+    );
+    second.unwrap().unwrap().bytes().await.unwrap();
+
+    // Keep the exhausted stream live through the second request.
+    assert!(stream.next().await.is_none());
 }

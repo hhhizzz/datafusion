@@ -36,10 +36,10 @@ use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
     MultipartUpload, OBJECT_STORE_COALESCE_DEFAULT, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, Result,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
 };
 use serde::Serialize;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Default range-request concurrency used by object_store 0.13.2.
 pub const OBJECT_STORE_COALESCE_PARALLEL_DEFAULT: usize = 10;
@@ -466,6 +466,7 @@ pub struct MetricsObjectStore<T: ObjectStore> {
     metrics: ObjectStoreMetrics,
     coalesce_gap_bytes: u64,
     coalesce_parallelism: usize,
+    request_permits: Arc<Semaphore>,
     metrics_enabled: bool,
 }
 
@@ -500,7 +501,33 @@ impl<T: ObjectStore> MetricsObjectStore<T> {
         coalesce_gap_bytes: u64,
         coalesce_parallelism: usize,
     ) -> Self {
-        Self::new_inner(inner, coalesce_gap_bytes, coalesce_parallelism, true)
+        Self::new_inner(
+            inner,
+            coalesce_gap_bytes,
+            coalesce_parallelism,
+            OBJECT_STORE_COALESCE_PARALLEL_MAX,
+            true,
+        )
+    }
+
+    /// Construct an instrumented store with explicit physical request limits.
+    pub fn new_with_limits(
+        inner: T,
+        coalesce_gap_bytes: u64,
+        coalesce_parallelism: usize,
+        global_parallelism: usize,
+    ) -> Self {
+        assert!(
+            (1..=OBJECT_STORE_COALESCE_PARALLEL_MAX).contains(&global_parallelism),
+            "global parallelism must be between 1 and {OBJECT_STORE_COALESCE_PARALLEL_MAX}"
+        );
+        Self::new_inner(
+            inner,
+            coalesce_gap_bytes,
+            coalesce_parallelism,
+            global_parallelism,
+            true,
+        )
     }
 
     /// Construct a metrics-free store with explicit range coalescing options.
@@ -509,13 +536,20 @@ impl<T: ObjectStore> MetricsObjectStore<T> {
         coalesce_gap_bytes: u64,
         coalesce_parallelism: usize,
     ) -> Self {
-        Self::new_inner(inner, coalesce_gap_bytes, coalesce_parallelism, false)
+        Self::new_inner(
+            inner,
+            coalesce_gap_bytes,
+            coalesce_parallelism,
+            OBJECT_STORE_COALESCE_PARALLEL_MAX,
+            false,
+        )
     }
 
     fn new_inner(
         inner: T,
         coalesce_gap_bytes: u64,
         coalesce_parallelism: usize,
+        global_parallelism: usize,
         metrics_enabled: bool,
     ) -> Self {
         assert!(
@@ -536,6 +570,7 @@ impl<T: ObjectStore> MetricsObjectStore<T> {
             metrics,
             coalesce_gap_bytes,
             coalesce_parallelism,
+            request_permits: Arc::new(Semaphore::new(global_parallelism)),
             metrics_enabled,
         }
     }
@@ -570,6 +605,10 @@ impl<T: ObjectStore> MetricsObjectStore<T> {
                 .fetch_add(range.end - range.start, Ordering::Relaxed);
         }
 
+        let request_permit = Arc::clone(&self.request_permits)
+            .acquire_owned()
+            .await
+            .expect("request semaphore must not be closed");
         let mut tracker = self.metrics.request_started(location.as_ref(), kind);
         let result = self.inner.get_opts(location, options).await;
         let result = match result {
@@ -587,20 +626,32 @@ impl<T: ObjectStore> MetricsObjectStore<T> {
             response_bytes,
         );
 
-        let payload = match result.payload {
+        let payload =
+            Self::with_request_permit(result.payload, Some(tracker), request_permit);
+        Ok(GetResult { payload, ..result })
+    }
+
+    fn with_request_permit(
+        payload: GetResultPayload,
+        tracker: Option<RequestTracker>,
+        request_permit: OwnedSemaphorePermit,
+    ) -> GetResultPayload {
+        match payload {
             payload @ GetResultPayload::File(_, _) => {
-                tracker.finish();
+                if let Some(mut tracker) = tracker {
+                    tracker.finish();
+                }
                 payload
             }
             GetResultPayload::Stream(stream) => GetResultPayload::Stream(
                 MetricsStream {
                     inner: stream,
-                    tracker: Some(tracker),
+                    tracker,
+                    _request_permit: request_permit,
                 }
                 .boxed(),
             ),
-        };
-        Ok(GetResult { payload, ..result })
+        }
     }
 
     async fn get_coalesced_range(
@@ -609,7 +660,8 @@ impl<T: ObjectStore> MetricsObjectStore<T> {
         range: Range<u64>,
     ) -> Result<Bytes> {
         if !self.metrics_enabled {
-            return self.inner.get_range(location, range).await;
+            let options = GetOptions::new().with_range(Some(range));
+            return self.get_opts(location, options).await?.bytes().await;
         }
         let options = GetOptions::new().with_range(Some(range));
         self.instrumented_get_opts(location, options, false)
@@ -648,7 +700,13 @@ impl<T: ObjectStore> ObjectStore for MetricsObjectStore<T> {
         if self.metrics_enabled {
             self.instrumented_get_opts(location, options, true).await
         } else {
-            self.inner.get_opts(location, options).await
+            let request_permit = Arc::clone(&self.request_permits)
+                .acquire_owned()
+                .await
+                .expect("request semaphore must not be closed");
+            let result = self.inner.get_opts(location, options).await?;
+            let payload = Self::with_request_permit(result.payload, None, request_permit);
+            Ok(GetResult { payload, ..result })
         }
     }
 
@@ -839,6 +897,7 @@ impl Drop for RequestTracker {
 struct MetricsStream {
     inner: BoxStream<'static, Result<Bytes>>,
     tracker: Option<RequestTracker>,
+    _request_permit: OwnedSemaphorePermit,
 }
 
 impl Stream for MetricsStream {

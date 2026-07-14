@@ -21,6 +21,7 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[tokio::test]
@@ -161,4 +162,38 @@ async fn configurable_parallelism_bounds_in_flight_range_gets() {
     assert_eq!(snapshot.get_ranges_parallelism_saturated_calls, 1);
     assert_eq!(snapshot.range_get_requests, 8);
     assert_eq!(snapshot.peak_in_flight, 4);
+}
+
+#[tokio::test]
+async fn global_limit_bounds_concurrent_get_ranges_calls() {
+    let inner = ThrottledStore::new(
+        InMemory::new(),
+        ThrottleConfig {
+            wait_get_per_call: Duration::from_millis(50),
+            ..Default::default()
+        },
+    );
+    let store = Arc::new(MetricsObjectStore::new_with_limits(inner, 0, 4, 3));
+    let path = Path::from("data.parquet");
+    store
+        .put(&path, PutPayload::from_bytes(Bytes::from(vec![0_u8; 32])))
+        .await
+        .unwrap();
+    store.metrics().reset();
+
+    let left = Arc::clone(&store);
+    let right = Arc::clone(&store);
+    let left_path = path.clone();
+    let right_path = path.clone();
+    let (left_result, right_result) = tokio::join!(
+        async move { left.get_ranges(&left_path, &[0..1, 2..3, 4..5, 6..7]).await },
+        async move {
+            right
+                .get_ranges(&right_path, &[8..9, 10..11, 12..13, 14..15])
+                .await
+        },
+    );
+    left_result.unwrap();
+    right_result.unwrap();
+    assert_eq!(store.metrics().snapshot().peak_in_flight, 3);
 }

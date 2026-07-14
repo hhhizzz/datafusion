@@ -341,19 +341,18 @@ async fn drive_speculative_next_reader(
     let result = loop {
         match decoder.try_next_reader() {
             Ok(DecodeResult::NeedsData(ranges)) => {
-                let fetch_ranges = ranges
-                    .into_iter()
-                    .take(MAX_RANGES_PER_FILE_FETCH)
-                    .collect::<Vec<_>>();
-                let Some(bytes) = fetch_ranges.iter().try_fold(0usize, |sum, range| {
+                if ranges.len() > MAX_RANGES_PER_FILE_FETCH {
+                    break NextReaderResult::Denied;
+                }
+                let Some(bytes) = ranges.iter().try_fold(0usize, |sum, range| {
                     let len =
                         usize::try_from(range.end.checked_sub(range.start)?).ok()?;
                     sum.checked_add(len)
                 }) else {
                     break NextReaderResult::Denied;
                 };
-                let permit_count = u32::try_from(fetch_ranges.len())
-                    .expect("speculative range chunk is bounded by four");
+                let permit_count = u32::try_from(ranges.len())
+                    .expect("speculative range set is bounded by four");
                 let Ok(range_permit) = Arc::clone(&lookahead.coordinator.range_permits)
                     .try_acquire_many_owned(permit_count)
                 else {
@@ -363,7 +362,7 @@ async fn drive_speculative_next_reader(
                     drop(range_permit);
                     break NextReaderResult::Denied;
                 };
-                let data = match reader.get_byte_ranges(fetch_ranges.clone()).await {
+                let data = match reader.get_byte_ranges(ranges.clone()).await {
                     Ok(data) => data,
                     Err(error) => {
                         drop(lease);
@@ -371,7 +370,7 @@ async fn drive_speculative_next_reader(
                         break NextReaderResult::Error(DataFusionError::from(error));
                     }
                 };
-                if let Err(error) = decoder.push_ranges(fetch_ranges, data) {
+                if let Err(error) = decoder.push_ranges(ranges, data) {
                     drop(lease);
                     drop(range_permit);
                     break NextReaderResult::Error(DataFusionError::from(error));
@@ -442,6 +441,10 @@ mod tests {
     const FILTER_COLUMNS: [&str; 6] = [
         "value", "filter_1", "filter_2", "filter_3", "filter_4", "filter_5",
     ];
+    const LOOKAHEAD_FILTER_COLUMNS: [&str; 4] =
+        ["value", "filter_1", "filter_2", "filter_3"];
+    const DISJOINT_FILTER_COLUMNS: [&str; 4] =
+        ["filter_1", "filter_2", "filter_3", "filter_4"];
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct RequestRecord {
@@ -687,10 +690,15 @@ mod tests {
         metadata: Arc<ParquetMetaData>,
         row_group_spans: Arc<Vec<Range<u64>>>,
         output_schema: SchemaRef,
+        filter_columns: Vec<&'static str>,
     }
 
     impl ThreeRowGroupFixture {
         fn new() -> Self {
+            Self::with_filter_columns(&LOOKAHEAD_FILTER_COLUMNS)
+        }
+
+        fn with_filter_columns(filter_columns: &[&'static str]) -> Self {
             let schema = Arc::new(Schema::new(
                 FILTER_COLUMNS
                     .iter()
@@ -752,7 +760,12 @@ mod tests {
                 metadata,
                 row_group_spans,
                 output_schema,
+                filter_columns: filter_columns.to_vec(),
             }
+        }
+
+        fn with_disjoint_filter_and_projection() -> Self {
+            Self::with_filter_columns(&DISJOINT_FILTER_COLUMNS)
         }
 
         fn reader(&self, control: ScriptControl) -> Box<dyn AsyncFileReader> {
@@ -801,7 +814,10 @@ mod tests {
                 .with_metrics(arrow_reader_metrics.clone());
             if let Some(filter_threshold) = filter_threshold {
                 let predicate = ArrowPredicateFn::new(
-                    ProjectionMask::columns(&schema_descr, FILTER_COLUMNS),
+                    ProjectionMask::columns(
+                        &schema_descr,
+                        self.filter_columns.iter().copied(),
+                    ),
                     move |batch| {
                         let values = batch
                             .column(0)
@@ -1065,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn foreground_fetch_error_after_partial_byte_denial_is_immediate_and_terminal()
     {
-        let fixture = ThreeRowGroupFixture::new();
+        let fixture = ThreeRowGroupFixture::with_disjoint_filter_and_projection();
         let (_, serial_control) = fixture.serial_oracle().await;
         let first_chunk_bytes = serial_control.requests_for(1)[0].ranges[..4]
             .iter()
@@ -1090,7 +1106,7 @@ mod tests {
                 .iter()
                 .map(|request| request.ranges.len())
                 .collect::<Vec<_>>(),
-            vec![4, 2]
+            vec![4, 1]
         );
         assert!(!control.has_request_for(2));
         assert_eq!(control.active_fetches(), 0);
@@ -1215,7 +1231,7 @@ mod tests {
         let (coordinator, context) = fixture.lookahead_context();
         let reservation = Arc::clone(&context.reservation);
         let held = Arc::clone(&coordinator.range_permits)
-            .try_acquire_many_owned(20)
+            .try_acquire_many_owned(21)
             .unwrap();
         let stream = fixture.lookahead_stream(control.clone(), context);
 
@@ -1228,7 +1244,7 @@ mod tests {
                 .iter()
                 .map(|request| request.ranges.len())
                 .collect::<Vec<_>>(),
-            vec![4, 2]
+            vec![4]
         );
         let actual_ranges = denied_requests
             .iter()
@@ -1242,11 +1258,75 @@ mod tests {
             .map(|range| (range.start, range.end))
             .collect::<HashSet<_>>();
         assert_eq!(actual_ranges, expected_ranges);
-        assert_eq!(actual_ranges.len(), 6);
+        assert_eq!(actual_ranges.len(), 4);
         assert_eq!(reservation.size(), 0);
-        assert_eq!(coordinator.range_permits.available_permits(), 4);
+        assert_eq!(coordinator.range_permits.available_permits(), 3);
 
         drop(held);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_range_set_falls_back_without_fragmenting() {
+        let fixture = ThreeRowGroupFixture::with_filter_columns(&FILTER_COLUMNS);
+        let (serial, serial_control) = fixture.serial_oracle().await;
+        let control = ScriptControl::new(Some(1));
+        let (coordinator, context) = fixture.lookahead_context();
+        let reservation = Arc::clone(&context.reservation);
+        let mut stream = fixture.lookahead_stream(control.clone(), context);
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(batch_values(&first), vec![1]);
+        assert!(!control.has_request_for(1));
+
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(batch_values(&second), vec![2]);
+        assert!(!control.has_request_for(1));
+
+        let mut next = Box::pin(stream.next());
+        assert!(matches!(futures::poll!(next.as_mut()), Poll::Pending));
+        assert!(control.has_request_for(1));
+        assert_eq!(
+            control
+                .requests_for(1)
+                .iter()
+                .map(|request| request.ranges.len())
+                .collect::<Vec<_>>(),
+            vec![6]
+        );
+
+        control.release();
+        let third = timeout(Duration::from_secs(5), next)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch_values(&third), vec![3]);
+
+        let mut lookahead = vec![first, second, third];
+        lookahead.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+
+        assert_eq!(lookahead, serial);
+        assert_eq!(
+            serial_control
+                .requests_for(1)
+                .iter()
+                .map(|request| request.ranges.len())
+                .collect::<Vec<_>>(),
+            vec![6]
+        );
+        assert_eq!(
+            control
+                .requests_for(2)
+                .iter()
+                .map(|request| request.ranges.len())
+                .collect::<Vec<_>>(),
+            vec![6]
+        );
+        assert_eq!(reservation.size(), 0);
         assert_eq!(
             coordinator.range_permits.available_permits(),
             MAX_IN_FLIGHT_RANGES
@@ -1272,7 +1352,7 @@ mod tests {
                 .iter()
                 .map(|request| request.ranges.len())
                 .collect::<Vec<_>>(),
-            vec![6]
+            vec![4]
         );
         assert_eq!(reservation.size(), 0);
         assert_eq!(pool.reserved(), 0);
@@ -1284,7 +1364,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_memory_denial_preserves_ranges_and_disables_later_speculation() {
-        let fixture = ThreeRowGroupFixture::new();
+        let fixture = ThreeRowGroupFixture::with_disjoint_filter_and_projection();
         let (serial, serial_control) = fixture.serial_oracle().await;
         let first_chunk_bytes = serial_control.requests_for(1)[0].ranges[..4]
             .iter()
@@ -1305,7 +1385,7 @@ mod tests {
                 .iter()
                 .map(|request| request.ranges.len())
                 .collect::<Vec<_>>(),
-            vec![4, 2]
+            vec![4, 1]
         );
         assert_eq!(
             control
@@ -1313,7 +1393,7 @@ mod tests {
                 .iter()
                 .map(|request| request.ranges.len())
                 .collect::<Vec<_>>(),
-            vec![6]
+            vec![4, 1]
         );
         let actual_ranges = control
             .requests_for(1)
@@ -1328,7 +1408,7 @@ mod tests {
             .map(|range| (range.start, range.end))
             .collect::<HashSet<_>>();
         assert_eq!(actual_ranges, expected_ranges);
-        assert_eq!(actual_ranges.len(), 6);
+        assert_eq!(actual_ranges.len(), 5);
         assert_eq!(reservation.size(), 0);
         assert_eq!(pool.reserved(), 0);
         assert_eq!(

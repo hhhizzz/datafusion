@@ -1973,9 +1973,7 @@ mod test {
         ))
     }
 
-    const LOOKAHEAD_COLUMNS: [&str; 6] = [
-        "value", "filter_1", "filter_2", "filter_3", "filter_4", "filter_5",
-    ];
+    const LOOKAHEAD_COLUMNS: [&str; 4] = ["value", "filter_1", "filter_2", "filter_3"];
 
     fn lookahead_integration_fixture() -> (Bytes, SchemaRef) {
         let physical_schema = Arc::new(Schema::new(
@@ -2131,8 +2129,8 @@ mod test {
                 .map(String::as_str),
             Some("preserved")
         );
-        assert_eq!(serial_factory.request_sizes(), vec![6, 6, 6]);
-        assert_eq!(lookahead_factory.request_sizes(), vec![6, 4, 2, 4, 2]);
+        assert_eq!(serial_factory.request_sizes(), vec![4, 4, 4]);
+        assert_eq!(lookahead_factory.request_sizes(), vec![4, 4, 4]);
         assert_eq!(
             metric_value(&serial_metrics, "predicate_cache_inner_records"),
             metric_value(&lookahead_metrics, "predicate_cache_inner_records")

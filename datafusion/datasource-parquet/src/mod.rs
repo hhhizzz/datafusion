@@ -36,13 +36,6 @@ mod push_decoder;
 mod reader;
 mod row_filter;
 mod row_group_filter;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 5 consumes the planning-only seams registered here."
-    )
-)]
 mod row_group_prefetch;
 mod schema_coercion;
 mod sink;

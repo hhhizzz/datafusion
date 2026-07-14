@@ -85,6 +85,10 @@ impl RowGroupPrefetchPlan {
     }
 
     /// Returns the final decoder order, including a reverse scan order.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 5 advances plans by row group.")
+    )]
     pub(crate) fn row_group_order(&self) -> &[usize] {
         &self.row_group_order
     }
@@ -95,6 +99,10 @@ impl RowGroupPrefetchPlan {
     }
 
     /// Returns deterministic physical ranges for the requested row groups.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 5 fetches admitted spans.")
+    )]
     pub(crate) fn ranges_for(&self, row_group_indexes: &[usize]) -> Vec<Range<u64>> {
         let requested = row_group_indexes.iter().copied().collect::<BTreeSet<_>>();
         let mut ranges = requested
@@ -108,6 +116,10 @@ impl RowGroupPrefetchPlan {
     }
 
     /// Creates policy state that observes exact requests for this plan's spans.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 5 drives density admission.")
+    )]
     pub(crate) fn density_admission(&self) -> DensityAdmission {
         let candidate_ranges = merge_ranges_without_gap(
             self.ranges_by_row_group
@@ -130,6 +142,15 @@ pub(crate) enum AdmissionState {
     Disabled,
 }
 
+/// A terminal density-admission transition, emitted at most once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionDecision {
+    /// Candidate spans have sufficient dense exact coverage.
+    Enabled,
+    /// Candidate spans have sufficient sparse exact coverage.
+    Denied,
+}
+
 /// Tracks unique exact coverage against the candidate projected spans.
 #[derive(Debug, Clone)]
 pub(crate) struct DensityAdmission {
@@ -138,8 +159,13 @@ pub(crate) struct DensityAdmission {
     candidate_payload_bytes: usize,
     observed_payload_bytes: usize,
     state: AdmissionState,
+    admission_metrics_recorded: bool,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Task 5 drives density admission.")
+)]
 impl DensityAdmission {
     fn new(candidate_ranges: Vec<Range<u64>>) -> Self {
         let candidate_payload_bytes =
@@ -150,16 +176,17 @@ impl DensityAdmission {
             candidate_payload_bytes,
             observed_payload_bytes: 0,
             state: AdmissionState::Observing,
+            admission_metrics_recorded: false,
         }
     }
 
-    /// Adds exact decoder requests and returns the current admission state.
+    /// Adds exact decoder requests and returns a terminal transition once.
     pub(crate) fn observe_exact_ranges(
         &mut self,
         exact_ranges: &[Range<u64>],
-    ) -> AdmissionState {
+    ) -> Option<AdmissionDecision> {
         if self.state != AdmissionState::Observing {
-            return self.state;
+            return None;
         }
 
         for exact_range in exact_ranges {
@@ -177,17 +204,20 @@ impl DensityAdmission {
         if self.observed_payload_bytes < MIN_ADMISSION_BYTES
             || self.candidate_payload_bytes == 0
         {
-            return self.state;
+            return None;
         }
 
         let observed = self.observed_payload_bytes as u128;
         let candidate = self.candidate_payload_bytes as u128;
         if observed * 5 >= candidate * 4 {
             self.state = AdmissionState::Enabled;
+            Some(AdmissionDecision::Enabled)
         } else if observed * 2 < candidate {
             self.state = AdmissionState::Disabled;
+            Some(AdmissionDecision::Denied)
+        } else {
+            None
         }
-        self.state
     }
 
     /// Returns the unique exact bytes observed within the candidate spans.
@@ -203,6 +233,24 @@ impl DensityAdmission {
     /// Returns the current policy state.
     pub(crate) fn state(&self) -> AdmissionState {
         self.state
+    }
+
+    /// Records the terminal admission decision at most once for this instance.
+    pub(crate) fn record_admission_metrics(
+        &mut self,
+        metrics: &RowGroupPrefetchMetrics,
+    ) -> Option<AdmissionDecision> {
+        if self.admission_metrics_recorded {
+            return None;
+        }
+        let decision = match self.state {
+            AdmissionState::Observing => return None,
+            AdmissionState::Enabled => AdmissionDecision::Enabled,
+            AdmissionState::Disabled => AdmissionDecision::Denied,
+        };
+        metrics.record_admission(decision);
+        self.admission_metrics_recorded = true;
+        Some(decision)
     }
 }
 
@@ -258,6 +306,10 @@ impl RowGroupPrefetchMetrics {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 5 records exact coverage.")
+    )]
     pub(crate) fn record_observed_exact_bytes(&self, bytes: usize) {
         self.observed_exact_bytes.add(bytes);
     }
@@ -266,28 +318,43 @@ impl RowGroupPrefetchMetrics {
         self.candidate_bytes.add(bytes);
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 5 records prefetch windows.")
+    )]
     pub(crate) fn record_prefetch(&self, range_count: usize, bytes: usize) {
         self.prefetch_windows.add(1);
         self.prefetched_ranges.add(range_count);
         self.prefetched_bytes.add(bytes);
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 5 records staged-byte use.")
+    )]
     pub(crate) fn record_useful_staged_bytes(&self, bytes: usize) {
         self.useful_staged_bytes.add(bytes);
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 5 records staged-byte release.")
+    )]
     pub(crate) fn record_unused_staged_bytes(&self, bytes: usize) {
         self.unused_staged_bytes.add(bytes);
     }
 
-    pub(crate) fn record_admission(&self, state: AdmissionState) {
-        match state {
-            AdmissionState::Enabled => self.admission_enables.add(1),
-            AdmissionState::Disabled => self.admission_denials.add(1),
-            AdmissionState::Observing => {}
+    fn record_admission(&self, decision: AdmissionDecision) {
+        match decision {
+            AdmissionDecision::Enabled => self.admission_enables.add(1),
+            AdmissionDecision::Denied => self.admission_denials.add(1),
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 5 records staged-byte peaks.")
+    )]
     pub(crate) fn record_peak_staged_bytes(&self, bytes: usize) {
         self.peak_staged_bytes.set_max(bytes);
     }
@@ -370,8 +437,9 @@ mod tests {
     use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 
     use super::{
-        AdmissionState, MAX_MERGE_GAP, MAX_MERGED_RANGE, RowGroupPrefetchMetrics,
-        RowGroupPrefetchPlan, split_large_range,
+        AdmissionDecision, AdmissionState, DensityAdmission, MAX_MERGE_GAP,
+        MAX_MERGED_RANGE, RowGroupPrefetchMetrics, RowGroupPrefetchPlan,
+        split_large_range,
     };
 
     #[test]
@@ -484,19 +552,14 @@ mod tests {
         let dense_metadata = metadata_with_leaf_ranges(single_range(0..(MIB * 5 / 4)));
         let dense_plan = leaf_plan(&dense_metadata, vec![0]);
         let mut admission = dense_plan.density_admission();
-        assert_eq!(
-            observe_single(&mut admission, 0..(MIB - 1)),
-            AdmissionState::Observing
-        );
-        assert_eq!(
-            observe_single(&mut admission, 0..(MIB - 1)),
-            AdmissionState::Observing
-        );
+        assert_eq!(observe_single(&mut admission, 0..(MIB - 1)), None);
+        assert_eq!(observe_single(&mut admission, 0..(MIB - 1)), None);
         assert_eq!(admission.observed_payload_bytes(), (MIB - 1) as usize);
         assert_eq!(
             observe_single(&mut admission, (MIB - 1)..MIB),
-            AdmissionState::Enabled
+            Some(AdmissionDecision::Enabled)
         );
+        assert_eq!(observe_single(&mut admission, 0..MIB), None);
         assert_eq!(admission.observed_payload_bytes(), MIB as usize);
         assert_eq!(admission.candidate_payload_bytes(), (MIB * 5 / 4) as usize);
         assert_eq!(admission.state(), AdmissionState::Enabled);
@@ -504,17 +567,14 @@ mod tests {
         let half_metadata = metadata_with_leaf_ranges(single_range(0..(MIB * 2)));
         let half_plan = leaf_plan(&half_metadata, vec![0]);
         let mut admission = half_plan.density_admission();
-        assert_eq!(
-            observe_single(&mut admission, 0..MIB),
-            AdmissionState::Observing
-        );
+        assert_eq!(observe_single(&mut admission, 0..MIB), None);
 
         let sparse_metadata = metadata_with_leaf_ranges(single_range(0..(MIB * 2 + 1)));
         let sparse_plan = leaf_plan(&sparse_metadata, vec![0]);
         let mut admission = sparse_plan.density_admission();
         assert_eq!(
             observe_single(&mut admission, 0..MIB),
-            AdmissionState::Disabled
+            Some(AdmissionDecision::Denied)
         );
     }
 
@@ -529,8 +589,28 @@ mod tests {
         first.record_prefetch(2, 30);
         first.record_useful_staged_bytes(8);
         first.record_unused_staged_bytes(22);
-        first.record_admission(AdmissionState::Enabled);
-        second.record_admission(AdmissionState::Disabled);
+        const MIB: u64 = 1024 * 1024;
+        let mut enabled_admission = DensityAdmission::new(single_range(0..MIB));
+        assert_eq!(
+            observe_single(&mut enabled_admission, 0..MIB),
+            Some(AdmissionDecision::Enabled)
+        );
+        assert_eq!(
+            enabled_admission.record_admission_metrics(&first),
+            Some(AdmissionDecision::Enabled)
+        );
+        assert_eq!(enabled_admission.record_admission_metrics(&first), None);
+
+        let mut denied_admission = DensityAdmission::new(single_range(0..(MIB * 2 + 1)));
+        assert_eq!(
+            observe_single(&mut denied_admission, 0..MIB),
+            Some(AdmissionDecision::Denied)
+        );
+        assert_eq!(
+            denied_admission.record_admission_metrics(&second),
+            Some(AdmissionDecision::Denied)
+        );
+        assert_eq!(denied_admission.record_admission_metrics(&second), None);
         first.record_peak_staged_bytes(30);
         first.record_peak_staged_bytes(10);
 
@@ -595,9 +675,9 @@ mod tests {
     }
 
     fn observe_single(
-        admission: &mut super::DensityAdmission,
+        admission: &mut DensityAdmission,
         range: std::ops::Range<u64>,
-    ) -> AdmissionState {
+    ) -> Option<AdmissionDecision> {
         admission.observe_exact_ranges(&[range])
     }
 

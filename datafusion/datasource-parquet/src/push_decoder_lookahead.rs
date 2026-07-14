@@ -34,12 +34,15 @@ use super::PushDecoderOutputState;
 use crate::lookahead::{
     LookaheadFileContext, MAX_RANGES_PER_FILE_FETCH, SpeculativeLease,
 };
+use crate::row_group_prefetch::RowGroupPrefetchPlan;
 
 /// A bounded push-decoder driver that overlaps upcoming row-group fetches with
 /// synchronous decoding of the current row group.
 pub(crate) struct LookaheadPushDecoderStreamState {
     decoder: Option<ParquetPushDecoder>,
     pending_decoders: VecDeque<ParquetPushDecoder>,
+    active_prefetch_plan: Option<RowGroupPrefetchPlan>,
+    pending_prefetch_plans: VecDeque<RowGroupPrefetchPlan>,
     reader: Option<Box<dyn AsyncFileReader>>,
     output: PushDecoderOutputState,
     lookahead: LookaheadFileContext,
@@ -94,6 +97,8 @@ impl LookaheadPushDecoderStreamState {
         Self {
             decoder: Some(decoder),
             pending_decoders,
+            active_prefetch_plan: None,
+            pending_prefetch_plans: VecDeque::new(),
             reader: Some(reader),
             output,
             lookahead,
@@ -106,6 +111,34 @@ impl LookaheadPushDecoderStreamState {
             speculation_disabled: false,
             terminated: false,
         }
+    }
+
+    /// Creates a lookahead state with one prefetch plan for every decoder run.
+    pub(crate) fn new_with_prefetch_plans(
+        decoder: ParquetPushDecoder,
+        pending_decoders: VecDeque<ParquetPushDecoder>,
+        active_prefetch_plan: RowGroupPrefetchPlan,
+        pending_prefetch_plans: VecDeque<RowGroupPrefetchPlan>,
+        reader: Box<dyn AsyncFileReader>,
+        output: PushDecoderOutputState,
+        lookahead: LookaheadFileContext,
+    ) -> Result<Self> {
+        if pending_decoders.len() != pending_prefetch_plans.len() {
+            return Err(prefetch_plan_queue_drift());
+        }
+        let mut state = Self::new(decoder, pending_decoders, reader, output, lookahead);
+        state.active_prefetch_plan = Some(active_prefetch_plan);
+        state.pending_prefetch_plans = pending_prefetch_plans;
+        Ok(state)
+    }
+
+    /// Returns the plan paired with the active decoder run for Task 5.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 5 reads the active prefetch plan.")
+    )]
+    pub(crate) fn active_prefetch_plan(&self) -> Option<&RowGroupPrefetchPlan> {
+        self.active_prefetch_plan.as_ref()
     }
 
     pub(crate) fn into_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
@@ -137,11 +170,17 @@ impl LookaheadPushDecoderStreamState {
                 }
 
                 if self.run_finished {
-                    if !self.advance_decoder_run() {
-                        self.terminate();
-                        return None;
+                    match self.advance_decoder_run() {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            self.terminate();
+                            return None;
+                        }
+                        Err(error) => {
+                            self.terminate();
+                            return Some((Err(error), self));
+                        }
                     }
-                    continue;
                 }
 
                 if let Some(future) = self.next_reader_future.take() {
@@ -297,13 +336,30 @@ impl LookaheadPushDecoderStreamState {
         }
     }
 
-    fn advance_decoder_run(&mut self) -> bool {
+    fn advance_decoder_run(&mut self) -> Result<bool> {
         self.run_finished = false;
-        let Some(decoder) = self.pending_decoders.pop_front() else {
-            return false;
+        if self.active_prefetch_plan.is_none() {
+            if !self.pending_prefetch_plans.is_empty() {
+                return Err(prefetch_plan_queue_drift());
+            }
+            let Some(decoder) = self.pending_decoders.pop_front() else {
+                return Ok(false);
+            };
+            self.decoder = Some(decoder);
+            return Ok(true);
+        }
+        if self.pending_decoders.is_empty() != self.pending_prefetch_plans.is_empty() {
+            return Err(prefetch_plan_queue_drift());
+        }
+        let (Some(decoder), Some(prefetch_plan)) = (
+            self.pending_decoders.pop_front(),
+            self.pending_prefetch_plans.pop_front(),
+        ) else {
+            return Ok(false);
         };
         self.decoder = Some(decoder);
-        true
+        self.active_prefetch_plan = Some(prefetch_plan);
+        Ok(true)
     }
 
     fn terminate(&mut self) {
@@ -315,9 +371,17 @@ impl LookaheadPushDecoderStreamState {
         self.decoder = None;
         self.reader = None;
         self.pending_decoders.clear();
+        self.active_prefetch_plan = None;
+        self.pending_prefetch_plans.clear();
         self.deferred_error = None;
         self.run_finished = false;
     }
+}
+
+fn prefetch_plan_queue_drift() -> DataFusionError {
+    DataFusionError::Internal(
+        "row-group prefetch plan queue drifted from decoder runs".to_string(),
+    )
 }
 
 impl Drop for LookaheadPushDecoderStreamState {
@@ -444,6 +508,7 @@ mod tests {
         LookaheadFileContext, MAX_IN_FLIGHT_RANGES, MAX_SPECULATIVE_BYTES,
         ParquetLookaheadCoordinator,
     };
+    use crate::row_group_prefetch::RowGroupPrefetchPlan;
 
     const FILTER_COLUMNS: [&str; 6] = [
         "value", "filter_1", "filter_2", "filter_3", "filter_4", "filter_5",
@@ -921,6 +986,16 @@ mod tests {
             builder.build().unwrap()
         }
 
+        fn prefetch_plan(&self, row_group_order: Vec<usize>) -> RowGroupPrefetchPlan {
+            let schema_descr = self.metadata.file_metadata().schema_descr();
+            let projection_mask = ProjectionMask::columns(schema_descr, ["value"]);
+            RowGroupPrefetchPlan::new(
+                self.metadata.as_ref(),
+                &projection_mask,
+                row_group_order,
+            )
+        }
+
         fn output_state(
             &self,
             arrow_reader_metrics: ArrowReaderMetrics,
@@ -1019,6 +1094,131 @@ mod tests {
             )
             .into_stream()
         }
+    }
+
+    #[test]
+    fn prefetch_plans_advance_with_split_decoder_runs_without_io() {
+        let fixture = ThreeRowGroupFixture::with_row_group_count_and_filter_columns(
+            5,
+            &LOOKAHEAD_FILTER_COLUMNS,
+        );
+        let control = ScriptControl::new(None);
+        let (_, context) = fixture.lookahead_context();
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let active_decoder =
+            fixture.decoder_for_row_groups(Some(vec![0, 1]), &arrow_reader_metrics);
+        let pending_decoders = VecDeque::from([
+            fixture.decoder_for_row_groups(Some(vec![2]), &arrow_reader_metrics),
+            fixture.decoder_for_row_groups(Some(vec![3, 4]), &arrow_reader_metrics),
+        ]);
+        let mut state = LookaheadPushDecoderStreamState::new_with_prefetch_plans(
+            active_decoder,
+            pending_decoders,
+            fixture.prefetch_plan(vec![0, 1]),
+            VecDeque::from([
+                fixture.prefetch_plan(vec![2]),
+                fixture.prefetch_plan(vec![3, 4]),
+            ]),
+            fixture.reader(control.clone()),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.active_prefetch_plan().unwrap().row_group_order(),
+            &[0, 1]
+        );
+        assert_eq!(state.pending_prefetch_plans.len(), 2);
+        assert!((0..5).all(|row_group| !control.has_request_for(row_group)));
+
+        state.run_finished = true;
+        assert!(state.advance_decoder_run().unwrap());
+        assert_eq!(
+            state.active_prefetch_plan().unwrap().row_group_order(),
+            &[2]
+        );
+        assert_eq!(state.pending_prefetch_plans.len(), 1);
+
+        state.run_finished = true;
+        assert!(state.advance_decoder_run().unwrap());
+        assert_eq!(
+            state.active_prefetch_plan().unwrap().row_group_order(),
+            &[3, 4]
+        );
+        assert!(state.pending_prefetch_plans.is_empty());
+        assert!((0..5).all(|row_group| !control.has_request_for(row_group)));
+    }
+
+    #[test]
+    fn prefetch_plans_retain_reverse_order_and_reject_drift() {
+        let fixture = ThreeRowGroupFixture::with_row_group_count_and_filter_columns(
+            5,
+            &LOOKAHEAD_FILTER_COLUMNS,
+        );
+        let control = ScriptControl::new(None);
+        let (_, context) = fixture.lookahead_context();
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let active_decoder =
+            fixture.decoder_for_row_groups(Some(vec![4, 3]), &arrow_reader_metrics);
+        let pending_decoder =
+            fixture.decoder_for_row_groups(Some(vec![2, 1, 0]), &arrow_reader_metrics);
+        let mut state = LookaheadPushDecoderStreamState::new_with_prefetch_plans(
+            active_decoder,
+            VecDeque::from([pending_decoder]),
+            fixture.prefetch_plan(vec![4, 3]),
+            VecDeque::from([fixture.prefetch_plan(vec![2, 1, 0])]),
+            fixture.reader(control),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.active_prefetch_plan().unwrap().row_group_order(),
+            &[4, 3]
+        );
+        state.run_finished = true;
+        assert!(state.advance_decoder_run().unwrap());
+        assert_eq!(
+            state.active_prefetch_plan().unwrap().row_group_order(),
+            &[2, 1, 0]
+        );
+
+        state
+            .pending_prefetch_plans
+            .push_back(fixture.prefetch_plan(vec![0]));
+        state.run_finished = true;
+        let error = state.advance_decoder_run().unwrap_err();
+        assert!(error.to_string().contains("prefetch plan queue drift"));
+    }
+
+    #[test]
+    fn prefetch_plan_constructor_rejects_decoder_queue_drift() {
+        let fixture = ThreeRowGroupFixture::new();
+        let control = ScriptControl::new(None);
+        let (_, context) = fixture.lookahead_context();
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let decoder =
+            fixture.decoder_for_row_groups(Some(vec![0]), &arrow_reader_metrics);
+        let pending_decoder =
+            fixture.decoder_for_row_groups(Some(vec![1]), &arrow_reader_metrics);
+
+        let result = LookaheadPushDecoderStreamState::new_with_prefetch_plans(
+            decoder,
+            VecDeque::from([pending_decoder]),
+            fixture.prefetch_plan(vec![0]),
+            VecDeque::new(),
+            fixture.reader(control),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        );
+        let error = match result {
+            Ok(_) => panic!("mismatched queues must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("prefetch plan queue drift"));
     }
 
     fn batch_values(batch: &RecordBatch) -> Vec<i32> {

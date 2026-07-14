@@ -1276,10 +1276,6 @@ impl RowGroupsPrunedParquetOpen {
             )
         };
 
-        // Task 5 transfers these plans to the lookahead state with their decoder
-        // counterparts. This task intentionally performs no speculative I/O.
-        drop((active_prefetch_plan, pending_prefetch_plans));
-
         let predicate_cache_inner_records =
             prepared.file_metrics.predicate_cache_inner_records.clone();
         let predicate_cache_records =
@@ -1311,15 +1307,20 @@ impl RowGroupsPrunedParquetOpen {
             baseline_metrics: prepared.baseline_metrics,
         };
         let stream = if let Some(lookahead) = prepared.lookahead {
-            LookaheadPushDecoderStreamState::new(
+            LookaheadPushDecoderStreamState::new_with_prefetch_plans(
                 decoder,
                 pending_decoders,
+                active_prefetch_plan,
+                pending_prefetch_plans,
                 prepared.async_file_reader,
                 output,
                 lookahead,
-            )
+            )?
             .into_stream()
         } else {
+            // Row-group span prefetch requires the lookahead driver. Keep the
+            // existing serial path byte-for-byte unchanged.
+            drop((active_prefetch_plan, pending_prefetch_plans));
             PushDecoderStreamState {
                 decoder,
                 pending_decoders,

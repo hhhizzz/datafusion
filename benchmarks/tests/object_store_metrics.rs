@@ -46,11 +46,20 @@ async fn records_logical_ranges_and_coalesced_wire_gets() {
     assert_eq!(snapshot.response_range_bytes, 6);
     assert_eq!(snapshot.body_bytes, 6);
     assert_eq!(snapshot.peak_in_flight, 1);
+    assert!(snapshot.request_window_ms > 0.0);
+    assert!(snapshot.body_throughput_mib_per_s > 0.0);
     assert_eq!(snapshot.paths.len(), 1);
     assert_eq!(snapshot.paths[0].path, "data.parquet");
     assert_eq!(snapshot.paths[0].range_get_requests, 1);
     assert_eq!(snapshot.paths[0].response_range_bytes, 6);
     assert_eq!(snapshot.paths[0].body_bytes, 6);
+    assert!(snapshot.paths[0].request_window_ms > 0.0);
+    assert!(snapshot.paths[0].body_throughput_mib_per_s > 0.0);
+
+    metrics.reset();
+    let reset = metrics.snapshot();
+    assert_eq!(reset.request_window_ms, 0.0);
+    assert_eq!(reset.body_throughput_mib_per_s, 0.0);
 }
 
 #[tokio::test]

@@ -133,20 +133,23 @@ async fn configurable_parallelism_bounds_in_flight_range_gets() {
     let store = MetricsObjectStore::new_with_coalesce_options(inner, 0, 4);
     let path = Path::from("data.parquet");
     store
-        .put(&path, PutPayload::from_static(b"abcdefgh"))
+        .put(&path, PutPayload::from_static(b"abcdefghijklmnop"))
         .await
         .unwrap();
 
     let metrics = store.metrics();
     metrics.reset();
     let result = store
-        .get_ranges(&path, &[0..1, 1..2, 2..3, 3..4, 4..5, 5..6, 6..7, 7..8])
+        .get_ranges(
+            &path,
+            &[0..1, 2..3, 4..5, 6..7, 8..9, 10..11, 12..13, 14..15],
+        )
         .await
         .unwrap();
 
     assert_eq!(
         result,
-        b"abcdefgh"
+        b"acegikmo"
             .iter()
             .map(|value| Bytes::copy_from_slice(&[*value]))
             .collect::<Vec<_>>()

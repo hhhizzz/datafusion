@@ -35,7 +35,7 @@ use crate::lookahead::{
     LookaheadFileContext, MAX_RANGES_PER_FILE_FETCH, SpeculativeLease,
 };
 
-/// A depth-one push-decoder driver that overlaps the next row-group fetch with
+/// A bounded push-decoder driver that overlaps upcoming row-group fetches with
 /// synchronous decoding of the current row group.
 pub(crate) struct LookaheadPushDecoderStreamState {
     decoder: Option<ParquetPushDecoder>,
@@ -45,7 +45,7 @@ pub(crate) struct LookaheadPushDecoderStreamState {
     lookahead: LookaheadFileContext,
     active_reader: Option<ParquetRecordBatchReader>,
     next_reader_future: Option<BoxFuture<'static, NextReaderOutcome>>,
-    prefetched_reader: Option<PrefetchedReader>,
+    prefetched_readers: VecDeque<PrefetchedReader>,
     foreground_resources: SpeculativeResources,
     deferred_error: Option<DataFusionError>,
     run_finished: bool,
@@ -99,7 +99,7 @@ impl LookaheadPushDecoderStreamState {
             lookahead,
             active_reader: None,
             next_reader_future: None,
-            prefetched_reader: None,
+            prefetched_readers: VecDeque::new(),
             foreground_resources: SpeculativeResources::default(),
             deferred_error: None,
             run_finished: false,
@@ -125,7 +125,7 @@ impl LookaheadPushDecoderStreamState {
             }
 
             if self.active_reader.is_none() {
-                if let Some(prefetched) = self.prefetched_reader.take() {
+                if let Some(prefetched) = self.prefetched_readers.pop_front() {
                     self.active_reader = Some(prefetched.reader);
                     drop(prefetched.resources);
                     continue;
@@ -200,7 +200,7 @@ impl LookaheadPushDecoderStreamState {
     fn start_speculation(&mut self) {
         if self.speculation_disabled
             || self.next_reader_future.is_some()
-            || self.prefetched_reader.is_some()
+            || self.prefetched_readers.len() >= self.lookahead.depth()
             || self.run_finished
             || self.deferred_error.is_some()
             || self.active_reader.is_none()
@@ -233,7 +233,7 @@ impl LookaheadPushDecoderStreamState {
             NextReaderResult::Reader(next_reader) => {
                 self.decoder = Some(decoder);
                 self.reader = Some(reader);
-                self.prefetched_reader = Some(PrefetchedReader {
+                self.prefetched_readers.push_back(PrefetchedReader {
                     reader: next_reader,
                     resources,
                 });
@@ -309,7 +309,7 @@ impl LookaheadPushDecoderStreamState {
     fn terminate(&mut self) {
         self.terminated = true;
         self.next_reader_future = None;
-        self.prefetched_reader = None;
+        self.prefetched_readers.clear();
         self.active_reader = None;
         self.decoder = None;
         self.reader = None;
@@ -435,7 +435,8 @@ mod tests {
         LookaheadPushDecoderStreamState, PushDecoderOutputState, PushDecoderStreamState,
     };
     use crate::lookahead::{
-        LookaheadFileContext, MAX_IN_FLIGHT_RANGES, ParquetLookaheadCoordinator,
+        LookaheadFileContext, MAX_IN_FLIGHT_RANGES, MAX_SPECULATIVE_BYTES,
+        ParquetLookaheadCoordinator,
     };
 
     const FILTER_COLUMNS: [&str; 6] = [
@@ -699,19 +700,39 @@ mod tests {
         }
 
         fn with_filter_columns(filter_columns: &[&'static str]) -> Self {
+            Self::with_row_group_count_and_filter_columns(3, filter_columns)
+        }
+
+        fn with_row_group_count_and_filter_columns(
+            row_group_count: usize,
+            filter_columns: &[&'static str],
+        ) -> Self {
+            Self::with_row_group_count_and_rows_per_group_and_filter_columns(
+                row_group_count,
+                3,
+                filter_columns,
+            )
+        }
+
+        fn with_row_group_count_and_rows_per_group_and_filter_columns(
+            row_group_count: usize,
+            rows_per_group: usize,
+            filter_columns: &[&'static str],
+        ) -> Self {
             let schema = Arc::new(Schema::new(
                 FILTER_COLUMNS
                     .iter()
                     .map(|name| Field::new(*name, DataType::Int32, false))
                     .collect::<Vec<_>>(),
             ));
-            let values = Arc::new(Int32Array::from_iter_values(0..9)) as ArrayRef;
+            let row_count = i32::try_from(row_group_count * rows_per_group).unwrap();
+            let values = Arc::new(Int32Array::from_iter_values(0..row_count)) as ArrayRef;
             let columns = (0..FILTER_COLUMNS.len())
                 .map(|_| Arc::clone(&values))
                 .collect::<Vec<_>>();
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
             let properties = WriterProperties::builder()
-                .set_max_row_group_row_count(Some(3))
+                .set_max_row_group_row_count(Some(rows_per_group))
                 .build();
             let mut output = Vec::new();
             let mut writer =
@@ -725,7 +746,7 @@ mod tests {
                     .parse_and_finish(&data)
                     .unwrap(),
             );
-            assert_eq!(metadata.num_row_groups(), 3);
+            assert_eq!(metadata.num_row_groups(), row_group_count);
             let row_group_spans = Arc::new(
                 metadata
                     .row_groups()
@@ -858,15 +879,30 @@ mod tests {
         fn lookahead_context(
             &self,
         ) -> (Arc<ParquetLookaheadCoordinator>, LookaheadFileContext) {
+            self.lookahead_context_with_depth(1)
+        }
+
+        fn lookahead_context_with_depth(
+            &self,
+            depth: usize,
+        ) -> (Arc<ParquetLookaheadCoordinator>, LookaheadFileContext) {
             let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-            self.lookahead_context_with_pool(pool)
+            self.lookahead_context_with_depth_and_pool(depth, pool)
         }
 
         fn lookahead_context_with_pool(
             &self,
             pool: Arc<dyn MemoryPool>,
         ) -> (Arc<ParquetLookaheadCoordinator>, LookaheadFileContext) {
-            let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
+            self.lookahead_context_with_depth_and_pool(1, pool)
+        }
+
+        fn lookahead_context_with_depth_and_pool(
+            &self,
+            depth: usize,
+            pool: Arc<dyn MemoryPool>,
+        ) -> (Arc<ParquetLookaheadCoordinator>, LookaheadFileContext) {
+            let coordinator = Arc::new(ParquetLookaheadCoordinator::new(depth));
             let reservation = Arc::new(
                 MemoryConsumer::new("push-decoder-lookahead-test").register(&pool),
             );
@@ -929,6 +965,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn depth_four_queues_multiple_readers_and_preserves_order() {
+        let fixture = ThreeRowGroupFixture::with_row_group_count_and_rows_per_group_and_filter_columns(
+            4,
+            4,
+            &LOOKAHEAD_FILTER_COLUMNS,
+        );
+        let (serial, _) = fixture.serial_oracle().await;
+
+        let depth_one_control = ScriptControl::new(None);
+        let (_, depth_one_context) = fixture.lookahead_context_with_depth(1);
+        let mut depth_one_stream =
+            fixture.lookahead_stream(depth_one_control.clone(), depth_one_context);
+        let depth_one_first = depth_one_stream.next().await.unwrap().unwrap();
+        let depth_one_second = depth_one_stream.next().await.unwrap().unwrap();
+        assert_eq!(batch_values(&depth_one_first), vec![1]);
+        assert_eq!(batch_values(&depth_one_second), vec![2]);
+        assert!(depth_one_control.has_request_for(1));
+        assert!(!depth_one_control.has_request_for(2));
+        assert!(!depth_one_control.has_request_for(3));
+        drop(depth_one_stream);
+
+        let depth_four_control = ScriptControl::new(None);
+        let (_, depth_four_context) = fixture.lookahead_context_with_depth(4);
+        let mut depth_four_stream =
+            fixture.lookahead_stream(depth_four_control.clone(), depth_four_context);
+        let mut output = vec![depth_four_stream.next().await.unwrap().unwrap()];
+        assert_eq!(batch_values(&output[0]), vec![1]);
+        output.push(depth_four_stream.next().await.unwrap().unwrap());
+        output.push(depth_four_stream.next().await.unwrap().unwrap());
+        assert_eq!(batch_values(&output[2]), vec![3]);
+
+        assert!(depth_four_control.has_request_for(1));
+        assert!(depth_four_control.has_request_for(2));
+        assert!(depth_four_control.has_request_for(3));
+
+        output.extend(depth_four_stream.try_collect::<Vec<_>>().await.unwrap());
+        assert_eq!(output, serial);
+    }
+
+    #[tokio::test]
     async fn lookahead_overlaps_at_depth_one_and_matches_serial_order() {
         let fixture = ThreeRowGroupFixture::new();
         let (serial, _) = fixture.serial_oracle().await;
@@ -988,73 +1064,107 @@ mod tests {
     #[tokio::test]
     async fn dropping_pending_lookahead_releases_fetch_and_budgets() {
         let fixture = ThreeRowGroupFixture::new();
-        let control = ScriptControl::new(Some(1));
-        let (coordinator, context) = fixture.lookahead_context();
-        let reservation = Arc::clone(&context.reservation);
-        let mut stream = fixture.lookahead_stream(control.clone(), context);
+        for depth in [1, 4] {
+            let control = ScriptControl::new(Some(1));
+            let (coordinator, context) = fixture.lookahead_context_with_depth(depth);
+            let reservation = Arc::clone(&context.reservation);
+            let budget_context = context.clone();
+            let mut stream = fixture.lookahead_stream(control.clone(), context);
 
-        let first = stream.next().await.unwrap().unwrap();
-        assert_eq!(batch_values(&first), vec![1]);
-        control.wait_for_row_group(1).await;
-        assert_eq!(control.active_fetches(), 1);
-        assert!(reservation.size() > 0);
-        assert!(coordinator.range_permits.available_permits() < MAX_IN_FLIGHT_RANGES);
+            let first = stream.next().await.unwrap().unwrap();
+            assert_eq!(batch_values(&first), vec![1]);
+            control.wait_for_row_group(1).await;
+            assert_eq!(control.active_fetches(), 1);
+            assert!(reservation.size() > 0);
+            assert!(coordinator.range_permits.available_permits() < MAX_IN_FLIGHT_RANGES);
 
-        drop(stream);
+            drop(stream);
 
-        assert_eq!(control.active_fetches(), 0);
-        assert_eq!(reservation.size(), 0);
-        assert_eq!(
-            coordinator.range_permits.available_permits(),
-            MAX_IN_FLIGHT_RANGES
-        );
+            assert_eq!(control.active_fetches(), 0);
+            assert_eq!(reservation.size(), 0);
+            assert_eq!(
+                coordinator.range_permits.available_permits(),
+                MAX_IN_FLIGHT_RANGES
+            );
+            drop(
+                budget_context
+                    .try_reserve(MAX_SPECULATIVE_BYTES)
+                    .expect("the full byte budget must be released"),
+            );
+        }
     }
 
     #[tokio::test]
     async fn final_limit_batch_synchronously_releases_pending_lookahead() {
-        let fixture = ThreeRowGroupFixture::new();
-        let control = ScriptControl::new(Some(1));
-        let (coordinator, context) = fixture.lookahead_context();
-        let reservation = Arc::clone(&context.reservation);
-        let mut stream =
-            fixture.lookahead_stream_with_limit(control.clone(), context, Some(1));
-
-        let first = stream.next().await.unwrap().unwrap();
-
-        assert_eq!(batch_values(&first), vec![1]);
-        assert!(control.has_request_for(1));
-        assert_eq!(control.active_fetches(), 0);
-        assert_eq!(reservation.size(), 0);
-        assert_eq!(
-            coordinator.range_permits.available_permits(),
-            MAX_IN_FLIGHT_RANGES
+        let fixture = ThreeRowGroupFixture::with_row_group_count_and_filter_columns(
+            4,
+            &LOOKAHEAD_FILTER_COLUMNS,
         );
-        assert!(stream.next().await.is_none());
+        for (depth, limit, requested_row_groups) in
+            [(1, 1, &[1][..]), (4, 3, &[1, 2, 3][..])]
+        {
+            let control = ScriptControl::new(None);
+            let (coordinator, context) = fixture.lookahead_context_with_depth(depth);
+            let reservation = Arc::clone(&context.reservation);
+            let mut stream = fixture.lookahead_stream_with_limit(
+                control.clone(),
+                context,
+                Some(limit),
+            );
+
+            let mut output = Vec::new();
+            for _ in 0..limit {
+                output.push(stream.next().await.unwrap().unwrap());
+            }
+
+            assert_eq!(batch_values(&output[0]), vec![1]);
+            for row_group in requested_row_groups {
+                assert!(control.has_request_for(*row_group));
+            }
+            assert_eq!(control.active_fetches(), 0);
+            assert_eq!(reservation.size(), 0);
+            assert_eq!(
+                coordinator.range_permits.available_permits(),
+                MAX_IN_FLIGHT_RANGES
+            );
+            assert!(stream.next().await.is_none());
+        }
     }
 
     #[tokio::test]
     async fn speculative_error_is_deferred_until_foreground_reader_drains() {
         let fixture = ThreeRowGroupFixture::new();
-        let control = ScriptControl::failing(1);
-        let (coordinator, context) = fixture.lookahead_context();
-        let reservation = Arc::clone(&context.reservation);
-        let mut stream = fixture.lookahead_stream(control.clone(), context);
+        for (depth, failed_row_group, expected_output) in
+            [(1, 1, vec![1, 2]), (4, 2, vec![1, 2, 3, 4, 5])]
+        {
+            let control = ScriptControl::failing(failed_row_group);
+            let (coordinator, context) = fixture.lookahead_context_with_depth(depth);
+            let reservation = Arc::clone(&context.reservation);
+            let mut stream = fixture.lookahead_stream(control.clone(), context);
+            let mut output = Vec::new();
+            let error = loop {
+                match stream.next().await {
+                    Some(Ok(batch)) => output.extend(batch_values(&batch)),
+                    Some(Err(error)) => break error,
+                    None => panic!("speculative error must be surfaced"),
+                }
+            };
 
-        let first = stream.next().await.unwrap().unwrap();
-        let second = stream.next().await.unwrap().unwrap();
-        let error = stream.next().await.unwrap().unwrap_err();
-
-        assert_eq!(batch_values(&first), vec![1]);
-        assert_eq!(batch_values(&second), vec![2]);
-        assert!(error.to_string().contains("scripted row-group 1 failure"));
-        assert!(!control.has_request_for(2));
-        assert_eq!(control.active_fetches(), 0);
-        assert_eq!(reservation.size(), 0);
-        assert_eq!(
-            coordinator.range_permits.available_permits(),
-            MAX_IN_FLIGHT_RANGES
-        );
-        assert!(stream.next().await.is_none());
+            assert_eq!(output, expected_output);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("scripted row-group {failed_row_group} failure"))
+            );
+            assert!(!control.has_request_for(failed_row_group + 1));
+            assert_eq!(control.active_fetches(), 0);
+            assert_eq!(reservation.size(), 0);
+            assert_eq!(
+                coordinator.range_permits.available_permits(),
+                MAX_IN_FLIGHT_RANGES
+            );
+            assert!(stream.next().await.is_none());
+        }
     }
 
     #[tokio::test]
@@ -1122,151 +1232,162 @@ mod tests {
     #[tokio::test]
     async fn foreground_record_reader_decode_error_cancels_prefetch_and_terminates() {
         let fixture = ThreeRowGroupFixture::new();
-        let control = ScriptControl::corrupting(0);
-        let (coordinator, context) = fixture.lookahead_context();
-        let reservation = Arc::clone(&context.reservation);
-        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
-        let decoder =
-            fixture.decoder_for_row_groups_with_filter(None, &arrow_reader_metrics, None);
-        let mut stream = LookaheadPushDecoderStreamState::new(
-            decoder,
-            VecDeque::new(),
-            fixture.reader(control.clone()),
-            fixture.output_state(arrow_reader_metrics),
-            context,
-        )
-        .into_stream();
+        for depth in [1, 4] {
+            let control = ScriptControl::corrupting(0);
+            let (coordinator, context) = fixture.lookahead_context_with_depth(depth);
+            let reservation = Arc::clone(&context.reservation);
+            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+            let decoder = fixture.decoder_for_row_groups_with_filter(
+                None,
+                &arrow_reader_metrics,
+                None,
+            );
+            let mut stream = LookaheadPushDecoderStreamState::new(
+                decoder,
+                VecDeque::new(),
+                fixture.reader(control.clone()),
+                fixture.output_state(arrow_reader_metrics),
+                context,
+            )
+            .into_stream();
 
-        let error = stream.next().await.unwrap().unwrap_err();
+            let error = stream.next().await.unwrap().unwrap_err();
 
-        assert!(control.has_request_for(1));
-        assert!(!error.to_string().is_empty());
-        assert_eq!(control.active_fetches(), 0);
-        assert_eq!(reservation.size(), 0);
-        assert_eq!(
-            coordinator.range_permits.available_permits(),
-            MAX_IN_FLIGHT_RANGES
-        );
-        assert!(stream.next().await.is_none());
+            assert!(control.has_request_for(1));
+            assert!(!error.to_string().is_empty());
+            assert_eq!(control.active_fetches(), 0);
+            assert_eq!(reservation.size(), 0);
+            assert_eq!(
+                coordinator.range_permits.available_permits(),
+                MAX_IN_FLIGHT_RANGES
+            );
+            assert!(stream.next().await.is_none());
+        }
     }
 
     #[tokio::test]
     async fn replacement_schema_error_cancels_pending_prefetch_and_terminates() {
         let fixture = ThreeRowGroupFixture::new();
-        let control = ScriptControl::new(Some(1));
-        let (coordinator, context) = fixture.lookahead_context();
-        let reservation = Arc::clone(&context.reservation);
-        let (decoder, arrow_reader_metrics) = fixture.decoder();
-        let mut output = fixture.output_state(arrow_reader_metrics);
-        output.replace_schema = true;
-        output.output_schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int32, false),
-            Field::new("unexpected", DataType::Int32, false),
-        ]));
-        let mut stream = LookaheadPushDecoderStreamState::new(
-            decoder,
-            VecDeque::new(),
-            fixture.reader(control.clone()),
-            output,
-            context,
-        )
-        .into_stream();
+        for depth in [1, 4] {
+            let control = ScriptControl::new(Some(1));
+            let (coordinator, context) = fixture.lookahead_context_with_depth(depth);
+            let reservation = Arc::clone(&context.reservation);
+            let (decoder, arrow_reader_metrics) = fixture.decoder();
+            let mut output = fixture.output_state(arrow_reader_metrics);
+            output.replace_schema = true;
+            output.output_schema = Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int32, false),
+                Field::new("unexpected", DataType::Int32, false),
+            ]));
+            let mut stream = LookaheadPushDecoderStreamState::new(
+                decoder,
+                VecDeque::new(),
+                fixture.reader(control.clone()),
+                output,
+                context,
+            )
+            .into_stream();
 
-        let error = stream.next().await.unwrap().unwrap_err();
+            let error = stream.next().await.unwrap().unwrap_err();
 
-        assert!(error.to_string().contains("number of columns"));
-        assert!(control.has_request_for(1));
-        assert_eq!(control.active_fetches(), 0);
-        assert_eq!(reservation.size(), 0);
-        assert_eq!(
-            coordinator.range_permits.available_permits(),
-            MAX_IN_FLIGHT_RANGES
-        );
-        assert!(stream.next().await.is_none());
+            assert!(error.to_string().contains("number of columns"));
+            assert!(control.has_request_for(1));
+            assert_eq!(control.active_fetches(), 0);
+            assert_eq!(reservation.size(), 0);
+            assert_eq!(
+                coordinator.range_permits.available_permits(),
+                MAX_IN_FLIGHT_RANGES
+            );
+            assert!(stream.next().await.is_none());
+        }
     }
 
     #[tokio::test]
     async fn pending_decoder_run_is_not_prefetched_across_boundary() {
         let fixture = ThreeRowGroupFixture::new();
         let (serial, _) = fixture.serial_oracle().await;
-        let control = ScriptControl::new(Some(1));
-        let (_, context) = fixture.lookahead_context();
-        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
-        let decoder =
-            fixture.decoder_for_row_groups(Some(vec![0]), &arrow_reader_metrics);
-        let pending_decoder =
-            fixture.decoder_for_row_groups(Some(vec![1, 2]), &arrow_reader_metrics);
-        let mut stream = LookaheadPushDecoderStreamState::new(
-            decoder,
-            VecDeque::from([pending_decoder]),
-            fixture.reader(control.clone()),
-            fixture.output_state(arrow_reader_metrics),
-            context,
-        )
-        .into_stream();
+        for depth in [1, 4] {
+            let control = ScriptControl::new(Some(1));
+            let (_, context) = fixture.lookahead_context_with_depth(depth);
+            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+            let decoder =
+                fixture.decoder_for_row_groups(Some(vec![0]), &arrow_reader_metrics);
+            let pending_decoder =
+                fixture.decoder_for_row_groups(Some(vec![1, 2]), &arrow_reader_metrics);
+            let mut stream = LookaheadPushDecoderStreamState::new(
+                decoder,
+                VecDeque::from([pending_decoder]),
+                fixture.reader(control.clone()),
+                fixture.output_state(arrow_reader_metrics),
+                context,
+            )
+            .into_stream();
 
-        let first = stream.next().await.unwrap().unwrap();
-        let second = stream.next().await.unwrap().unwrap();
-        assert_eq!(batch_values(&first), vec![1]);
-        assert_eq!(batch_values(&second), vec![2]);
-        assert!(!control.has_request_for(1));
+            let first = stream.next().await.unwrap().unwrap();
+            let second = stream.next().await.unwrap().unwrap();
+            assert_eq!(batch_values(&first), vec![1]);
+            assert_eq!(batch_values(&second), vec![2]);
+            assert!(!control.has_request_for(1));
 
-        let mut next = Box::pin(stream.next());
-        assert!(matches!(futures::poll!(next.as_mut()), Poll::Pending));
-        assert!(control.has_request_for(1));
-        assert!(!control.has_request_for(2));
+            let mut next = Box::pin(stream.next());
+            assert!(matches!(futures::poll!(next.as_mut()), Poll::Pending));
+            assert!(control.has_request_for(1));
+            assert!(!control.has_request_for(2));
 
-        control.release();
-        let third = next.await.unwrap().unwrap();
-        let mut lookahead = vec![first, second, third];
-        lookahead.extend(stream.try_collect::<Vec<_>>().await.unwrap());
-        assert_eq!(lookahead, serial);
+            control.release();
+            let third = next.await.unwrap().unwrap();
+            let mut lookahead = vec![first, second, third];
+            lookahead.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+            assert_eq!(lookahead, serial);
+        }
     }
 
     #[tokio::test]
     async fn partial_range_permit_denial_continues_without_duplicate_ranges() {
         let fixture = ThreeRowGroupFixture::new();
         let (serial, serial_control) = fixture.serial_oracle().await;
-        let control = ScriptControl::new(None);
-        let (coordinator, context) = fixture.lookahead_context();
-        let reservation = Arc::clone(&context.reservation);
-        let held = Arc::clone(&coordinator.range_permits)
-            .try_acquire_many_owned(21)
-            .unwrap();
-        let stream = fixture.lookahead_stream(control.clone(), context);
+        for depth in [1, 4] {
+            let control = ScriptControl::new(None);
+            let (coordinator, context) = fixture.lookahead_context_with_depth(depth);
+            let reservation = Arc::clone(&context.reservation);
+            let held = Arc::clone(&coordinator.range_permits)
+                .try_acquire_many_owned(21)
+                .unwrap();
+            let stream = fixture.lookahead_stream(control.clone(), context);
 
-        let lookahead = stream.try_collect::<Vec<_>>().await.unwrap();
+            let lookahead = stream.try_collect::<Vec<_>>().await.unwrap();
 
-        assert_eq!(lookahead, serial);
-        let denied_requests = control.requests_for(1);
-        assert_eq!(
-            denied_requests
+            assert_eq!(lookahead, serial);
+            let denied_requests = control.requests_for(1);
+            assert_eq!(
+                denied_requests
+                    .iter()
+                    .map(|request| request.ranges.len())
+                    .collect::<Vec<_>>(),
+                vec![4]
+            );
+            let actual_ranges = denied_requests
                 .iter()
-                .map(|request| request.ranges.len())
-                .collect::<Vec<_>>(),
-            vec![4]
-        );
-        let actual_ranges = denied_requests
-            .iter()
-            .flat_map(|request| request.ranges.iter())
-            .map(|range| (range.start, range.end))
-            .collect::<HashSet<_>>();
-        let expected_ranges = serial_control
-            .requests_for(1)
-            .iter()
-            .flat_map(|request| request.ranges.iter())
-            .map(|range| (range.start, range.end))
-            .collect::<HashSet<_>>();
-        assert_eq!(actual_ranges, expected_ranges);
-        assert_eq!(actual_ranges.len(), 4);
-        assert_eq!(reservation.size(), 0);
-        assert_eq!(coordinator.range_permits.available_permits(), 3);
+                .flat_map(|request| request.ranges.iter())
+                .map(|range| (range.start, range.end))
+                .collect::<HashSet<_>>();
+            let expected_ranges = serial_control
+                .requests_for(1)
+                .iter()
+                .flat_map(|request| request.ranges.iter())
+                .map(|range| (range.start, range.end))
+                .collect::<HashSet<_>>();
+            assert_eq!(actual_ranges, expected_ranges);
+            assert_eq!(actual_ranges.len(), 4);
+            assert_eq!(reservation.size(), 0);
+            assert_eq!(coordinator.range_permits.available_permits(), 3);
 
-        drop(held);
-        assert_eq!(
-            coordinator.range_permits.available_permits(),
-            MAX_IN_FLIGHT_RANGES
-        );
+            drop(held);
+            assert_eq!(
+                coordinator.range_permits.available_permits(),
+                MAX_IN_FLIGHT_RANGES
+            );
+        }
     }
 
     #[tokio::test]
@@ -1337,29 +1458,32 @@ mod tests {
     async fn reservation_denial_falls_back_to_foreground_without_result_change() {
         let fixture = ThreeRowGroupFixture::new();
         let (serial, _) = fixture.serial_oracle().await;
-        let control = ScriptControl::new(None);
-        let pool = Arc::new(GreedyMemoryPool::new(0));
-        let (coordinator, context) = fixture.lookahead_context_with_pool(pool.clone());
-        let reservation = Arc::clone(&context.reservation);
-        let stream = fixture.lookahead_stream(control.clone(), context);
+        for depth in [1, 4] {
+            let control = ScriptControl::new(None);
+            let pool = Arc::new(GreedyMemoryPool::new(0));
+            let (coordinator, context) =
+                fixture.lookahead_context_with_depth_and_pool(depth, pool.clone());
+            let reservation = Arc::clone(&context.reservation);
+            let stream = fixture.lookahead_stream(control.clone(), context);
 
-        let lookahead = stream.try_collect::<Vec<_>>().await.unwrap();
+            let lookahead = stream.try_collect::<Vec<_>>().await.unwrap();
 
-        assert_eq!(lookahead, serial);
-        assert_eq!(
-            control
-                .requests_for(1)
-                .iter()
-                .map(|request| request.ranges.len())
-                .collect::<Vec<_>>(),
-            vec![4]
-        );
-        assert_eq!(reservation.size(), 0);
-        assert_eq!(pool.reserved(), 0);
-        assert_eq!(
-            coordinator.range_permits.available_permits(),
-            MAX_IN_FLIGHT_RANGES
-        );
+            assert_eq!(lookahead, serial);
+            assert_eq!(
+                control
+                    .requests_for(1)
+                    .iter()
+                    .map(|request| request.ranges.len())
+                    .collect::<Vec<_>>(),
+                vec![4]
+            );
+            assert_eq!(reservation.size(), 0);
+            assert_eq!(pool.reserved(), 0);
+            assert_eq!(
+                coordinator.range_permits.available_permits(),
+                MAX_IN_FLIGHT_RANGES
+            );
+        }
     }
 
     #[tokio::test]
@@ -1370,51 +1494,54 @@ mod tests {
             .iter()
             .map(|range| usize::try_from(range.end - range.start).unwrap())
             .sum();
-        let control = ScriptControl::new(None);
-        let pool = Arc::new(GreedyMemoryPool::new(first_chunk_bytes));
-        let (coordinator, context) = fixture.lookahead_context_with_pool(pool.clone());
-        let reservation = Arc::clone(&context.reservation);
-        let stream = fixture.lookahead_stream(control.clone(), context);
+        for depth in [1, 4] {
+            let control = ScriptControl::new(None);
+            let pool = Arc::new(GreedyMemoryPool::new(first_chunk_bytes));
+            let (coordinator, context) =
+                fixture.lookahead_context_with_depth_and_pool(depth, pool.clone());
+            let reservation = Arc::clone(&context.reservation);
+            let stream = fixture.lookahead_stream(control.clone(), context);
 
-        let lookahead = stream.try_collect::<Vec<_>>().await.unwrap();
+            let lookahead = stream.try_collect::<Vec<_>>().await.unwrap();
 
-        assert_eq!(lookahead, serial);
-        assert_eq!(
-            control
+            assert_eq!(lookahead, serial);
+            assert_eq!(
+                control
+                    .requests_for(1)
+                    .iter()
+                    .map(|request| request.ranges.len())
+                    .collect::<Vec<_>>(),
+                vec![4, 1]
+            );
+            assert_eq!(
+                control
+                    .requests_for(2)
+                    .iter()
+                    .map(|request| request.ranges.len())
+                    .collect::<Vec<_>>(),
+                vec![4, 1]
+            );
+            let actual_ranges = control
                 .requests_for(1)
                 .iter()
-                .map(|request| request.ranges.len())
-                .collect::<Vec<_>>(),
-            vec![4, 1]
-        );
-        assert_eq!(
-            control
-                .requests_for(2)
+                .flat_map(|request| request.ranges.iter())
+                .map(|range| (range.start, range.end))
+                .collect::<HashSet<_>>();
+            let expected_ranges = serial_control
+                .requests_for(1)
                 .iter()
-                .map(|request| request.ranges.len())
-                .collect::<Vec<_>>(),
-            vec![4, 1]
-        );
-        let actual_ranges = control
-            .requests_for(1)
-            .iter()
-            .flat_map(|request| request.ranges.iter())
-            .map(|range| (range.start, range.end))
-            .collect::<HashSet<_>>();
-        let expected_ranges = serial_control
-            .requests_for(1)
-            .iter()
-            .flat_map(|request| request.ranges.iter())
-            .map(|range| (range.start, range.end))
-            .collect::<HashSet<_>>();
-        assert_eq!(actual_ranges, expected_ranges);
-        assert_eq!(actual_ranges.len(), 5);
-        assert_eq!(reservation.size(), 0);
-        assert_eq!(pool.reserved(), 0);
-        assert_eq!(
-            coordinator.range_permits.available_permits(),
-            MAX_IN_FLIGHT_RANGES
-        );
+                .flat_map(|request| request.ranges.iter())
+                .map(|range| (range.start, range.end))
+                .collect::<HashSet<_>>();
+            assert_eq!(actual_ranges, expected_ranges);
+            assert_eq!(actual_ranges.len(), 5);
+            assert_eq!(reservation.size(), 0);
+            assert_eq!(pool.reserved(), 0);
+            assert_eq!(
+                coordinator.range_permits.available_permits(),
+                MAX_IN_FLIGHT_RANGES
+            );
+        }
     }
 
     #[tokio::test]
@@ -1445,6 +1572,50 @@ mod tests {
             MAX_IN_FLIGHT_RANGES
         );
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_queued_readers_releases_all_lookahead_budgets() {
+        let fixture = ThreeRowGroupFixture::with_row_group_count_and_filter_columns(
+            4,
+            &LOOKAHEAD_FILTER_COLUMNS,
+        );
+        for depth in [1, 4] {
+            let control = ScriptControl::new(None);
+            let (coordinator, context) = fixture.lookahead_context_with_depth(depth);
+            let reservation = Arc::clone(&context.reservation);
+            let budget_context = context.clone();
+            let mut stream = fixture.lookahead_stream(control.clone(), context);
+
+            assert_eq!(
+                batch_values(&stream.next().await.unwrap().unwrap()),
+                vec![1]
+            );
+            assert_eq!(
+                batch_values(&stream.next().await.unwrap().unwrap()),
+                vec![2]
+            );
+            assert!(control.has_request_for(1));
+            if depth == 4 {
+                assert!(control.has_request_for(2));
+            }
+            assert!(reservation.size() > 0);
+            assert!(coordinator.range_permits.available_permits() < MAX_IN_FLIGHT_RANGES);
+
+            drop(stream);
+
+            assert_eq!(control.active_fetches(), 0);
+            assert_eq!(reservation.size(), 0);
+            assert_eq!(
+                coordinator.range_permits.available_permits(),
+                MAX_IN_FLIGHT_RANGES
+            );
+            drop(
+                budget_context
+                    .try_reserve(MAX_SPECULATIVE_BYTES)
+                    .expect("the full byte budget must be released"),
+            );
+        }
     }
 
     #[tokio::test]
@@ -1517,32 +1688,34 @@ mod tests {
     #[tokio::test]
     async fn reverse_row_group_order_is_preserved_by_lookahead() {
         let fixture = ThreeRowGroupFixture::new();
-        let control = ScriptControl::new(None);
-        let (coordinator, context) = fixture.lookahead_context();
-        let reservation = Arc::clone(&context.reservation);
-        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
-        let decoder =
-            fixture.decoder_for_row_groups(Some(vec![2, 1, 0]), &arrow_reader_metrics);
-        let stream = LookaheadPushDecoderStreamState::new(
-            decoder,
-            VecDeque::new(),
-            fixture.reader(control),
-            fixture.output_state(arrow_reader_metrics),
-            context,
-        )
-        .into_stream();
+        for depth in [1, 4] {
+            let control = ScriptControl::new(None);
+            let (coordinator, context) = fixture.lookahead_context_with_depth(depth);
+            let reservation = Arc::clone(&context.reservation);
+            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+            let decoder = fixture
+                .decoder_for_row_groups(Some(vec![2, 1, 0]), &arrow_reader_metrics);
+            let stream = LookaheadPushDecoderStreamState::new(
+                decoder,
+                VecDeque::new(),
+                fixture.reader(control),
+                fixture.output_state(arrow_reader_metrics),
+                context,
+            )
+            .into_stream();
 
-        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
 
-        assert_eq!(
-            batches.iter().flat_map(batch_values).collect::<Vec<_>>(),
-            vec![6, 7, 8, 3, 4, 5, 1, 2]
-        );
-        assert_eq!(reservation.size(), 0);
-        assert_eq!(
-            coordinator.range_permits.available_permits(),
-            MAX_IN_FLIGHT_RANGES
-        );
+            assert_eq!(
+                batches.iter().flat_map(batch_values).collect::<Vec<_>>(),
+                vec![6, 7, 8, 3, 4, 5, 1, 2]
+            );
+            assert_eq!(reservation.size(), 0);
+            assert_eq!(
+                coordinator.range_permits.available_permits(),
+                MAX_IN_FLIGHT_RANGES
+            );
+        }
     }
 
     #[tokio::test]

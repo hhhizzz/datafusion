@@ -413,13 +413,19 @@ enum ForegroundProgress {
 struct TerminationPhaseProbe {
     phase_one_complete: Arc<AtomicBool>,
     events: Arc<Mutex<Vec<TerminationEvent>>>,
+    record_reader_ranges: Option<Arc<Vec<std::ops::Range<u64>>>>,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminationEvent {
-    PhaseOneComplete { reservation_bytes: usize },
-    RecordReaderBufferDropped { phase_one_complete: bool },
+    PhaseOneComplete {
+        reservation_bytes: usize,
+    },
+    RecordReaderBufferDropped {
+        phase_one_complete: bool,
+        tracked_range_index: Option<usize>,
+    },
 }
 
 #[cfg(test)]
@@ -428,6 +434,29 @@ impl TerminationPhaseProbe {
         Self {
             phase_one_complete: Arc::new(AtomicBool::new(false)),
             events: Arc::new(Mutex::new(vec![])),
+            record_reader_ranges: None,
+        }
+    }
+
+    fn for_record_reader_ranges(ranges: Vec<std::ops::Range<u64>>) -> Self {
+        Self {
+            record_reader_ranges: Some(Arc::new(ranges)),
+            ..Self::new()
+        }
+    }
+
+    fn record_reader_range_match(
+        &self,
+        range: &std::ops::Range<u64>,
+    ) -> (bool, Option<usize>) {
+        match self.record_reader_ranges.as_ref() {
+            None => (true, None),
+            Some(ranges) => {
+                let index = ranges.iter().position(|candidate| {
+                    range.start >= candidate.start && range.end <= candidate.end
+                });
+                (index.is_some(), index)
+            }
         }
     }
 
@@ -439,12 +468,13 @@ impl TerminationPhaseProbe {
             .push(TerminationEvent::PhaseOneComplete { reservation_bytes });
     }
 
-    fn record_record_reader_buffer_drop(&self) {
+    fn record_record_reader_buffer_drop(&self, tracked_range_index: Option<usize>) {
         self.events
             .lock()
             .unwrap()
             .push(TerminationEvent::RecordReaderBufferDropped {
                 phase_one_complete: self.phase_one_complete.load(Ordering::SeqCst),
+                tracked_range_index,
             });
     }
 
@@ -1276,7 +1306,6 @@ mod tests {
     use arrow::compute::kernels::cmp::gt;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::Bytes;
-    use datafusion_common::DataFusionError;
     use datafusion_execution::memory_pool::{
         GreedyMemoryPool, MemoryConsumer, MemoryPool, UnboundedMemoryPool,
     };
@@ -1303,9 +1332,9 @@ mod tests {
         LookaheadPushDecoderStreamState, PushDecoderOutputState, PushDecoderStreamState,
     };
     use super::{
-        NextReaderOutcome, NextReaderResult, PrefetchPlanQueue, PrefetchRunState,
-        SpeculativeResources, StagingRequest, TerminationEvent, TerminationPhaseProbe,
-        checked_range_bytes, clear_decoder_staged_buffers, stage_admitted_window,
+        PrefetchPlanQueue, PrefetchRunState, SpeculativeResources, StagingRequest,
+        TerminationEvent, TerminationPhaseProbe, checked_range_bytes,
+        clear_decoder_staged_buffers, stage_admitted_window,
     };
     use crate::lookahead::{
         LookaheadFileContext, MAX_IN_FLIGHT_RANGES, MAX_SPECULATIVE_BYTES,
@@ -1534,6 +1563,7 @@ mod tests {
     struct RecordReaderBufferOwner {
         bytes: Bytes,
         probe: TerminationPhaseProbe,
+        tracked_range_index: Option<usize>,
     }
 
     impl AsRef<[u8]> for RecordReaderBufferOwner {
@@ -1544,7 +1574,8 @@ mod tests {
 
     impl Drop for RecordReaderBufferOwner {
         fn drop(&mut self) {
-            self.probe.record_record_reader_buffer_drop();
+            self.probe
+                .record_record_reader_buffer_drop(self.tracked_range_index);
         }
     }
 
@@ -1622,6 +1653,10 @@ mod tests {
                 Ok(ranges
                     .into_iter()
                     .map(|range| {
+                        let (track_record_reader_buffer, tracked_range_index) =
+                            buffer_probe.as_ref().map_or((false, None), |probe| {
+                                probe.record_reader_range_match(&range)
+                            });
                         let corrupt =
                             control.inner.corrupted_row_group.is_some_and(|row_group| {
                                 let span = &row_group_spans[row_group];
@@ -1634,11 +1669,14 @@ mod tests {
                             data.slice(range.start as usize..range.end as usize)
                         };
                         match &buffer_probe {
-                            Some(probe) => Bytes::from_owner(RecordReaderBufferOwner {
-                                bytes,
-                                probe: probe.clone(),
-                            }),
-                            None => bytes,
+                            Some(probe) if track_record_reader_buffer => {
+                                Bytes::from_owner(RecordReaderBufferOwner {
+                                    bytes,
+                                    probe: probe.clone(),
+                                    tracked_range_index,
+                                })
+                            }
+                            _ => bytes,
                         }
                     })
                     .collect())
@@ -2921,26 +2959,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_error_termination_releases_all_leases_before_record_reader_buffers()
-    {
-        let fixture = ThreeRowGroupFixture::dense_prefetch(3);
-        let control = ScriptControl::new(None);
-        let (coordinator, context) =
-            fixture.lookahead_context_with_depth_and_window(2, 2);
-        let reservation = Arc::clone(&context.reservation);
-        let probe = TerminationPhaseProbe::new();
-        let mut state = fixture.staged_state_with_record_reader_buffer_probe(
-            control,
-            context,
-            100_000,
-            None,
-            probe.clone(),
+    async fn real_speculative_error_is_deferred_and_terminates_readers_in_two_phases() {
+        let rows_per_group = 300_000;
+        let batch_size = 75_000;
+        let row_group_order = vec![0, 1, 2, 3, 4];
+        let fixture = ThreeRowGroupFixture::dense_prefetch_with_row_group_values(
+            &[1, 1, 1, 1, 1],
+            rows_per_group,
+            &DISJOINT_FILTER_COLUMNS,
         );
+        let serial = fixture
+            .serial_oracle_with_filter_and_batch_size(row_group_order.clone(), batch_size)
+            .await;
 
-        let (_, next_state) = state.transition().await.unwrap();
-        state = next_state;
-        let (_, next_state) = state.transition().await.unwrap();
-        state = next_state;
+        let control = ScriptControl::corrupting(3);
+        let (coordinator, context) =
+            fixture.lookahead_context_with_depth_and_window(4, 4);
+        let reservation = Arc::clone(&context.reservation);
+        let prefetch_plan = fixture.prefetch_plan(row_group_order.clone());
+        let record_reader_ranges = (0..3)
+            .map(|row_group| {
+                let ranges = prefetch_plan.ranges_for(&[row_group]);
+                assert_eq!(ranges.len(), 1);
+                ranges.into_iter().next().unwrap()
+            })
+            .collect();
+        let probe = TerminationPhaseProbe::for_record_reader_ranges(record_reader_ranges);
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let decoder = fixture.decoder_for_row_groups_with_filter_and_batch_size(
+            Some(row_group_order.clone()),
+            &arrow_reader_metrics,
+            Some(0),
+            batch_size,
+        );
+        let mut state = LookaheadPushDecoderStreamState::new_with_prefetch_plans(
+            decoder,
+            VecDeque::new(),
+            PrefetchPlanQueue {
+                active: prefetch_plan,
+                pending: VecDeque::new(),
+                metrics: fixture.prefetch_metrics(),
+                staging_enabled: true,
+            },
+            fixture.reader_with_buffer_probe(control.clone(), probe.clone()),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .unwrap()
+        .with_termination_phase_probe(probe.clone());
+
+        for _ in 0..3 {
+            let (batch, next_state) = state.transition().await.unwrap();
+            assert_eq!(batch.unwrap().num_rows(), batch_size);
+            state = next_state;
+        }
+        assert!(control.requests_for(3).len() >= 2);
+        assert!(state.deferred_error.is_some());
         assert!(state.active_reader.is_some());
         assert_eq!(state.prefetched_readers.len(), 2);
         assert!(
@@ -2949,23 +3023,54 @@ mod tests {
                 .iter()
                 .all(|reader| reader.staged_window_lease.is_some())
         );
+        assert!(reservation.size() > 0);
 
-        let decoder = state.decoder.take().unwrap();
-        let reader = state.reader.take().unwrap();
-        state.accept_next_reader_outcome(NextReaderOutcome {
-            decoder,
-            reader,
-            result: NextReaderResult::Error(DataFusionError::Execution(
-                "scripted deferred termination".to_string(),
-            )),
-            resources: SpeculativeResources::default(),
-        });
-        assert!(state.deferred_error.is_some());
-        state.terminate();
+        drop(state);
 
         assert_eq!(reservation.size(), 0);
         assert_shared_budgets_released(&coordinator);
         assert_record_reader_buffers_drop_after_phase_one(&probe);
+        assert_eq!(record_reader_buffer_drop_count(&probe), 3);
+        assert_eq!(
+            record_reader_buffer_drop_range_indexes(&probe),
+            vec![0, 1, 2]
+        );
+
+        let control = ScriptControl::corrupting(3);
+        let (coordinator, context) =
+            fixture.lookahead_context_with_depth_and_window(4, 4);
+        let reservation = Arc::clone(&context.reservation);
+        let mut state = fixture.staged_state_with_filter_and_batch_size(
+            control,
+            context,
+            row_group_order,
+            batch_size,
+            fixture.prefetch_metrics(),
+        );
+        let mut actual = vec![];
+        for _ in 0..3 {
+            let (result, next_state) = state.transition().await.unwrap();
+            actual.push(result.unwrap());
+            state = next_state;
+        }
+        assert!(state.deferred_error.is_some());
+        assert!(state.active_reader.is_some());
+        assert_eq!(state.prefetched_readers.len(), 2);
+        let error = loop {
+            let Some((result, next_state)) = state.transition().await else {
+                panic!("the speculative decode error must be delivered")
+            };
+            state = next_state;
+            match result {
+                Ok(batch) => actual.push(batch),
+                Err(error) => break error,
+            }
+        };
+        let expected_batches = 3 * rows_per_group / batch_size;
+        assert_eq!(actual, serial[..expected_batches]);
+        assert!(error.to_string().contains("Parquet error"));
+        assert_eq!(reservation.size(), 0);
+        assert_shared_budgets_released(&coordinator);
     }
 
     #[tokio::test]
@@ -3494,9 +3599,10 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(index, event)| match event {
-                TerminationEvent::RecordReaderBufferDropped { phase_one_complete } => {
-                    Some((index, *phase_one_complete))
-                }
+                TerminationEvent::RecordReaderBufferDropped {
+                    phase_one_complete,
+                    ..
+                } => Some((index, *phase_one_complete)),
                 TerminationEvent::PhaseOneComplete { .. } => None,
             })
             .collect::<Vec<_>>();
@@ -3511,6 +3617,34 @@ mod tests {
                     *index > phase_one && *phase_one_complete
                 })
         );
+    }
+
+    fn record_reader_buffer_drop_count(probe: &TerminationPhaseProbe) -> usize {
+        probe
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(event, TerminationEvent::RecordReaderBufferDropped { .. })
+            })
+            .count()
+    }
+
+    fn record_reader_buffer_drop_range_indexes(
+        probe: &TerminationPhaseProbe,
+    ) -> Vec<usize> {
+        let mut indexes = probe
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                TerminationEvent::RecordReaderBufferDropped {
+                    tracked_range_index,
+                    ..
+                } => *tracked_range_index,
+                TerminationEvent::PhaseOneComplete { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        indexes.sort_unstable();
+        indexes
     }
 
     fn assert_shared_budgets_released(coordinator: &Arc<ParquetLookaheadCoordinator>) {

@@ -139,6 +139,14 @@ impl LookaheadFileContext {
     pub(crate) fn prefetch_window(&self) -> usize {
         self.coordinator.prefetch_window()
     }
+
+    #[cfg(test)]
+    pub(crate) fn permit_snapshot(&self) -> (usize, usize) {
+        (
+            self.coordinator.range_permits.available_permits(),
+            self.coordinator.byte_permits.available_permits(),
+        )
+    }
 }
 
 #[derive(Debug)]

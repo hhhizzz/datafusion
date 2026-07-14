@@ -421,6 +421,8 @@ struct TerminationPhaseProbe {
 enum TerminationEvent {
     PhaseOneComplete {
         reservation_bytes: usize,
+        range_permits: usize,
+        byte_permits: usize,
     },
     RecordReaderBufferDropped {
         phase_one_complete: bool,
@@ -460,12 +462,21 @@ impl TerminationPhaseProbe {
         }
     }
 
-    fn record_phase_one_complete(&self, reservation_bytes: usize) {
+    fn record_phase_one_complete(
+        &self,
+        reservation_bytes: usize,
+        range_permits: usize,
+        byte_permits: usize,
+    ) {
         self.phase_one_complete.store(true, Ordering::SeqCst);
         self.events
             .lock()
             .unwrap()
-            .push(TerminationEvent::PhaseOneComplete { reservation_bytes });
+            .push(TerminationEvent::PhaseOneComplete {
+                reservation_bytes,
+                range_permits,
+                byte_permits,
+            });
     }
 
     fn record_record_reader_buffer_drop(&self, tracked_range_index: Option<usize>) {
@@ -948,7 +959,12 @@ impl LookaheadPushDecoderStreamState {
         );
         #[cfg(test)]
         if let Some(probe) = self.termination_phase_probe.as_ref() {
-            probe.record_phase_one_complete(self.lookahead.reservation.size());
+            let (range_permits, byte_permits) = self.lookahead.permit_snapshot();
+            probe.record_phase_one_complete(
+                self.lookahead.reservation.size(),
+                range_permits,
+                byte_permits,
+            );
         }
 
         // Phase 2: only now may record readers release the Bytes they own.
@@ -1302,7 +1318,7 @@ mod tests {
     use std::task::Poll;
     use std::time::Duration;
 
-    use arrow::array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow::array::{ArrayRef, BooleanArray, Int32Array, RecordBatch};
     use arrow::compute::kernels::cmp::gt;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::Bytes;
@@ -1356,6 +1372,18 @@ mod tests {
         ranges: Vec<Range<u64>>,
     }
 
+    #[derive(Debug, Clone)]
+    enum CorruptionTarget {
+        RowGroup(usize),
+        ByteSpan(Range<u64>),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RangeReadRecord {
+        request_range: Range<u64>,
+        corrupted_span: Option<Range<u64>>,
+    }
+
     #[derive(Debug)]
     struct ScriptControlInner {
         requests: Mutex<Vec<RequestRecord>>,
@@ -1364,7 +1392,8 @@ mod tests {
         gated_row_group: Option<usize>,
         failed_row_group: Option<usize>,
         successful_requests_before_failure: usize,
-        corrupted_row_group: Option<usize>,
+        corruption_target: Option<CorruptionTarget>,
+        range_reads: Mutex<Vec<RangeReadRecord>>,
         gate_released: AtomicBool,
         active_fetches: AtomicUsize,
     }
@@ -1396,14 +1425,28 @@ mod tests {
         }
 
         fn corrupting(corrupted_row_group: usize) -> Self {
-            Self::with_script(None, None, 0, Some(corrupted_row_group))
+            Self::with_script(
+                None,
+                None,
+                0,
+                Some(CorruptionTarget::RowGroup(corrupted_row_group)),
+            )
+        }
+
+        fn corrupting_span(corrupted_span: Range<u64>) -> Self {
+            Self::with_script(
+                None,
+                None,
+                0,
+                Some(CorruptionTarget::ByteSpan(corrupted_span)),
+            )
         }
 
         fn with_script(
             gated_row_group: Option<usize>,
             failed_row_group: Option<usize>,
             successful_requests_before_failure: usize,
-            corrupted_row_group: Option<usize>,
+            corruption_target: Option<CorruptionTarget>,
         ) -> Self {
             Self {
                 inner: Arc::new(ScriptControlInner {
@@ -1413,7 +1456,8 @@ mod tests {
                     gated_row_group,
                     failed_row_group,
                     successful_requests_before_failure,
-                    corrupted_row_group,
+                    corruption_target,
+                    range_reads: Mutex::new(vec![]),
                     gate_released: AtomicBool::new(gated_row_group.is_none()),
                     active_fetches: AtomicUsize::new(0),
                 }),
@@ -1496,6 +1540,39 @@ mod tests {
 
         fn active_fetches(&self) -> usize {
             self.inner.active_fetches.load(Ordering::SeqCst)
+        }
+
+        fn corruption_intersection(
+            &self,
+            request_range: &Range<u64>,
+            row_group_spans: &[Range<u64>],
+        ) -> Option<Range<u64>> {
+            let target = match self.inner.corruption_target.as_ref()? {
+                CorruptionTarget::RowGroup(row_group) => &row_group_spans[*row_group],
+                CorruptionTarget::ByteSpan(span) => span,
+            };
+            let start = request_range.start.max(target.start);
+            let end = request_range.end.min(target.end);
+            (start < end).then_some(start..end)
+        }
+
+        fn record_range_read(
+            &self,
+            request_range: Range<u64>,
+            corrupted_span: Option<Range<u64>>,
+        ) {
+            self.inner
+                .range_reads
+                .lock()
+                .unwrap()
+                .push(RangeReadRecord {
+                    request_range,
+                    corrupted_span,
+                });
+        }
+
+        fn range_reads(&self) -> Vec<RangeReadRecord> {
+            self.inner.range_reads.lock().unwrap().clone()
         }
 
         fn should_fail(&self, row_groups: &[usize]) -> bool {
@@ -1657,17 +1734,21 @@ mod tests {
                             buffer_probe.as_ref().map_or((false, None), |probe| {
                                 probe.record_reader_range_match(&range)
                             });
-                        let corrupt =
-                            control.inner.corrupted_row_group.is_some_and(|row_group| {
-                                let span = &row_group_spans[row_group];
-                                range.start >= span.start && range.end <= span.end
-                            });
-                        let bytes = if corrupt {
-                            let len = usize::try_from(range.end - range.start).unwrap();
-                            Bytes::from(vec![0_u8; len])
-                        } else {
-                            data.slice(range.start as usize..range.end as usize)
-                        };
+                        let mut bytes =
+                            data.slice(range.start as usize..range.end as usize);
+                        let corrupted_span =
+                            control.corruption_intersection(&range, &row_group_spans);
+                        if let Some(corrupted_span) = corrupted_span.as_ref() {
+                            let mut corrupted = bytes.to_vec();
+                            let start =
+                                usize::try_from(corrupted_span.start - range.start)
+                                    .unwrap();
+                            let end = usize::try_from(corrupted_span.end - range.start)
+                                .unwrap();
+                            corrupted[start..end].fill(0);
+                            bytes = Bytes::from(corrupted);
+                        }
+                        control.record_range_read(range.clone(), corrupted_span);
                         match &buffer_probe {
                             Some(probe) if track_record_reader_buffer => {
                                 Bytes::from_owner(RecordReaderBufferOwner {
@@ -2065,6 +2146,38 @@ mod tests {
             filter_threshold: Option<i32>,
             batch_size: usize,
         ) -> ParquetPushDecoder {
+            self.decoder_for_row_groups_with_filter_options(
+                row_groups,
+                arrow_reader_metrics,
+                filter_threshold,
+                batch_size,
+                false,
+            )
+        }
+
+        fn decoder_with_staged_projection_filter(
+            &self,
+            row_groups: Option<Vec<usize>>,
+            arrow_reader_metrics: &ArrowReaderMetrics,
+            batch_size: usize,
+        ) -> ParquetPushDecoder {
+            self.decoder_for_row_groups_with_filter_options(
+                row_groups,
+                arrow_reader_metrics,
+                Some(0),
+                batch_size,
+                true,
+            )
+        }
+
+        fn decoder_for_row_groups_with_filter_options(
+            &self,
+            row_groups: Option<Vec<usize>>,
+            arrow_reader_metrics: &ArrowReaderMetrics,
+            filter_threshold: Option<i32>,
+            batch_size: usize,
+            include_staged_projection_filter: bool,
+        ) -> ParquetPushDecoder {
             let mut builder =
                 ParquetPushDecoderBuilder::try_new_decoder(Arc::clone(&self.metadata))
                     .unwrap();
@@ -2091,8 +2204,19 @@ mod tests {
                         gt(values, &Int32Array::new_scalar(filter_threshold))
                     },
                 );
-                builder =
-                    builder.with_row_filter(RowFilter::new(vec![Box::new(predicate)]));
+                let row_filter = if include_staged_projection_filter {
+                    let staged_projection_predicate = ArrowPredicateFn::new(
+                        ProjectionMask::columns(&schema_descr, ["value"]),
+                        |batch| Ok(BooleanArray::from(vec![true; batch.num_rows()])),
+                    );
+                    RowFilter::new(vec![
+                        Box::new(predicate),
+                        Box::new(staged_projection_predicate),
+                    ])
+                } else {
+                    RowFilter::new(vec![Box::new(predicate)])
+                };
+                builder = builder.with_row_filter(row_filter);
             }
             builder.build().unwrap()
         }
@@ -2105,6 +2229,12 @@ mod tests {
                 &projection_mask,
                 row_group_order,
             )
+        }
+
+        fn projected_value_chunk_span(&self, row_group: usize) -> Range<u64> {
+            let (start, length) =
+                self.metadata.row_groups()[row_group].columns()[0].byte_range();
+            start..start + length
         }
 
         fn prefetch_metrics(&self) -> RowGroupPrefetchMetrics {
@@ -2283,13 +2413,58 @@ mod tests {
             batch_size: usize,
             metrics: RowGroupPrefetchMetrics,
         ) -> LookaheadPushDecoderStreamState {
-            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
-            let decoder = self.decoder_for_row_groups_with_filter_and_batch_size(
-                Some(row_group_order.clone()),
-                &arrow_reader_metrics,
-                Some(0),
+            self.staged_state_with_filter_options(
+                control,
+                context,
+                row_group_order,
                 batch_size,
-            );
+                metrics,
+                false,
+            )
+        }
+
+        fn staged_state_with_staged_projection_filter(
+            &self,
+            control: ScriptControl,
+            context: LookaheadFileContext,
+            row_group_order: Vec<usize>,
+            batch_size: usize,
+            metrics: RowGroupPrefetchMetrics,
+        ) -> LookaheadPushDecoderStreamState {
+            self.staged_state_with_filter_options(
+                control,
+                context,
+                row_group_order,
+                batch_size,
+                metrics,
+                true,
+            )
+        }
+
+        fn staged_state_with_filter_options(
+            &self,
+            control: ScriptControl,
+            context: LookaheadFileContext,
+            row_group_order: Vec<usize>,
+            batch_size: usize,
+            metrics: RowGroupPrefetchMetrics,
+            include_staged_projection_filter: bool,
+        ) -> LookaheadPushDecoderStreamState {
+            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+            let decoder = if include_staged_projection_filter {
+                self.decoder_with_staged_projection_filter(
+                    Some(row_group_order.clone()),
+                    &arrow_reader_metrics,
+                    batch_size,
+                )
+            } else {
+                self.decoder_for_row_groups_with_filter_and_batch_size(
+                    Some(row_group_order.clone()),
+                    &arrow_reader_metrics,
+                    Some(0),
+                    batch_size,
+                )
+            };
             LookaheadPushDecoderStreamState::new_with_prefetch_plans(
                 decoder,
                 VecDeque::new(),
@@ -2972,11 +3147,16 @@ mod tests {
             .serial_oracle_with_filter_and_batch_size(row_group_order.clone(), batch_size)
             .await;
 
-        let control = ScriptControl::corrupting(3);
+        let projected_value_span = fixture.projected_value_chunk_span(3);
+        let control = ScriptControl::corrupting_span(projected_value_span.clone());
         let (coordinator, context) =
             fixture.lookahead_context_with_depth_and_window(4, 4);
         let reservation = Arc::clone(&context.reservation);
         let prefetch_plan = fixture.prefetch_plan(row_group_order.clone());
+        assert_eq!(
+            prefetch_plan.ranges_for(&[3]),
+            vec![projected_value_span.clone()]
+        );
         let record_reader_ranges = (0..3)
             .map(|row_group| {
                 let ranges = prefetch_plan.ranges_for(&[row_group]);
@@ -2986,10 +3166,9 @@ mod tests {
             .collect();
         let probe = TerminationPhaseProbe::for_record_reader_ranges(record_reader_ranges);
         let arrow_reader_metrics = ArrowReaderMetrics::enabled();
-        let decoder = fixture.decoder_for_row_groups_with_filter_and_batch_size(
+        let decoder = fixture.decoder_with_staged_projection_filter(
             Some(row_group_order.clone()),
             &arrow_reader_metrics,
-            Some(0),
             batch_size,
         );
         let mut state = LookaheadPushDecoderStreamState::new_with_prefetch_plans(
@@ -3013,7 +3192,7 @@ mod tests {
             assert_eq!(batch.unwrap().num_rows(), batch_size);
             state = next_state;
         }
-        assert!(control.requests_for(3).len() >= 2);
+        assert_only_staged_projection_was_corrupted(&control, 3, &projected_value_span);
         assert!(state.deferred_error.is_some());
         assert!(state.active_reader.is_some());
         assert_eq!(state.prefetched_readers.len(), 2);
@@ -3036,12 +3215,12 @@ mod tests {
             vec![0, 1, 2]
         );
 
-        let control = ScriptControl::corrupting(3);
+        let control = ScriptControl::corrupting_span(projected_value_span.clone());
         let (coordinator, context) =
             fixture.lookahead_context_with_depth_and_window(4, 4);
         let reservation = Arc::clone(&context.reservation);
-        let mut state = fixture.staged_state_with_filter_and_batch_size(
-            control,
+        let mut state = fixture.staged_state_with_staged_projection_filter(
+            control.clone(),
             context,
             row_group_order,
             batch_size,
@@ -3056,6 +3235,7 @@ mod tests {
         assert!(state.deferred_error.is_some());
         assert!(state.active_reader.is_some());
         assert_eq!(state.prefetched_readers.len(), 2);
+        assert_only_staged_projection_was_corrupted(&control, 3, &projected_value_span);
         let error = loop {
             let Some((result, next_state)) = state.transition().await else {
                 panic!("the speculative decode error must be delivered")
@@ -3572,6 +3752,51 @@ mod tests {
         drop(stream);
     }
 
+    fn ranges_overlap(left: &Range<u64>, right: &Range<u64>) -> bool {
+        left.start < right.end && right.start < left.end
+    }
+
+    fn assert_only_staged_projection_was_corrupted(
+        control: &ScriptControl,
+        row_group: usize,
+        projected_value_span: &Range<u64>,
+    ) {
+        let range_reads = control.range_reads();
+        let corruptions = range_reads
+            .iter()
+            .filter(|read| read.corrupted_span.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(corruptions.len(), 1);
+        assert_eq!(
+            corruptions[0].corrupted_span.as_ref(),
+            Some(projected_value_span)
+        );
+        assert!(
+            corruptions[0].request_range.start <= projected_value_span.start
+                && corruptions[0].request_range.end >= projected_value_span.end
+        );
+
+        let requests = control.requests_for(row_group);
+        let (staged_projection, exact_filter): (Vec<_>, Vec<_>) =
+            requests.iter().partition(|request| {
+                request
+                    .ranges
+                    .iter()
+                    .any(|range| ranges_overlap(range, projected_value_span))
+            });
+        assert_eq!(staged_projection.len(), 1);
+        assert_eq!(staged_projection[0].ranges.len(), 1);
+        assert_eq!(staged_projection[0].ranges[0], corruptions[0].request_range);
+        assert_eq!(exact_filter.len(), 1);
+        assert_eq!(exact_filter[0].ranges.len(), DISJOINT_FILTER_COLUMNS.len());
+        for range in &exact_filter[0].ranges {
+            assert!(!ranges_overlap(range, projected_value_span));
+            assert!(range_reads.iter().any(|read| {
+                read.request_range == *range && read.corrupted_span.is_none()
+            }));
+        }
+    }
+
     fn batch_values(batch: &RecordBatch) -> Vec<i32> {
         batch
             .column(0)
@@ -3591,7 +3816,9 @@ mod tests {
         assert_eq!(
             events[phase_one],
             TerminationEvent::PhaseOneComplete {
-                reservation_bytes: 0
+                reservation_bytes: 0,
+                range_permits: MAX_IN_FLIGHT_RANGES,
+                byte_permits: MAX_SPECULATIVE_BYTES,
             }
         );
 

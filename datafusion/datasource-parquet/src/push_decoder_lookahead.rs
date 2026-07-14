@@ -1674,16 +1674,21 @@ mod tests {
                 .iter()
                 .cloned()
                 .fold(BTreeMap::new(), |mut grouped, range| {
-                    let row_group = self
+                    let row_groups = self
                         .row_group_spans
                         .iter()
-                        .position(|span| {
-                            range.start >= span.start && range.end <= span.end
+                        .enumerate()
+                        .filter_map(|(index, span)| {
+                            (range.start < span.end && span.start < range.end)
+                                .then_some(index)
                         })
-                        .unwrap_or_else(|| {
-                            panic!("range {range:?} is outside row-group data")
-                        });
-                    grouped.entry(row_group).or_default().push(range);
+                        .collect::<Vec<_>>();
+                    if row_groups.is_empty() {
+                        panic!("range {range:?} is outside row-group data")
+                    }
+                    for row_group in row_groups {
+                        grouped.entry(row_group).or_default().push(range.clone());
+                    }
                     grouped
                 })
         }
@@ -2789,7 +2794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sparse_first_row_group_never_stages_a_window() {
+    async fn fully_observed_tiny_row_group_stages_a_coalesced_window() {
         let fixture = ThreeRowGroupFixture::new();
         let control = ScriptControl::new(None);
         let (_, context) = fixture.lookahead_context_with_depth_and_window(2, 2);
@@ -2799,7 +2804,32 @@ mod tests {
 
         assert_eq!(first.num_rows(), fixture.rows_per_group);
         assert!(control.has_request_for(1));
-        assert!(!control.has_request_for(2));
+        assert!(control.has_request_for(2));
+        assert_eq!(control.requests_for(1).len(), 1);
+        assert_eq!(control.requests_for(2).len(), 1);
+        assert_eq!(
+            control.requests_for(1)[0].ranges,
+            control.requests_for(2)[0].ranges
+        );
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn fully_observed_small_row_group_stages_the_next_window() {
+        let fixture = ThreeRowGroupFixture::dense_prefetch_with_rows(3, 100_000);
+        let projected = fixture.projected_value_chunk_span(0);
+        assert!(projected.end - projected.start < 1024 * 1024);
+        let control = ScriptControl::new(None);
+        let (_, context) = fixture.lookahead_context_with_depth_and_window(2, 2);
+        let mut stream = fixture.staged_stream_without_filter(control.clone(), context);
+
+        let first = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(first.num_rows(), fixture.rows_per_group);
+        assert!(control.has_request_for(1));
+        assert!(control.has_request_for(2));
+        assert_eq!(control.requests_for(1).len(), 1);
+        assert_eq!(control.requests_for(2).len(), 1);
         drop(stream);
     }
 

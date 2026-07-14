@@ -255,8 +255,10 @@ impl DensityAdmission {
         self.observed_payload_bytes =
             unique_range_bytes(self.observed_ranges.iter().cloned());
 
-        if self.observed_payload_bytes < MIN_ADMISSION_BYTES
-            || self.candidate_payload_bytes == 0
+        let minimum_evidence_bytes =
+            MIN_ADMISSION_BYTES.min(self.candidate_payload_bytes);
+        if minimum_evidence_bytes == 0
+            || self.observed_payload_bytes < minimum_evidence_bytes
         {
             return None;
         }
@@ -595,6 +597,24 @@ mod tests {
             observe_single(&mut admission, 0..MIB),
             Some(AdmissionDecision::Denied)
         );
+    }
+
+    #[test]
+    fn small_candidates_require_full_coverage_before_enabling() {
+        const SMALL_PAYLOAD: u64 = 640 * 1024;
+        let metadata = metadata_with_leaf_ranges(single_range(0..SMALL_PAYLOAD));
+        let plan = leaf_plan(&metadata, vec![0]);
+        let mut admission = plan.density_admission_for(0);
+
+        assert_eq!(observe_single(&mut admission, 0..(SMALL_PAYLOAD - 1)), None);
+        assert_eq!(admission.state(), AdmissionState::Observing);
+        assert_eq!(
+            observe_single(&mut admission, (SMALL_PAYLOAD - 1)..SMALL_PAYLOAD),
+            Some(AdmissionDecision::Enabled)
+        );
+        assert_eq!(admission.state(), AdmissionState::Enabled);
+        assert_eq!(admission.observed_payload_bytes(), SMALL_PAYLOAD as usize);
+        assert_eq!(admission.candidate_payload_bytes(), SMALL_PAYLOAD as usize);
     }
 
     #[test]

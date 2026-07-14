@@ -505,9 +505,11 @@ mod parquet {
         }
     }
 
-    impl From<&ParquetOptionsProto> for ParquetOptions {
-        fn from(proto: &ParquetOptionsProto) -> Self {
-            ParquetOptions {
+    impl TryFrom<&ParquetOptionsProto> for ParquetOptions {
+        type Error = datafusion_common::DataFusionError;
+
+        fn try_from(proto: &ParquetOptionsProto) -> Result<Self, Self::Error> {
+            Ok(ParquetOptions {
             enable_page_index: proto.enable_page_index,
             pruning: proto.pruning,
             skip_metadata: proto.skip_metadata,
@@ -520,8 +522,11 @@ mod parquet {
                 .row_group_lookahead_depth_opt
                 .as_ref()
                 .map(|opt| match opt {
-                    parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(value) => *value as usize,
+                    parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(value) => {
+                        row_group_lookahead_depth_from_u64(*value)
+                    }
                 })
+                .transpose()?
                 .unwrap_or(1),
             reorder_filters: proto.reorder_filters,
             force_filter_selections: proto.force_filter_selections,
@@ -582,8 +587,18 @@ mod parquet {
                 max_chunk_size: cdc.max_chunk_size as usize,
                 norm_level: cdc.norm_level,
             }).unwrap_or_default(),
+        })
         }
-        }
+    }
+
+    fn row_group_lookahead_depth_from_u64(
+        value: u64,
+    ) -> datafusion_common::Result<usize> {
+        usize::try_from(value).map_err(|_| {
+            datafusion_common::DataFusionError::Configuration(format!(
+                "Parquet row_group_lookahead_depth value {value} does not fit in usize"
+            ))
+        })
     }
 
     impl From<ParquetColumnOptionsProto> for ParquetColumnOptions {
@@ -614,13 +629,16 @@ mod parquet {
         }
     }
 
-    impl From<&TableParquetOptionsProto> for TableParquetOptions {
-        fn from(proto: &TableParquetOptionsProto) -> Self {
-            TableParquetOptions {
+    impl TryFrom<&TableParquetOptionsProto> for TableParquetOptions {
+        type Error = datafusion_common::DataFusionError;
+
+        fn try_from(proto: &TableParquetOptionsProto) -> Result<Self, Self::Error> {
+            Ok(TableParquetOptions {
                 global: proto
                     .global
                     .as_ref()
-                    .map(ParquetOptions::from)
+                    .map(ParquetOptions::try_from)
+                    .transpose()?
                     .unwrap_or_default(),
                 column_specific_options: proto
                     .column_specific_options
@@ -643,7 +661,7 @@ mod parquet {
                     .map(|(k, v)| (k.clone(), Some(v.clone())))
                     .collect(),
                 ..Default::default()
-            }
+            })
         }
     }
 
@@ -697,7 +715,7 @@ mod parquet {
             let proto = TableParquetOptionsProto::decode(buf).map_err(|e| {
                 exec_datafusion_err!("Failed to decode TableParquetOptionsProto: {e:?}")
             })?;
-            let options: TableParquetOptions = (&proto).into();
+            let options: TableParquetOptions = (&proto).try_into()?;
             Ok(Arc::new(
                 datafusion_datasource_parquet::file_format::ParquetFormatFactory {
                     options: Some(options),

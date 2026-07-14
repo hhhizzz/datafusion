@@ -1066,8 +1066,11 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 .row_group_lookahead_depth_opt
                 .as_ref()
                 .map(|opt| match opt {
-                    protobuf::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(value) => *value as usize,
+                    protobuf::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(value) => {
+                        row_group_lookahead_depth_from_u64(*value)
+                    }
                 })
+                .transpose()?
                 .unwrap_or(1),
             reorder_filters: value.reorder_filters,
             force_filter_selections: value.force_filter_selections,
@@ -1141,6 +1144,14 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
             content_defined_chunking: value.content_defined_chunking.map(ParquetCdcOptions::from).unwrap_or_default(),
         })
     }
+}
+
+fn row_group_lookahead_depth_from_u64(value: u64) -> datafusion_common::Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        DataFusionError::Configuration(format!(
+            "Parquet row_group_lookahead_depth value {value} does not fit in usize"
+        ))
+    })
 }
 
 impl From<protobuf::ParquetCdcOptions> for ParquetCdcOptions {
@@ -1408,6 +1419,35 @@ mod tests {
         let recovered = ParquetOptions::try_from(&proto).expect("from_proto");
 
         assert_eq!(recovered.row_group_lookahead_depth, 1);
+    }
+
+    #[test]
+    fn row_group_lookahead_depth_wire_value_is_checked_without_truncation() {
+        let usize_max = u64::try_from(usize::MAX).expect("usize must fit in u64");
+        let mut proto: crate::protobuf_common::ParquetOptions =
+            (&ParquetOptions::default()).try_into().expect("to_proto");
+
+        if let Some(overflow) = usize_max.checked_add(1) {
+            proto.row_group_lookahead_depth_opt = Some(
+                crate::protobuf_common::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(
+                    overflow,
+                ),
+            );
+            let error = ParquetOptions::try_from(&proto).unwrap_err();
+            assert!(error.to_string().contains("does not fit in usize"));
+        } else {
+            proto.row_group_lookahead_depth_opt = Some(
+                crate::protobuf_common::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(
+                    u64::MAX,
+                ),
+            );
+            let recovered = ParquetOptions::try_from(&proto).expect("from_proto");
+            assert_eq!(recovered.row_group_lookahead_depth, usize::MAX);
+            assert!(
+                recovered.row_group_lookahead_depth > 4,
+                "large wire values must remain invalid depths"
+            );
+        }
     }
 
     #[test]

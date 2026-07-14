@@ -536,9 +536,13 @@ fn lookahead_context(
     let Some(state) = state else {
         return Ok(None);
     };
-    let Ok(coordinator) = state.downcast::<ParquetLookaheadCoordinator>() else {
-        return Ok(None);
-    };
+    let coordinator = state
+        .downcast::<ParquetLookaheadCoordinator>()
+        .map_err(|_| {
+            DataFusionError::Internal(
+                "Parquet lookahead execution state has an unexpected type".to_string(),
+            )
+        })?;
     coordinator.validate()?;
     Ok(Some(LookaheadScanContext {
         coordinator,
@@ -1022,8 +1026,69 @@ mod tests {
     use super::*;
     use crate::lookahead::ParquetLookaheadCoordinator;
     use arrow::datatypes::Schema;
+    use datafusion_datasource::PartitionedFile;
+    use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
     use datafusion_execution::TaskContext;
+    use datafusion_execution::object_store::ObjectStoreUrl;
     use datafusion_physical_expr::expressions::lit;
+    use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+    use object_store::memory::InMemory;
+    use parquet::arrow::async_reader::AsyncFileReader;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct ReaderFactorySentinel {
+        create_reader_calls: AtomicUsize,
+    }
+
+    impl ParquetFileReaderFactory for ReaderFactorySentinel {
+        fn create_reader(
+            &self,
+            _partition_index: usize,
+            _partitioned_file: PartitionedFile,
+            _metadata_size_hint: Option<usize>,
+            _metrics: &ExecutionPlanMetricsSet,
+        ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>> {
+            self.create_reader_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("reader factory must not be called while creating the morselizer")
+        }
+    }
+
+    fn source_with_lookahead(
+        enabled: bool,
+        depth: usize,
+        factory: Arc<ReaderFactorySentinel>,
+    ) -> ParquetSource {
+        let mut options = TableParquetOptions::default();
+        options.global.row_group_lookahead = enabled;
+        options.global.row_group_lookahead_depth = depth;
+
+        let mut source = ParquetSource::new(Arc::new(Schema::empty()))
+            .with_table_parquet_options(options)
+            .with_parquet_file_reader_factory(factory);
+        source.batch_size = Some(1);
+        source
+    }
+
+    fn create_morselizer_with_context(
+        source: &ParquetSource,
+        state: Option<FileSourceExecutionState>,
+    ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+        let base_config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(source.clone()),
+        )
+        .build();
+
+        FileSource::create_morselizer_with_context(
+            source,
+            Arc::new(InMemory::new()),
+            &base_config,
+            0,
+            Arc::new(TaskContext::default()),
+            state,
+        )
+    }
 
     #[test]
     fn lookahead_execution_state_is_opt_in() {
@@ -1043,16 +1108,13 @@ mod tests {
     }
 
     #[test]
-    fn lookahead_context_requires_correctly_typed_execution_state() {
+    fn lookahead_context_rejects_incorrectly_typed_execution_state() {
         let context = TaskContext::default();
         assert!(lookahead_context(None, &context).unwrap().is_none());
 
         let wrong_state: FileSourceExecutionState = Arc::new(());
-        assert!(
-            lookahead_context(Some(wrong_state), &context)
-                .unwrap()
-                .is_none()
-        );
+        let error = lookahead_context(Some(wrong_state), &context).unwrap_err();
+        assert!(matches!(error, DataFusionError::Internal(_)));
 
         let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1));
         let state: FileSourceExecutionState = coordinator.clone();
@@ -1073,6 +1135,55 @@ mod tests {
         let error = lookahead_context(Some(state), &context).unwrap_err();
 
         assert!(matches!(error, DataFusionError::Configuration(_)));
+    }
+
+    #[test]
+    fn create_morselizer_with_context_rejects_enabled_depth_zero_before_reader_io() {
+        let factory = Arc::new(ReaderFactorySentinel::default());
+        let source = source_with_lookahead(true, 0, Arc::clone(&factory));
+
+        let error =
+            create_morselizer_with_context(&source, source.create_execution_state())
+                .unwrap_err();
+
+        assert!(matches!(error, DataFusionError::Configuration(_)));
+        assert_eq!(factory.create_reader_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn create_morselizer_with_context_rejects_enabled_depth_five_before_reader_io() {
+        let factory = Arc::new(ReaderFactorySentinel::default());
+        let source = source_with_lookahead(true, 5, Arc::clone(&factory));
+
+        let error =
+            create_morselizer_with_context(&source, source.create_execution_state())
+                .unwrap_err();
+
+        assert!(matches!(error, DataFusionError::Configuration(_)));
+        assert_eq!(factory.create_reader_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn create_morselizer_with_context_rejects_incorrectly_typed_state_before_reader_io() {
+        let factory = Arc::new(ReaderFactorySentinel::default());
+        let source = source_with_lookahead(true, 1, Arc::clone(&factory));
+        let wrong_state: FileSourceExecutionState = Arc::new(());
+
+        let error =
+            create_morselizer_with_context(&source, Some(wrong_state)).unwrap_err();
+
+        assert!(matches!(error, DataFusionError::Internal(_)));
+        assert_eq!(factory.create_reader_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn create_morselizer_with_context_ignores_disabled_invalid_depth() {
+        let factory = Arc::new(ReaderFactorySentinel::default());
+        let source = source_with_lookahead(false, 0, Arc::clone(&factory));
+
+        create_morselizer_with_context(&source, source.create_execution_state()).unwrap();
+
+        assert_eq!(factory.create_reader_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

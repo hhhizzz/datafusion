@@ -93,10 +93,6 @@ impl LookaheadFileContext {
         })
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Consumed by the bounded queue in Task 2.")
-    )]
     pub(crate) fn depth(&self) -> usize {
         self.coordinator.depth()
     }

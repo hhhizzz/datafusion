@@ -308,8 +308,8 @@ impl LookaheadPushDecoderStreamState {
 
     fn terminate(&mut self) {
         self.terminated = true;
-        self.next_reader_future = None;
         self.prefetched_readers.clear();
+        self.next_reader_future = None;
         self.active_reader = None;
         self.decoder = None;
         self.reader = None;
@@ -317,6 +317,12 @@ impl LookaheadPushDecoderStreamState {
         self.foreground_resources = SpeculativeResources::default();
         self.deferred_error = None;
         self.run_finished = false;
+    }
+}
+
+impl Drop for LookaheadPushDecoderStreamState {
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -613,11 +619,47 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ReaderDropProbe {
+        context: LookaheadFileContext,
+        reader_dropped: Arc<AtomicBool>,
+        resources_released_before_reader_drop: Arc<AtomicBool>,
+    }
+
+    impl ReaderDropProbe {
+        fn new(context: LookaheadFileContext) -> Self {
+            Self {
+                context,
+                reader_dropped: Arc::new(AtomicBool::new(false)),
+                resources_released_before_reader_drop: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn record_reader_drop(&self) {
+            let byte_budget_released = self
+                .context
+                .try_reserve(MAX_SPECULATIVE_BYTES)
+                .is_some_and(|lease| {
+                    drop(lease);
+                    true
+                });
+            self.resources_released_before_reader_drop.store(
+                self.context.reservation.size() == 0
+                    && self.context.coordinator.range_permits.available_permits()
+                        == MAX_IN_FLIGHT_RANGES
+                    && byte_budget_released,
+                Ordering::SeqCst,
+            );
+            self.reader_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
     struct ScriptedAsyncFileReader {
         data: Bytes,
         metadata: Arc<ParquetMetaData>,
         row_group_spans: Arc<Vec<Range<u64>>>,
         control: ScriptControl,
+        drop_probe: Option<ReaderDropProbe>,
     }
 
     impl ScriptedAsyncFileReader {
@@ -636,6 +678,14 @@ mod tests {
                 "one request must not span row groups"
             );
             row_group
+        }
+    }
+
+    impl Drop for ScriptedAsyncFileReader {
+        fn drop(&mut self) {
+            if let Some(probe) = &self.drop_probe {
+                probe.record_reader_drop();
+            }
         }
     }
 
@@ -790,11 +840,20 @@ mod tests {
         }
 
         fn reader(&self, control: ScriptControl) -> Box<dyn AsyncFileReader> {
+            self.reader_with_drop_probe(control, None)
+        }
+
+        fn reader_with_drop_probe(
+            &self,
+            control: ScriptControl,
+            drop_probe: Option<ReaderDropProbe>,
+        ) -> Box<dyn AsyncFileReader> {
             Box::new(ScriptedAsyncFileReader {
                 data: self.data.clone(),
                 metadata: Arc::clone(&self.metadata),
                 row_group_spans: Arc::clone(&self.row_group_spans),
                 control,
+                drop_probe,
             })
         }
 
@@ -964,11 +1023,29 @@ mod tests {
             .to_vec()
     }
 
+    fn assert_shared_budgets_released(coordinator: &Arc<ParquetLookaheadCoordinator>) {
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = Arc::new(
+            MemoryConsumer::new("push-decoder-lookahead-byte-budget-probe")
+                .register(&pool),
+        );
+        let context = LookaheadFileContext::new(Arc::clone(coordinator), reservation);
+        drop(
+            context
+                .try_reserve(MAX_SPECULATIVE_BYTES)
+                .expect("the full shared byte budget must be released"),
+        );
+    }
+
     #[tokio::test]
     async fn depth_four_queues_multiple_readers_and_preserves_order() {
         let fixture = ThreeRowGroupFixture::with_row_group_count_and_rows_per_group_and_filter_columns(
             4,
-            4,
+            5,
             &LOOKAHEAD_FILTER_COLUMNS,
         );
         let (serial, _) = fixture.serial_oracle().await;
@@ -977,10 +1054,10 @@ mod tests {
         let (_, depth_one_context) = fixture.lookahead_context_with_depth(1);
         let mut depth_one_stream =
             fixture.lookahead_stream(depth_one_control.clone(), depth_one_context);
-        let depth_one_first = depth_one_stream.next().await.unwrap().unwrap();
-        let depth_one_second = depth_one_stream.next().await.unwrap().unwrap();
-        assert_eq!(batch_values(&depth_one_first), vec![1]);
-        assert_eq!(batch_values(&depth_one_second), vec![2]);
+        for expected in 1..=3 {
+            let batch = depth_one_stream.next().await.unwrap().unwrap();
+            assert_eq!(batch_values(&batch), vec![expected]);
+        }
         assert!(depth_one_control.has_request_for(1));
         assert!(!depth_one_control.has_request_for(2));
         assert!(!depth_one_control.has_request_for(3));
@@ -990,15 +1067,18 @@ mod tests {
         let (_, depth_four_context) = fixture.lookahead_context_with_depth(4);
         let mut depth_four_stream =
             fixture.lookahead_stream(depth_four_control.clone(), depth_four_context);
-        let mut output = vec![depth_four_stream.next().await.unwrap().unwrap()];
-        assert_eq!(batch_values(&output[0]), vec![1]);
-        output.push(depth_four_stream.next().await.unwrap().unwrap());
-        output.push(depth_four_stream.next().await.unwrap().unwrap());
-        assert_eq!(batch_values(&output[2]), vec![3]);
+        let mut output = Vec::new();
+        for expected in 1..=3 {
+            let batch = depth_four_stream.next().await.unwrap().unwrap();
+            assert_eq!(batch_values(&batch), vec![expected]);
+            output.push(batch);
+        }
 
         assert!(depth_four_control.has_request_for(1));
         assert!(depth_four_control.has_request_for(2));
         assert!(depth_four_control.has_request_for(3));
+        assert_eq!(batch_values(&serial[3]), vec![4]);
+        assert_eq!(output.len(), 3, "an RG0 output batch remains pending");
 
         output.extend(depth_four_stream.try_collect::<Vec<_>>().await.unwrap());
         assert_eq!(output, serial);
@@ -1127,44 +1207,73 @@ mod tests {
                 coordinator.range_permits.available_permits(),
                 MAX_IN_FLIGHT_RANGES
             );
+            assert_shared_budgets_released(&coordinator);
             assert!(stream.next().await.is_none());
         }
     }
 
     #[tokio::test]
     async fn speculative_error_is_deferred_until_foreground_reader_drains() {
-        let fixture = ThreeRowGroupFixture::new();
-        for (depth, failed_row_group, expected_output) in
-            [(1, 1, vec![1, 2]), (4, 2, vec![1, 2, 3, 4, 5])]
-        {
-            let control = ScriptControl::failing(failed_row_group);
-            let (coordinator, context) = fixture.lookahead_context_with_depth(depth);
-            let reservation = Arc::clone(&context.reservation);
-            let mut stream = fixture.lookahead_stream(control.clone(), context);
-            let mut output = Vec::new();
-            let error = loop {
-                match stream.next().await {
-                    Some(Ok(batch)) => output.extend(batch_values(&batch)),
-                    Some(Err(error)) => break error,
-                    None => panic!("speculative error must be surfaced"),
-                }
-            };
+        let depth_one_fixture = ThreeRowGroupFixture::new();
+        let depth_one_control = ScriptControl::failing(1);
+        let (depth_one_coordinator, depth_one_context) =
+            depth_one_fixture.lookahead_context_with_depth(1);
+        let depth_one_reservation = Arc::clone(&depth_one_context.reservation);
+        let mut depth_one_stream = depth_one_fixture
+            .lookahead_stream(depth_one_control.clone(), depth_one_context);
+        let depth_one_error = depth_one_stream.next().await.unwrap().unwrap();
+        let depth_one_second = depth_one_stream.next().await.unwrap().unwrap();
+        let depth_one_failure = depth_one_stream.next().await.unwrap().unwrap_err();
 
-            assert_eq!(output, expected_output);
-            assert!(
-                error
-                    .to_string()
-                    .contains(&format!("scripted row-group {failed_row_group} failure"))
-            );
-            assert!(!control.has_request_for(failed_row_group + 1));
-            assert_eq!(control.active_fetches(), 0);
-            assert_eq!(reservation.size(), 0);
-            assert_eq!(
-                coordinator.range_permits.available_permits(),
-                MAX_IN_FLIGHT_RANGES
-            );
-            assert!(stream.next().await.is_none());
+        assert_eq!(batch_values(&depth_one_error), vec![1]);
+        assert_eq!(batch_values(&depth_one_second), vec![2]);
+        assert!(
+            depth_one_failure
+                .to_string()
+                .contains("scripted row-group 1 failure")
+        );
+        assert!(!depth_one_control.has_request_for(2));
+        assert_eq!(depth_one_reservation.size(), 0);
+        assert_shared_budgets_released(&depth_one_coordinator);
+
+        let fixture = ThreeRowGroupFixture::with_row_group_count_and_rows_per_group_and_filter_columns(
+            4,
+            5,
+            &LOOKAHEAD_FILTER_COLUMNS,
+        );
+        let healthy_control = ScriptControl::new(None);
+        let (_, healthy_context) = fixture.lookahead_context_with_depth(4);
+        let mut healthy_stream =
+            fixture.lookahead_stream(healthy_control.clone(), healthy_context);
+        for expected in 1..=3 {
+            let batch = healthy_stream.next().await.unwrap().unwrap();
+            assert_eq!(batch_values(&batch), vec![expected]);
         }
+        assert!(healthy_control.has_request_for(3));
+        drop(healthy_stream);
+
+        let control = ScriptControl::failing(2);
+        let (coordinator, context) = fixture.lookahead_context_with_depth(4);
+        let reservation = Arc::clone(&context.reservation);
+        let mut stream = fixture.lookahead_stream(control.clone(), context);
+        let mut output = Vec::new();
+        let error = loop {
+            match stream.next().await {
+                Some(Ok(batch)) => output.extend(batch_values(&batch)),
+                Some(Err(error)) => break error,
+                None => panic!("speculative error must be surfaced"),
+            }
+        };
+
+        assert_eq!(output, (1..=9).collect::<Vec<_>>());
+        assert!(error.to_string().contains("scripted row-group 2 failure"));
+        assert!(control.has_request_for(1));
+        assert!(control.has_request_for(2));
+        assert!(!control.has_request_for(3));
+        assert_eq!(control.active_fetches(), 0);
+        assert_eq!(reservation.size(), 0);
+        assert_shared_budgets_released(&coordinator);
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
@@ -1304,42 +1413,46 @@ mod tests {
 
     #[tokio::test]
     async fn pending_decoder_run_is_not_prefetched_across_boundary() {
-        let fixture = ThreeRowGroupFixture::new();
+        let fixture = ThreeRowGroupFixture::with_row_group_count_and_filter_columns(
+            5,
+            &LOOKAHEAD_FILTER_COLUMNS,
+        );
         let (serial, _) = fixture.serial_oracle().await;
-        for depth in [1, 4] {
-            let control = ScriptControl::new(Some(1));
-            let (_, context) = fixture.lookahead_context_with_depth(depth);
-            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
-            let decoder =
-                fixture.decoder_for_row_groups(Some(vec![0]), &arrow_reader_metrics);
-            let pending_decoder =
-                fixture.decoder_for_row_groups(Some(vec![1, 2]), &arrow_reader_metrics);
-            let mut stream = LookaheadPushDecoderStreamState::new(
-                decoder,
-                VecDeque::from([pending_decoder]),
-                fixture.reader(control.clone()),
-                fixture.output_state(arrow_reader_metrics),
-                context,
-            )
-            .into_stream();
+        let control = ScriptControl::new(Some(3));
+        let (_, context) = fixture.lookahead_context_with_depth(4);
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let decoder =
+            fixture.decoder_for_row_groups(Some(vec![0, 1, 2]), &arrow_reader_metrics);
+        let pending_decoder =
+            fixture.decoder_for_row_groups(Some(vec![3, 4]), &arrow_reader_metrics);
+        let mut stream = LookaheadPushDecoderStreamState::new(
+            decoder,
+            VecDeque::from([pending_decoder]),
+            fixture.reader(control.clone()),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .into_stream();
 
-            let first = stream.next().await.unwrap().unwrap();
-            let second = stream.next().await.unwrap().unwrap();
-            assert_eq!(batch_values(&first), vec![1]);
-            assert_eq!(batch_values(&second), vec![2]);
-            assert!(!control.has_request_for(1));
-
-            let mut next = Box::pin(stream.next());
-            assert!(matches!(futures::poll!(next.as_mut()), Poll::Pending));
-            assert!(control.has_request_for(1));
-            assert!(!control.has_request_for(2));
-
-            control.release();
-            let third = next.await.unwrap().unwrap();
-            let mut lookahead = vec![first, second, third];
-            lookahead.extend(stream.try_collect::<Vec<_>>().await.unwrap());
-            assert_eq!(lookahead, serial);
+        let mut output = Vec::new();
+        for expected in 1..=8 {
+            let batch = stream.next().await.unwrap().unwrap();
+            assert_eq!(batch_values(&batch), vec![expected]);
+            output.push(batch);
+            assert!(!control.has_request_for(3));
         }
+        assert!(control.has_request_for(1));
+        assert!(control.has_request_for(2));
+
+        let mut next = Box::pin(stream.next());
+        assert!(matches!(futures::poll!(next.as_mut()), Poll::Pending));
+        assert!(control.has_request_for(3));
+        assert!(!control.has_request_for(4));
+
+        control.release();
+        output.push(next.await.unwrap().unwrap());
+        output.extend(stream.try_collect::<Vec<_>>().await.unwrap());
+        assert_eq!(output, serial);
     }
 
     #[tokio::test]
@@ -1387,6 +1500,7 @@ mod tests {
                 coordinator.range_permits.available_permits(),
                 MAX_IN_FLIGHT_RANGES
             );
+            assert_shared_budgets_released(&coordinator);
         }
     }
 
@@ -1483,6 +1597,7 @@ mod tests {
                 coordinator.range_permits.available_permits(),
                 MAX_IN_FLIGHT_RANGES
             );
+            assert_shared_budgets_released(&coordinator);
         }
     }
 
@@ -1541,6 +1656,7 @@ mod tests {
                 coordinator.range_permits.available_permits(),
                 MAX_IN_FLIGHT_RANGES
             );
+            assert_shared_budgets_released(&coordinator);
         }
     }
 
@@ -1615,7 +1731,54 @@ mod tests {
                     .try_reserve(MAX_SPECULATIVE_BYTES)
                     .expect("the full byte budget must be released"),
             );
+            assert_shared_budgets_released(&coordinator);
         }
+    }
+
+    #[tokio::test]
+    async fn direct_stream_drop_releases_speculation_before_reader_teardown() {
+        let fixture = ThreeRowGroupFixture::with_row_group_count_and_rows_per_group_and_filter_columns(
+            5,
+            4,
+            &LOOKAHEAD_FILTER_COLUMNS,
+        );
+        let control = ScriptControl::new(Some(4));
+        let (coordinator, context) = fixture.lookahead_context_with_depth(4);
+        let probe = ReaderDropProbe::new(context.clone());
+        let (decoder, arrow_reader_metrics) = fixture.decoder();
+        let mut stream = LookaheadPushDecoderStreamState::new(
+            decoder,
+            VecDeque::new(),
+            fixture.reader_with_drop_probe(control.clone(), Some(probe.clone())),
+            fixture.output_state(arrow_reader_metrics),
+            context,
+        )
+        .into_stream();
+
+        for expected in 1..=4 {
+            let batch = stream.next().await.unwrap().unwrap();
+            assert_eq!(batch_values(&batch), vec![expected]);
+        }
+        control.wait_for_row_group(4).await;
+        assert!(control.has_request_for(1));
+        assert!(control.has_request_for(2));
+        assert!(control.has_request_for(3));
+        assert!(control.has_request_for(4));
+
+        drop(stream);
+
+        assert!(probe.reader_dropped.load(Ordering::SeqCst));
+        assert!(
+            probe
+                .resources_released_before_reader_drop
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(control.active_fetches(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            MAX_IN_FLIGHT_RANGES
+        );
+        assert_shared_budgets_released(&coordinator);
     }
 
     #[tokio::test]

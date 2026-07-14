@@ -24,25 +24,33 @@ use crate::util::metrics_object_store::{
     MetricsObjectStore, OBJECT_STORE_COALESCE_PARALLEL_DEFAULT,
     OBJECT_STORE_COALESCE_PARALLEL_MAX, ObjectStoreMetrics,
 };
-use crate::util::{BenchmarkRun, CommonOpt, QueryResult, print_memory_stats};
+use crate::util::{BenchmarkRun, CommonOpt, print_memory_stats};
 
+use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::{self, pretty_format_batches};
+use arrow_row::{RowConverter, SortField};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result;
+use datafusion::execution::TaskContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
-use datafusion::physical_plan::{collect, displayable};
+use datafusion::physical_plan::metrics::MetricValue;
+use datafusion::physical_plan::{
+    ExecutionPlan, collect, collect_partitioned, displayable,
+};
 use datafusion::prelude::*;
 use datafusion_common::instant::Instant;
 use datafusion_common::utils::get_available_parallelism;
 use datafusion_common::{DEFAULT_PARQUET_EXTENSION, DataFusionError, plan_err};
 use object_store::OBJECT_STORE_COALESCE_DEFAULT;
 use object_store::aws::AmazonS3Builder;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use clap::Args;
@@ -56,6 +64,141 @@ const OBJECT_STORE_COALESCE_GAP_ENV: &str = "TPCDS_OBJECT_STORE_COALESCE_GAP_BYT
 const OBJECT_STORE_COALESCE_PARALLELISM_ENV: &str =
     "TPCDS_OBJECT_STORE_COALESCE_PARALLELISM";
 const Q39_REUSE_CONTROL_ENV: &str = "TPCDS_Q39_REUSE_CONTROL";
+const ROW_GROUP_PREFETCH_METRICS_LABEL: &str = "TPCDS_ROW_GROUP_PREFETCH_METRICS";
+// `q39_reuse::materialize` does not expose its physical plan. Keep this query
+// local so the benchmark can retain metrics from the Parquet-reading phase.
+const Q39_REUSE_INV_SQL: &str = r#"
+SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy,
+       stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+FROM (
+    SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy,
+           stddev_samp(inv_quantity_on_hand) stdev,
+           avg(inv_quantity_on_hand) mean
+    FROM inventory, item, warehouse, date_dim
+    WHERE inv_item_sk = i_item_sk
+      AND inv_warehouse_sk = w_warehouse_sk
+      AND inv_date_sk = d_date_sk
+      AND d_year = 1998
+      AND d_moy IN (4, 5)
+    GROUP BY w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy
+) foo
+WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1
+"#;
+
+struct QueryOutput {
+    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+}
+
+struct PlannedQuery {
+    physical_plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+}
+
+struct StatementExecution {
+    output: QueryOutput,
+    physical_plan: Arc<dyn ExecutionPlan>,
+}
+
+struct IterationExecution {
+    output: QueryOutput,
+    physical_plans: Vec<Arc<dyn ExecutionPlan>>,
+}
+
+struct TpcdsQueryResult {
+    elapsed: std::time::Duration,
+    row_count: usize,
+    result_hash: String,
+}
+
+/// Benchmark projection of Route B metrics.
+///
+/// This snapshot cannot prove the global 256 MiB cap; that gate requires
+/// shared-permit-pool and effective-configuration evidence.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+struct RowGroupPrefetchMetrics {
+    metric_plan_nodes: usize,
+    prefetch_observed_exact_bytes: usize,
+    prefetch_candidate_bytes: usize,
+    prefetch_windows: usize,
+    prefetched_ranges: usize,
+    prefetched_bytes: usize,
+    useful_staged_bytes: usize,
+    unused_staged_bytes: usize,
+    prefetch_admission_enables: usize,
+    prefetch_admission_denials: usize,
+    /// Maximum single `PrefetchRunState` watermark, not a query-wide
+    /// simultaneous-memory peak.
+    prefetch_peak_staged_bytes: usize,
+}
+
+impl RowGroupPrefetchMetrics {
+    fn accumulate_plan(&mut self, plan: &dyn ExecutionPlan) {
+        let mut matched_plan_node = false;
+        if let Some(metrics) = plan.metrics() {
+            for metric in metrics.iter() {
+                matched_plan_node |= match metric.value() {
+                    MetricValue::Count { name, count } => {
+                        self.accumulate_count(name, count.value())
+                    }
+                    MetricValue::Gauge { name, gauge }
+                        if name == "prefetch_peak_staged_bytes" =>
+                    {
+                        self.prefetch_peak_staged_bytes =
+                            self.prefetch_peak_staged_bytes.max(gauge.value());
+                        true
+                    }
+                    _ => false,
+                };
+            }
+        }
+        if matched_plan_node {
+            self.metric_plan_nodes += 1;
+        }
+        for child in plan.children() {
+            self.accumulate_plan(child.as_ref());
+        }
+    }
+
+    fn accumulate_count(&mut self, name: &str, value: usize) -> bool {
+        let target = match name {
+            "prefetch_observed_exact_bytes" => &mut self.prefetch_observed_exact_bytes,
+            "prefetch_candidate_bytes" => &mut self.prefetch_candidate_bytes,
+            "prefetch_windows" => &mut self.prefetch_windows,
+            "prefetched_ranges" => &mut self.prefetched_ranges,
+            "prefetched_bytes" => &mut self.prefetched_bytes,
+            "useful_staged_bytes" => &mut self.useful_staged_bytes,
+            "unused_staged_bytes" => &mut self.unused_staged_bytes,
+            "prefetch_admission_enables" => &mut self.prefetch_admission_enables,
+            "prefetch_admission_denials" => &mut self.prefetch_admission_denials,
+            _ => return false,
+        };
+        *target += value;
+        true
+    }
+}
+
+fn row_group_prefetch_metrics(
+    plans: &[Arc<dyn ExecutionPlan>],
+) -> RowGroupPrefetchMetrics {
+    let mut metrics = RowGroupPrefetchMetrics::default();
+    for plan in plans {
+        metrics.accumulate_plan(plan.as_ref());
+    }
+    metrics
+}
+
+fn row_group_prefetch_metrics_line(
+    query: usize,
+    iteration: usize,
+    metrics: &RowGroupPrefetchMetrics,
+) -> Result<String> {
+    let json = serde_json::to_string(metrics)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    Ok(format!(
+        "{ROW_GROUP_PREFETCH_METRICS_LABEL} query={query} iteration={iteration} {json}"
+    ))
+}
 
 pub const TPCDS_TABLES: &[&str] = &[
     "call_center",
@@ -201,7 +344,11 @@ impl RunOpt {
             match query_run {
                 Ok(query_results) => {
                     for iter in query_results {
-                        benchmark_run.write_iter(iter.elapsed, iter.row_count);
+                        benchmark_run.write_iter_with_result_hash(
+                            iter.elapsed,
+                            iter.row_count,
+                            Some(iter.result_hash),
+                        );
                     }
                 }
                 Err(e) => {
@@ -220,7 +367,7 @@ impl RunOpt {
         query_id: usize,
         ctx: &SessionContext,
         object_store_metrics: Option<&ObjectStoreMetrics>,
-    ) -> Result<Vec<QueryResult>> {
+    ) -> Result<Vec<TpcdsQueryResult>> {
         let mut millis = vec![];
         // run benchmark
         let mut query_results = vec![];
@@ -242,38 +389,58 @@ impl RunOpt {
             }
             let start = Instant::now();
 
-            // query 15 is special, with 3 statements. the second statement is the one from which we
-            // want to capture the results
+            // Retain every successful statement plan while only the final statement
+            // supplies the result batches and schema.
             let result = if q39_reuse_control {
                 self.execute_q39_reuse_consumers(ctx, i, &q39_reuse::consumer_sql())
                     .await?
             } else {
-                let mut result = vec![];
-
-                for query in sql {
-                    result = self.execute_query(ctx, query).await?;
-                }
-
-                result
+                self.execute_statements(ctx, sql, Vec::new(), "TPC-DS query is empty")
+                    .await?
             };
 
             let elapsed = start.elapsed();
-            if let Some(metrics) = object_store_metrics {
+            let object_store_metrics_line = if let Some(metrics) = object_store_metrics {
                 let snapshot = metrics.snapshot();
                 let json = serde_json::to_string(&snapshot)
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                println!(
+                Some(format!(
                     "TPCDS_OBJECT_STORE_METRICS query={query_id} iteration={i} {json}"
-                );
-            }
+                ))
+            } else {
+                None
+            };
             let ms = elapsed.as_secs_f64() * 1000.0;
             millis.push(ms);
-            info!("output:\n\n{}\n\n", pretty_format_batches(&result)?);
-            let row_count = result.iter().map(|b| b.num_rows()).sum();
+            let formatted_output = pretty_format_batches(&result.output.batches)?;
+            let row_count = result
+                .output
+                .batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum();
+            let result_hash =
+                canonical_result_hash(&result.output.schema, &result.output.batches)?;
+            let prefetch_metrics = row_group_prefetch_metrics(&result.physical_plans);
+            let prefetch_metrics_line =
+                row_group_prefetch_metrics_line(query_id, i, &prefetch_metrics)?;
+
+            if let Some(line) = object_store_metrics_line {
+                println!("{line}");
+            }
+            println!("{prefetch_metrics_line}");
+            info!("output:\n\n{formatted_output}\n\n");
+            println!(
+                "TPCDS_RESULT_HASH query={query_id} iteration={i} sha256={result_hash} rows={row_count}"
+            );
             println!(
                 "Query {query_id} iteration {i} took {ms:.1} ms and returned {row_count} rows"
             );
-            query_results.push(QueryResult { elapsed, row_count });
+            query_results.push(TpcdsQueryResult {
+                elapsed,
+                row_count,
+                result_hash,
+            });
         }
 
         let avg = millis.iter().sum::<f64>() / millis.len() as f64;
@@ -312,7 +479,34 @@ impl RunOpt {
         &self,
         ctx: &SessionContext,
         sql: &str,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> Result<StatementExecution> {
+        let PlannedQuery {
+            physical_plan,
+            task_ctx,
+        } = self.plan_query(ctx, sql).await?;
+        let result = collect(Arc::clone(&physical_plan), task_ctx).await?;
+        if self.common.debug {
+            println!(
+                "=== Physical plan with metrics ===\n{}\n",
+                DisplayableExecutionPlan::with_metrics(physical_plan.as_ref())
+                    .indent(true)
+            );
+            if !result.is_empty() {
+                // do not call print_batches if there are no batches as the result is confusing
+                // and makes it look like there is a batch with no columns
+                pretty::print_batches(&result)?;
+            }
+        }
+        Ok(StatementExecution {
+            output: QueryOutput {
+                batches: result,
+                schema: physical_plan.schema(),
+            },
+            physical_plan,
+        })
+    }
+
+    async fn plan_query(&self, ctx: &SessionContext, sql: &str) -> Result<PlannedQuery> {
         let debug = self.common.debug;
         let plan = ctx.sql(sql).await?;
         let (state, plan) = plan.into_parts();
@@ -332,20 +526,68 @@ impl RunOpt {
                 displayable(physical_plan.as_ref()).indent(true)
             );
         }
-        let result = collect(physical_plan.clone(), state.task_ctx()).await?;
-        if debug {
+        Ok(PlannedQuery {
+            physical_plan,
+            task_ctx: state.task_ctx(),
+        })
+    }
+
+    async fn execute_statements(
+        &self,
+        ctx: &SessionContext,
+        statements: &[String],
+        mut physical_plans: Vec<Arc<dyn ExecutionPlan>>,
+        empty_error: &str,
+    ) -> Result<IterationExecution> {
+        let mut output = None;
+        for statement in statements {
+            let execution = self.execute_query(ctx, statement).await?;
+            output = Some(execution.output);
+            physical_plans.push(execution.physical_plan);
+        }
+        let output =
+            output.ok_or_else(|| DataFusionError::Execution(empty_error.to_string()))?;
+        Ok(IterationExecution {
+            output,
+            physical_plans,
+        })
+    }
+
+    async fn materialize_q39_reuse(
+        &self,
+        ctx: &SessionContext,
+    ) -> Result<(q39_reuse::MaterializedInv, Arc<dyn ExecutionPlan>)> {
+        let PlannedQuery {
+            physical_plan,
+            task_ctx,
+        } = self.plan_query(ctx, Q39_REUSE_INV_SQL).await?;
+        let schema = physical_plan.schema();
+        let partitions =
+            collect_partitioned(Arc::clone(&physical_plan), task_ctx).await?;
+        if self.common.debug {
             println!(
                 "=== Physical plan with metrics ===\n{}\n",
                 DisplayableExecutionPlan::with_metrics(physical_plan.as_ref())
                     .indent(true)
             );
-            if !result.is_empty() {
-                // do not call print_batches if there are no batches as the result is confusing
-                // and makes it look like there is a batch with no columns
-                pretty::print_batches(&result)?;
-            }
         }
-        Ok(result)
+        let stats = q39_reuse::Q39ReuseStats {
+            rows: partitions.iter().flatten().map(RecordBatch::num_rows).sum(),
+            batches: partitions.iter().flatten().count(),
+            estimated_bytes: partitions
+                .iter()
+                .flatten()
+                .map(RecordBatch::get_array_memory_size)
+                .sum(),
+        };
+        let table = MemTable::try_new(schema, partitions)?;
+        Ok((
+            q39_reuse::MaterializedInv {
+                table: Arc::new(table),
+                stats,
+            },
+            physical_plan,
+        ))
     }
 
     async fn execute_q39_reuse_consumers(
@@ -353,8 +595,9 @@ impl RunOpt {
         ctx: &SessionContext,
         iteration: usize,
         consumers: &[String],
-    ) -> Result<Vec<RecordBatch>> {
-        let materialized = q39_reuse::materialize(ctx).await?;
+    ) -> Result<IterationExecution> {
+        let (materialized, materialization_plan) =
+            self.materialize_q39_reuse(ctx).await?;
         ctx.register_table(Q39_REUSE_TABLE, materialized.table)?;
         println!(
             "TPCDS_Q39_REUSE_CONTROL iteration={iteration} rows={} batches={} bytes={}",
@@ -363,14 +606,14 @@ impl RunOpt {
             materialized.stats.estimated_bytes,
         );
 
-        let execution = async {
-            let mut result = vec![];
-            for query in consumers {
-                result = self.execute_query(ctx, query).await?;
-            }
-            Ok(result)
-        }
-        .await;
+        let execution = self
+            .execute_statements(
+                ctx,
+                consumers,
+                vec![materialization_plan],
+                "TPC-DS q39 consumers are empty",
+            )
+            .await;
         let cleanup = ctx.deregister_table(Q39_REUSE_TABLE).map(|_| ());
 
         match (execution, cleanup) {
@@ -442,6 +685,121 @@ impl RunOpt {
             .partitions
             .unwrap_or_else(get_available_parallelism)
     }
+}
+
+fn canonical_result_hash(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hash_length_prefixed(&mut hasher, b"tpcds-result-v3-arrow-row");
+    write_schema_identity(&mut hasher, schema);
+    let converter = RowConverter::new(
+        schema
+            .fields()
+            .iter()
+            .map(|field| SortField::new(field.data_type().clone()))
+            .collect(),
+    )?;
+
+    let mut rows = Vec::new();
+    for batch in batches {
+        if batch.schema() != *schema {
+            return plan_err!("TPC-DS result batches have inconsistent schemas");
+        }
+        if schema.fields().is_empty() {
+            rows.resize_with(rows.len().saturating_add(batch.num_rows()), Vec::new);
+            continue;
+        }
+        let converted = converter.convert_columns(batch.columns())?;
+        if converted.num_rows() != batch.num_rows() {
+            return plan_err!("TPC-DS result row conversion changed the row count");
+        }
+        rows.extend(converted.iter().map(|row| row.as_ref().to_vec()));
+    }
+    rows.sort_unstable();
+    hash_u64(&mut hasher, u64::try_from(rows.len()).unwrap_or(u64::MAX));
+    for row in rows {
+        hash_length_prefixed(&mut hasher, &row);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn write_schema_identity(hasher: &mut Sha256, schema: &SchemaRef) {
+    hash_u64(
+        hasher,
+        u64::try_from(schema.fields().len()).unwrap_or(u64::MAX),
+    );
+    for field in schema.fields() {
+        write_field_identity(hasher, field);
+    }
+    write_metadata(hasher, schema.metadata());
+}
+
+fn write_field_identity(hasher: &mut Sha256, field: &Field) {
+    hash_length_prefixed(hasher, field.name().as_bytes());
+    hasher.update([u8::from(field.is_nullable())]);
+    write_metadata(hasher, field.metadata());
+    write_data_type_identity(hasher, field.data_type());
+}
+
+fn write_data_type_identity(hasher: &mut Sha256, data_type: &DataType) {
+    hash_length_prefixed(hasher, data_type.to_string().as_bytes());
+    match data_type {
+        DataType::List(field)
+        | DataType::ListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::LargeList(field)
+        | DataType::LargeListView(field)
+        | DataType::Map(field, _) => write_field_identity(hasher, field),
+        DataType::Struct(fields) => {
+            hash_u64(hasher, u64::try_from(fields.len()).unwrap_or(u64::MAX));
+            for field in fields {
+                write_field_identity(hasher, field);
+            }
+        }
+        DataType::Union(fields, _) => {
+            hash_u64(hasher, u64::try_from(fields.len()).unwrap_or(u64::MAX));
+            for (type_id, field) in fields.iter() {
+                hasher.update(type_id.to_be_bytes());
+                write_field_identity(hasher, field);
+            }
+        }
+        DataType::Dictionary(key, value) => {
+            write_data_type_identity(hasher, key);
+            write_data_type_identity(hasher, value);
+        }
+        DataType::RunEndEncoded(run_ends, values) => {
+            write_field_identity(hasher, run_ends);
+            write_field_identity(hasher, values);
+        }
+        _ => {}
+    }
+}
+
+fn write_metadata(
+    hasher: &mut Sha256,
+    metadata: &std::collections::HashMap<String, String>,
+) {
+    let mut entries = metadata.iter().collect::<Vec<_>>();
+    entries.sort_unstable_by(|left, right| {
+        left.0.cmp(right.0).then_with(|| left.1.cmp(right.1))
+    });
+    hash_u64(hasher, u64::try_from(entries.len()).unwrap_or(u64::MAX));
+    for (key, value) in entries {
+        hash_length_prefixed(hasher, key.as_bytes());
+        hash_length_prefixed(hasher, value.as_bytes());
+    }
+}
+
+fn hash_u64(target: &mut Sha256, value: u64) {
+    target.update(value.to_be_bytes());
+}
+
+fn hash_length_prefixed(target: &mut Sha256, value: &[u8]) {
+    hash_u64(target, u64::try_from(value.len()).unwrap_or(u64::MAX));
+    target.update(value);
 }
 
 fn register_s3_object_store(
@@ -580,6 +938,407 @@ fn s3_object_store_url(path: &str) -> Result<Option<ObjectStoreUrl>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::builder::{
+        StringBuilder, StringDictionaryBuilder, StringViewBuilder,
+    };
+    use arrow::array::{Array, ArrayRef, Int32Array, ListArray};
+    use arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema};
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::metrics::{
+        ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+    };
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, PlanProperties, SendableRecordBatchStream,
+    };
+
+    #[test]
+    fn result_hash_ignores_batch_and_row_order() {
+        let schema = hash_schema("value", true);
+        let one_batch = vec![int_batch(
+            Arc::clone(&schema),
+            vec![Some(1), None, Some(2), Some(2)],
+        )];
+        let reordered_batches = vec![
+            int_batch(Arc::clone(&schema), vec![Some(2), Some(1)]),
+            int_batch(Arc::clone(&schema), vec![None, Some(2)]),
+        ];
+
+        let hash = canonical_result_hash(&schema, &one_batch).unwrap();
+        assert_eq!(hash.len(), 64);
+        assert_eq!(
+            hash,
+            canonical_result_hash(&schema, &reordered_batches).unwrap()
+        );
+    }
+
+    #[test]
+    fn result_hash_changes_for_values_nulls_duplicates_and_schema() {
+        let schema = hash_schema("value", true);
+        let baseline = canonical_result_hash(
+            &schema,
+            &[int_batch(Arc::clone(&schema), vec![Some(1), None, Some(2)])],
+        )
+        .unwrap();
+        let changed_value = canonical_result_hash(
+            &schema,
+            &[int_batch(Arc::clone(&schema), vec![Some(1), None, Some(3)])],
+        )
+        .unwrap();
+        let changed_null = canonical_result_hash(
+            &schema,
+            &[int_batch(
+                Arc::clone(&schema),
+                vec![Some(1), Some(0), Some(2)],
+            )],
+        )
+        .unwrap();
+        let changed_duplicate = canonical_result_hash(
+            &schema,
+            &[int_batch(
+                Arc::clone(&schema),
+                vec![Some(1), None, Some(2), Some(2)],
+            )],
+        )
+        .unwrap();
+        let schema_changed = hash_schema("different_value", true);
+        let changed_schema = canonical_result_hash(
+            &schema_changed,
+            &[int_batch(
+                Arc::clone(&schema_changed),
+                vec![Some(1), None, Some(2)],
+            )],
+        )
+        .unwrap();
+
+        for changed in [
+            changed_value,
+            changed_null,
+            changed_duplicate,
+            changed_schema,
+        ] {
+            assert_ne!(baseline, changed);
+        }
+    }
+
+    #[test]
+    fn result_hash_distinguishes_nested_list_values_that_display_ambiguously() {
+        let one_value = Arc::new(ListArray::from_nested_iter::<StringBuilder, _, _, _>([
+            Some(vec![Some("a, b")]),
+        ])) as ArrayRef;
+        let two_values =
+            Arc::new(ListArray::from_nested_iter::<StringBuilder, _, _, _>([
+                Some(vec![Some("a"), Some("b")]),
+            ])) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "nested",
+            one_value.data_type().clone(),
+            true,
+        )]));
+        let one_batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![one_value]).unwrap();
+        let two_batch = RecordBatch::try_new(schema.clone(), vec![two_values]).unwrap();
+
+        assert_ne!(
+            canonical_result_hash(&schema, &[one_batch]).unwrap(),
+            canonical_result_hash(&schema, &[two_batch]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn result_hash_normalizes_utf8_view_backing_layout_and_batches() {
+        let logical_first = "the first logical string stored out of line";
+        let logical_second = "the second logical string stored out of line";
+        let mut compact = StringViewBuilder::new().with_fixed_block_size(64);
+        compact.append_value(logical_first);
+        compact.append_value(logical_second);
+        let compact = Arc::new(compact.finish()) as ArrayRef;
+
+        let mut first_backing = StringViewBuilder::new().with_fixed_block_size(128);
+        first_backing.append_value("an unused prefix in the first backing buffer");
+        first_backing.append_value(logical_first);
+        let first_backing = Arc::new(first_backing.finish().slice(1, 1)) as ArrayRef;
+        let mut second_backing = StringViewBuilder::new().with_fixed_block_size(256);
+        second_backing.append_value("an unused prefix in another backing buffer");
+        second_backing.append_value(logical_second);
+        let second_backing = Arc::new(second_backing.finish().slice(1, 1)) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "view",
+            DataType::Utf8View,
+            false,
+        )]));
+
+        let compact_batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![compact]).unwrap();
+        let first_batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![first_backing]).unwrap();
+        let second_batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![second_backing]).unwrap();
+        assert_eq!(
+            canonical_result_hash(&schema, &[compact_batch]).unwrap(),
+            canonical_result_hash(&schema, &[second_batch, first_batch]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn result_hash_hydrates_dictionary_values_and_ignores_unused_entries() {
+        let mut compact = StringDictionaryBuilder::<Int32Type>::new();
+        compact.append("same logical value").unwrap();
+        let compact = Arc::new(compact.finish()) as ArrayRef;
+
+        let mut expanded = StringDictionaryBuilder::<Int32Type>::new();
+        expanded.append("unused dictionary value").unwrap();
+        expanded.append("same logical value").unwrap();
+        let expanded = Arc::new(expanded.finish().slice(1, 1)) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            compact.data_type().clone(),
+            false,
+        )]));
+
+        let compact_batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![compact]).unwrap();
+        let expanded_batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![expanded]).unwrap();
+        assert_eq!(
+            canonical_result_hash(&schema, &[compact_batch]).unwrap(),
+            canonical_result_hash(&schema, &[expanded_batch]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn result_hash_rejects_unsupported_arrow_types_cleanly() {
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int32, true),
+            ])),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "unsupported_map",
+            DataType::Map(Arc::new(entries), false),
+            true,
+        )]));
+        let error = canonical_result_hash(
+            &schema,
+            &[RecordBatch::new_empty(Arc::clone(&schema))],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Row format support"));
+    }
+
+    fn hash_schema(name: &str, nullable: bool) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            name,
+            DataType::Int32,
+            nullable,
+        )]))
+    }
+
+    fn int_batch(schema: SchemaRef, values: Vec<Option<i32>>) -> RecordBatch {
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values)) as ArrayRef])
+            .unwrap()
+    }
+
+    const PREFETCH_COUNT_NAMES: [&str; 9] = [
+        "prefetch_observed_exact_bytes",
+        "prefetch_candidate_bytes",
+        "prefetch_windows",
+        "prefetched_ranges",
+        "prefetched_bytes",
+        "useful_staged_bytes",
+        "unused_staged_bytes",
+        "prefetch_admission_enables",
+        "prefetch_admission_denials",
+    ];
+
+    #[test]
+    fn row_group_prefetch_metrics_sum_counts_max_peak_and_aggregate_statements() {
+        let irrelevant = metric_exec_with(|metrics| {
+            MetricBuilder::new(metrics)
+                .gauge("prefetch_windows", 0)
+                .set(700);
+            MetricBuilder::new(metrics)
+                .counter("prefetch_peak_staged_bytes", 0)
+                .add(800);
+            MetricBuilder::new(metrics)
+                .counter("unrelated_count", 0)
+                .add(900);
+        });
+        let first_leaf = prefetch_metric_exec(vec![irrelevant], &[(0, 1), (1, 2)], 70);
+        let first_root = prefetch_metric_exec(vec![first_leaf], &[(2, 3)], 50);
+        let second_root = prefetch_metric_exec(vec![], &[(0, 4)], 120);
+
+        let metrics = row_group_prefetch_metrics(&[first_root, second_root]);
+
+        assert_eq!(
+            metrics,
+            RowGroupPrefetchMetrics {
+                metric_plan_nodes: 3,
+                prefetch_observed_exact_bytes: 10,
+                prefetch_candidate_bytes: 10,
+                prefetch_windows: 10,
+                prefetched_ranges: 10,
+                prefetched_bytes: 10,
+                useful_staged_bytes: 10,
+                unused_staged_bytes: 10,
+                prefetch_admission_enables: 10,
+                prefetch_admission_denials: 10,
+                prefetch_peak_staged_bytes: 120,
+            }
+        );
+    }
+
+    #[test]
+    fn row_group_prefetch_metrics_line_has_strict_json_framing_and_all_fields() {
+        let plan = prefetch_metric_exec(vec![], &[(0, 5)], 64);
+        let metrics = row_group_prefetch_metrics(&[plan]);
+        let line = row_group_prefetch_metrics_line(72, 3, &metrics).unwrap();
+
+        assert!(!line.contains('\n'));
+        let json = line
+            .strip_prefix("TPCDS_ROW_GROUP_PREFETCH_METRICS query=72 iteration=3 ")
+            .expect("strict metrics prefix");
+        assert!(json.starts_with('{') && json.ends_with('}'));
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 11);
+        assert_eq!(value["metric_plan_nodes"], 1);
+        for name in PREFETCH_COUNT_NAMES {
+            assert_eq!(value[name], 5, "metric {name}");
+        }
+        assert_eq!(value["prefetch_peak_staged_bytes"], 64);
+    }
+
+    #[tokio::test]
+    async fn execute_statements_retains_all_plans_and_only_final_output() {
+        let ctx = SessionContext::new();
+        let statements = vec![
+            "SELECT 1 AS value".to_string(),
+            "SELECT 2 AS value UNION ALL SELECT 3 AS value".to_string(),
+        ];
+
+        let result = q39_reuse_runner()
+            .execute_statements(&ctx, &statements, Vec::new(), "empty statements")
+            .await
+            .unwrap();
+
+        assert_eq!(result.physical_plans.len(), 2);
+        assert_eq!(
+            result
+                .output
+                .batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    fn prefetch_metric_exec(
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        partitions: &[(usize, usize)],
+        peak: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        metric_exec_with_children(children, |metrics| {
+            for &(partition, value) in partitions {
+                for name in PREFETCH_COUNT_NAMES {
+                    MetricBuilder::new(metrics)
+                        .counter(name, partition)
+                        .add(value);
+                }
+            }
+            MetricBuilder::new(metrics)
+                .gauge("prefetch_peak_staged_bytes", 0)
+                .set(peak);
+        })
+    }
+
+    fn metric_exec_with(
+        register: impl FnOnce(&ExecutionPlanMetricsSet),
+    ) -> Arc<dyn ExecutionPlan> {
+        metric_exec_with_children(vec![], register)
+    }
+
+    fn metric_exec_with_children(
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        register: impl FnOnce(&ExecutionPlanMetricsSet),
+    ) -> Arc<dyn ExecutionPlan> {
+        let metrics = ExecutionPlanMetricsSet::new();
+        register(&metrics);
+        Arc::new(MetricExec::new(children, metrics))
+    }
+
+    #[derive(Debug)]
+    struct MetricExec {
+        inner: EmptyExec,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        metrics: ExecutionPlanMetricsSet,
+    }
+
+    impl MetricExec {
+        fn new(
+            children: Vec<Arc<dyn ExecutionPlan>>,
+            metrics: ExecutionPlanMetricsSet,
+        ) -> Self {
+            Self {
+                inner: EmptyExec::new(Arc::new(Schema::empty())),
+                children,
+                metrics,
+            }
+        }
+    }
+
+    impl DisplayAs for MetricExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            write!(f, "MetricExec")
+        }
+    }
+
+    impl ExecutionPlan for MetricExec {
+        fn name(&self) -> &str {
+            "MetricExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            self.children.iter().collect()
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                inner: self.inner.clone(),
+                children,
+                metrics: self.metrics.clone(),
+            }))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.inner.execute(partition, context)
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            Some(self.metrics.clone_inner())
+        }
+    }
 
     #[test]
     fn derives_s3_object_store_url_from_tpcds_path() {
@@ -639,6 +1398,29 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+        assert!(ctx.table(Q39_REUSE_TABLE).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn q39_reuse_retains_materialization_and_all_consumer_plans() {
+        let ctx = SessionContext::new();
+        register_q39_fixture(&ctx).await.unwrap();
+
+        let result = q39_reuse_runner()
+            .execute_q39_reuse_consumers(&ctx, 0, &q39_reuse::consumer_sql())
+            .await
+            .unwrap();
+
+        assert_eq!(result.physical_plans.len(), 3);
+        assert_eq!(
+            result
+                .output
+                .batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            1
+        );
         assert!(ctx.table(Q39_REUSE_TABLE).await.is_err());
     }
 

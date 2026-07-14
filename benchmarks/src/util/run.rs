@@ -82,6 +82,8 @@ struct QueryIter {
     #[serde(serialize_with = "serialize_elapsed")]
     elapsed: Duration,
     row_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_hash: Option<String>,
 }
 /// A single benchmark case
 #[derive(Debug, Serialize)]
@@ -135,10 +137,25 @@ impl BenchmarkRun {
     }
     /// Write a new iteration to the current case
     pub fn write_iter(&mut self, elapsed: Duration, row_count: usize) {
+        self.write_iter_with_result_hash(elapsed, row_count, None);
+    }
+
+    /// Write an iteration result and, when available, its canonical result identity.
+    ///
+    /// The original `write_iter` API remains available for benchmark suites that
+    /// do not collect result values.
+    pub fn write_iter_with_result_hash(
+        &mut self,
+        elapsed: Duration,
+        row_count: usize,
+        result_hash: Option<String>,
+    ) {
         if let Some(idx) = self.current_case {
-            self.queries[idx]
-                .iterations
-                .push(QueryIter { elapsed, row_count })
+            self.queries[idx].iterations.push(QueryIter {
+                elapsed,
+                row_count,
+                result_hash,
+            })
         } else {
             panic!("no cases existed yet");
         }
@@ -180,5 +197,29 @@ impl BenchmarkRun {
             std::fs::write(path, self.to_json())?;
         };
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::BenchmarkRun;
+
+    #[test]
+    fn benchmark_run_serializes_optional_result_hash_compatibly() {
+        let mut run = BenchmarkRun::new();
+        run.start_new_case("Query 72");
+        run.write_iter_with_result_hash(
+            Duration::from_millis(1),
+            3,
+            Some("a".repeat(64)),
+        );
+        run.write_iter(Duration::from_millis(2), 4);
+
+        let value: serde_json::Value = serde_json::from_str(&run.to_json()).unwrap();
+        let iterations = &value["queries"][0]["iterations"];
+        assert_eq!(iterations[0]["result_hash"], "a".repeat(64));
+        assert!(iterations[1].get("result_hash").is_none());
     }
 }

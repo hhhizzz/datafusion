@@ -1700,6 +1700,7 @@ version = "54.0.0"
 dependencies = [
  "anstream",
  "arrow",
+ "arrow-row",
  "async-trait",
  "bytes",
  "clap",
@@ -1718,6 +1719,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "snmalloc-rs",
  "tempfile",
  "tokio",

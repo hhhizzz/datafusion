@@ -720,6 +720,118 @@ mod test {
     }
 
     #[test]
+    fn repartition_single_file_interleaves_ranges() {
+        let single_partition = vec![FileGroup::new(vec![pfile("a", 160)])];
+
+        let actual = FileGroupPartitioner::new()
+            .with_target_partitions(4)
+            .with_repartition_file_min_size(10)
+            .with_range_interleave_factor(4)
+            .repartition_file_groups(&single_partition);
+
+        let expected = Some(vec![
+            FileGroup::new(vec![
+                pfile("a", 160).with_range(0, 10),
+                pfile("a", 160).with_range(40, 50),
+                pfile("a", 160).with_range(80, 90),
+                pfile("a", 160).with_range(120, 130),
+            ]),
+            FileGroup::new(vec![
+                pfile("a", 160).with_range(10, 20),
+                pfile("a", 160).with_range(50, 60),
+                pfile("a", 160).with_range(90, 100),
+                pfile("a", 160).with_range(130, 140),
+            ]),
+            FileGroup::new(vec![
+                pfile("a", 160).with_range(20, 30),
+                pfile("a", 160).with_range(60, 70),
+                pfile("a", 160).with_range(100, 110),
+                pfile("a", 160).with_range(140, 150),
+            ]),
+            FileGroup::new(vec![
+                pfile("a", 160).with_range(30, 40),
+                pfile("a", 160).with_range(70, 80),
+                pfile("a", 160).with_range(110, 120),
+                pfile("a", 160).with_range(150, 160),
+            ]),
+        ]);
+        assert_partitioned_files(expected, actual);
+    }
+
+    #[test]
+    fn repartition_interleaved_ranges_preserve_source_bounds() {
+        let input = vec![FileGroup::new(vec![
+            pfile("a", 160).with_range(20, 100),
+        ])];
+
+        let actual = FileGroupPartitioner::new()
+            .with_target_partitions(4)
+            .with_repartition_file_min_size(10)
+            .with_range_interleave_factor(2)
+            .repartition_file_groups(&input);
+
+        let expected = Some(vec![
+            FileGroup::new(vec![
+                pfile("a", 160).with_range(20, 30),
+                pfile("a", 160).with_range(60, 70),
+            ]),
+            FileGroup::new(vec![
+                pfile("a", 160).with_range(30, 40),
+                pfile("a", 160).with_range(70, 80),
+            ]),
+            FileGroup::new(vec![
+                pfile("a", 160).with_range(40, 50),
+                pfile("a", 160).with_range(80, 90),
+            ]),
+            FileGroup::new(vec![
+                pfile("a", 160).with_range(50, 60),
+                pfile("a", 160).with_range(90, 100),
+            ]),
+        ]);
+        assert_partitioned_files(expected, actual);
+    }
+
+    #[test]
+    fn repartition_range_interleave_factor_one_is_unchanged() {
+        let input = vec![
+            FileGroup::new(vec![pfile("a", 40)]),
+            FileGroup::new(vec![pfile("b", 60)]),
+        ];
+
+        let default = FileGroupPartitioner::new()
+            .with_target_partitions(3)
+            .with_repartition_file_min_size(10)
+            .repartition_file_groups(&input);
+        let explicit_one = FileGroupPartitioner::new()
+            .with_target_partitions(3)
+            .with_repartition_file_min_size(10)
+            .with_range_interleave_factor(1)
+            .repartition_file_groups(&input);
+
+        assert_eq!(default, explicit_one);
+    }
+
+    #[test]
+    fn repartition_ordered_ignores_range_interleave_factor() {
+        let input = vec![FileGroup::new(vec![pfile("a", 100)])];
+
+        let actual = FileGroupPartitioner::new()
+            .with_preserve_order_within_groups(true)
+            .with_target_partitions(4)
+            .with_repartition_file_min_size(10)
+            .with_range_interleave_factor(4)
+            .repartition_file_groups(&input);
+
+        let expected = Some(vec![
+            FileGroup::new(vec![pfile("a", 100).with_range(0, 25)]),
+            FileGroup::new(vec![pfile("a", 100).with_range(25, 50)]),
+            FileGroup::new(vec![pfile("a", 100).with_range(50, 75)]),
+            FileGroup::new(vec![pfile("a", 100).with_range(75, 100)]),
+        ]);
+        assert_partitioned_files(expected, actual);
+    }
+
+    #[test]
     fn repartition_single_file_with_range() {
         // Single file, single partition into multiple partitions
         let single_partition =

@@ -30,15 +30,20 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion_common::instant::Instant;
 use futures::stream::BoxStream;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
     MultipartUpload, OBJECT_STORE_COALESCE_DEFAULT, ObjectMeta, ObjectStore,
     ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, Result, coalesce_ranges,
+    RenameOptions, Result,
 };
 use serde::Serialize;
+
+/// Default range-request concurrency used by object_store 0.13.2.
+pub const OBJECT_STORE_COALESCE_PARALLEL_DEFAULT: usize = 10;
+/// Benchmark guardrail for configurable range-request concurrency.
+pub const OBJECT_STORE_COALESCE_PARALLEL_MAX: usize = 24;
 
 #[derive(Debug, Clone, Copy)]
 enum RequestKind {
@@ -73,7 +78,11 @@ struct RequestWindow {
 #[derive(Debug, Default)]
 struct MetricsState {
     coalesce_gap_bytes: AtomicU64,
+    coalesce_parallelism: AtomicU64,
     get_ranges_calls: AtomicU64,
+    get_ranges_max_logical_ranges: AtomicU64,
+    get_ranges_max_coalesced_ranges: AtomicU64,
+    get_ranges_parallelism_saturated_calls: AtomicU64,
     logical_ranges: AtomicU64,
     logical_range_bytes: AtomicU64,
     head_requests: AtomicU64,
@@ -121,7 +130,11 @@ pub struct PathMetricsSnapshot {
 #[derive(Debug, Serialize)]
 pub struct ObjectStoreMetricsSnapshot {
     pub coalesce_gap_bytes: u64,
+    pub coalesce_parallelism: u64,
     pub get_ranges_calls: u64,
+    pub get_ranges_max_logical_ranges: u64,
+    pub get_ranges_max_coalesced_ranges: u64,
+    pub get_ranges_parallelism_saturated_calls: u64,
     pub logical_ranges: u64,
     pub logical_range_bytes: u64,
     pub head_requests: u64,
@@ -155,6 +168,9 @@ impl ObjectStoreMetrics {
     pub fn reset(&self) {
         for metric in [
             &self.state.get_ranges_calls,
+            &self.state.get_ranges_max_logical_ranges,
+            &self.state.get_ranges_max_coalesced_ranges,
+            &self.state.get_ranges_parallelism_saturated_calls,
             &self.state.logical_ranges,
             &self.state.logical_range_bytes,
             &self.state.head_requests,
@@ -273,7 +289,20 @@ impl ObjectStoreMetrics {
         let body_bytes = self.state.body_bytes.load(Ordering::Relaxed);
         ObjectStoreMetricsSnapshot {
             coalesce_gap_bytes: self.state.coalesce_gap_bytes.load(Ordering::Relaxed),
+            coalesce_parallelism: self.state.coalesce_parallelism.load(Ordering::Relaxed),
             get_ranges_calls: self.state.get_ranges_calls.load(Ordering::Relaxed),
+            get_ranges_max_logical_ranges: self
+                .state
+                .get_ranges_max_logical_ranges
+                .load(Ordering::Relaxed),
+            get_ranges_max_coalesced_ranges: self
+                .state
+                .get_ranges_max_coalesced_ranges
+                .load(Ordering::Relaxed),
+            get_ranges_parallelism_saturated_calls: self
+                .state
+                .get_ranges_parallelism_saturated_calls
+                .load(Ordering::Relaxed),
             logical_ranges: self.state.logical_ranges.load(Ordering::Relaxed),
             logical_range_bytes,
             head_requests: self.state.head_requests.load(Ordering::Relaxed),
@@ -435,32 +464,77 @@ pub struct MetricsObjectStore<T: ObjectStore> {
     inner: T,
     metrics: ObjectStoreMetrics,
     coalesce_gap_bytes: u64,
+    coalesce_parallelism: usize,
     metrics_enabled: bool,
 }
 
 impl<T: ObjectStore> MetricsObjectStore<T> {
     pub fn new(inner: T) -> Self {
-        Self::new_with_coalesce_gap(inner, OBJECT_STORE_COALESCE_DEFAULT)
+        Self::new_with_coalesce_options(
+            inner,
+            OBJECT_STORE_COALESCE_DEFAULT,
+            OBJECT_STORE_COALESCE_PARALLEL_DEFAULT,
+        )
     }
 
     pub fn new_with_coalesce_gap(inner: T, coalesce_gap_bytes: u64) -> Self {
-        Self::new_inner(inner, coalesce_gap_bytes, true)
+        Self::new_with_coalesce_options(
+            inner,
+            coalesce_gap_bytes,
+            OBJECT_STORE_COALESCE_PARALLEL_DEFAULT,
+        )
     }
 
     pub fn new_coalescing(inner: T, coalesce_gap_bytes: u64) -> Self {
-        Self::new_inner(inner, coalesce_gap_bytes, false)
+        Self::new_coalescing_with_options(
+            inner,
+            coalesce_gap_bytes,
+            OBJECT_STORE_COALESCE_PARALLEL_DEFAULT,
+        )
     }
 
-    fn new_inner(inner: T, coalesce_gap_bytes: u64, metrics_enabled: bool) -> Self {
+    /// Construct an instrumented store with explicit range coalescing options.
+    pub fn new_with_coalesce_options(
+        inner: T,
+        coalesce_gap_bytes: u64,
+        coalesce_parallelism: usize,
+    ) -> Self {
+        Self::new_inner(inner, coalesce_gap_bytes, coalesce_parallelism, true)
+    }
+
+    /// Construct a metrics-free store with explicit range coalescing options.
+    pub fn new_coalescing_with_options(
+        inner: T,
+        coalesce_gap_bytes: u64,
+        coalesce_parallelism: usize,
+    ) -> Self {
+        Self::new_inner(inner, coalesce_gap_bytes, coalesce_parallelism, false)
+    }
+
+    fn new_inner(
+        inner: T,
+        coalesce_gap_bytes: u64,
+        coalesce_parallelism: usize,
+        metrics_enabled: bool,
+    ) -> Self {
+        assert!(
+            (1..=OBJECT_STORE_COALESCE_PARALLEL_MAX).contains(&coalesce_parallelism),
+            "coalesce parallelism must be between 1 and {OBJECT_STORE_COALESCE_PARALLEL_MAX}"
+        );
         let metrics = ObjectStoreMetrics::default();
         metrics
             .state
             .coalesce_gap_bytes
             .store(coalesce_gap_bytes, Ordering::Relaxed);
+        metrics
+            .state
+            .coalesce_parallelism
+            .store(coalesce_parallelism as u64, Ordering::Relaxed);
         Self {
             inner,
             metrics,
             coalesce_gap_bytes,
+            coalesce_parallelism,
             metrics_enabled,
         }
     }
@@ -582,6 +656,7 @@ impl<T: ObjectStore> ObjectStore for MetricsObjectStore<T> {
         location: &Path,
         ranges: &[Range<u64>],
     ) -> Result<Vec<Bytes>> {
+        let fetch_ranges = merge_ranges(ranges, self.coalesce_gap_bytes);
         if self.metrics_enabled {
             self.metrics
                 .state
@@ -595,11 +670,26 @@ impl<T: ObjectStore> ObjectStore for MetricsObjectStore<T> {
                 ranges.iter().map(|range| range.end - range.start).sum(),
                 Ordering::Relaxed,
             );
+            self.metrics
+                .state
+                .get_ranges_max_logical_ranges
+                .fetch_max(ranges.len() as u64, Ordering::Relaxed);
+            self.metrics
+                .state
+                .get_ranges_max_coalesced_ranges
+                .fetch_max(fetch_ranges.len() as u64, Ordering::Relaxed);
+            if fetch_ranges.len() > self.coalesce_parallelism {
+                self.metrics
+                    .state
+                    .get_ranges_parallelism_saturated_calls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
-        coalesce_ranges(
+        coalesce_ranges_with_parallelism(
             ranges,
+            &fetch_ranges,
             |range| self.get_coalesced_range(location, range),
-            self.coalesce_gap_bytes,
+            self.coalesce_parallelism,
         )
         .await
     }
@@ -648,6 +738,69 @@ impl<T: ObjectStore> ObjectStore for MetricsObjectStore<T> {
     ) -> Result<()> {
         self.inner.rename_opts(from, to, options).await
     }
+}
+
+async fn coalesce_ranges_with_parallelism<F, E, Fut>(
+    ranges: &[Range<u64>],
+    fetch_ranges: &[Range<u64>],
+    fetch: F,
+    parallelism: usize,
+) -> std::result::Result<Vec<Bytes>, E>
+where
+    F: Send + FnMut(Range<u64>) -> Fut,
+    E: Send,
+    Fut: std::future::Future<Output = std::result::Result<Bytes, E>> + Send,
+{
+    let fetched: Vec<_> = futures::stream::iter(fetch_ranges.iter().cloned())
+        .map(fetch)
+        .buffered(parallelism)
+        .try_collect()
+        .await?;
+
+    Ok(ranges
+        .iter()
+        .map(|range| {
+            let idx = fetch_ranges
+                .partition_point(|candidate| candidate.start <= range.start)
+                - 1;
+            let fetch_range = &fetch_ranges[idx];
+            let fetch_bytes = &fetched[idx];
+            let start = range.start - fetch_range.start;
+            let end = range.end - fetch_range.start;
+            fetch_bytes.slice((start as usize)..(end as usize).min(fetch_bytes.len()))
+        })
+        .collect())
+}
+
+fn merge_ranges(ranges: &[Range<u64>], coalesce_gap_bytes: u64) -> Vec<Range<u64>> {
+    if ranges.is_empty() {
+        return vec![];
+    }
+
+    let mut ranges = ranges.to_vec();
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged = Vec::with_capacity(ranges.len());
+    let mut start_idx = 0;
+    let mut end_idx = 1;
+
+    while start_idx != ranges.len() {
+        let mut range_end = ranges[start_idx].end;
+        while end_idx != ranges.len()
+            && ranges[end_idx]
+                .start
+                .checked_sub(range_end)
+                .map(|gap| gap <= coalesce_gap_bytes)
+                .unwrap_or(true)
+        {
+            range_end = range_end.max(ranges[end_idx].end);
+            end_idx += 1;
+        }
+
+        merged.push(ranges[start_idx].start..range_end);
+        start_idx = end_idx;
+        end_idx += 1;
+    }
+    merged
 }
 
 struct RequestTracker {

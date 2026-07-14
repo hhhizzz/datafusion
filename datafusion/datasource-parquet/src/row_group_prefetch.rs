@@ -85,10 +85,6 @@ impl RowGroupPrefetchPlan {
     }
 
     /// Returns the final decoder order, including a reverse scan order.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 5 advances plans by row group.")
-    )]
     pub(crate) fn row_group_order(&self) -> &[usize] {
         &self.row_group_order
     }
@@ -105,7 +101,6 @@ impl RowGroupPrefetchPlan {
             .into_iter()
             .filter_map(|index| self.ranges_by_row_group.get(&index))
             .flat_map(|ranges| ranges.iter().cloned())
-            .flat_map(split_large_range)
             .collect::<Vec<_>>();
         ranges.sort_unstable_by_key(|range| (range.start, range.end));
         merge_ranges(ranges)
@@ -399,20 +394,6 @@ impl RowGroupPrefetchMetrics {
     }
 }
 
-fn split_large_range(range: Range<u64>) -> Vec<Range<u64>> {
-    let mut ranges = Vec::new();
-    let mut start = range.start;
-    while start < range.end {
-        let end = start
-            .checked_add(MAX_MERGED_RANGE)
-            .unwrap_or(range.end)
-            .min(range.end);
-        ranges.push(start..end);
-        start = end;
-    }
-    ranges
-}
-
 fn merge_ranges(ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
     let mut merged = Vec::with_capacity(ranges.len());
     for range in ranges {
@@ -479,7 +460,6 @@ mod tests {
     use super::{
         AdmissionDecision, AdmissionState, DensityAdmission, MAX_MERGE_GAP,
         MAX_MERGED_RANGE, RowGroupPrefetchMetrics, RowGroupPrefetchPlan,
-        split_large_range,
     };
 
     #[test]
@@ -575,14 +555,13 @@ mod tests {
     }
 
     #[test]
-    fn splits_large_ranges_near_u64_max_without_overflow() {
-        let start = u64::MAX - (MAX_MERGED_RANGE * 2) - 1;
-        let ranges = split_large_range(start..u64::MAX);
+    fn preserves_an_individual_projected_chunk_larger_than_merge_limit() {
+        let metadata = metadata_with_leaf_ranges(
+            std::iter::once(0..(MAX_MERGED_RANGE + 1)).collect(),
+        );
+        let plan = leaf_plan(&metadata, vec![0]);
 
-        assert_eq!(ranges.first().unwrap().start, start);
-        assert_eq!(ranges.last().unwrap().end, u64::MAX);
-        assert!(ranges.iter().all(|range| range.end > range.start
-            && range.end - range.start <= MAX_MERGED_RANGE));
+        assert_eq!(plan.ranges_for(&[0]), vec![0..(MAX_MERGED_RANGE + 1)]);
     }
 
     #[test]

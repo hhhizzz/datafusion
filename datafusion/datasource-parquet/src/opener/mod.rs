@@ -1239,10 +1239,12 @@ impl RowGroupsPrunedParquetOpen {
             let mut prefetch_plans = VecDeque::with_capacity(runs.len());
             for run in runs {
                 let prepared_access_plan = prepare_access_plan(run.access_plan)?;
+                let prefetch_row_group_indexes = prepared_access_plan
+                    .row_group_indexes_with_selected_rows(rg_metadata)?;
                 let prefetch_plan = RowGroupPrefetchPlan::new(
                     file_metadata.as_ref(),
                     &read_plan.projection_mask,
-                    prepared_access_plan.row_group_indexes.clone(),
+                    prefetch_row_group_indexes,
                 );
                 prefetch_metrics
                     .record_candidate_bytes(prefetch_plan.projected_payload_bytes());
@@ -2050,6 +2052,34 @@ mod test {
         (data, logical_schema)
     }
 
+    fn dense_lookahead_integration_fixture() -> (Bytes, SchemaRef) {
+        let physical_schema = Arc::new(Schema::new(
+            LOOKAHEAD_COLUMNS
+                .iter()
+                .map(|name| Field::new(*name, DataType::Int32, false))
+                .collect::<Vec<_>>(),
+        ));
+        let mut state = 0x9e37_79b9_u32;
+        let values = Arc::new(TestInt32Array::from_iter_values((0..900_000).map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state | 1) as i32
+        }))) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&physical_schema),
+            (0..LOOKAHEAD_COLUMNS.len())
+                .map(|_| Arc::clone(&values))
+                .collect(),
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(300_000))
+            .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+            .set_encoding(parquet::basic::Encoding::PLAIN)
+            .build();
+        let data = encode_parquet_batches(vec![batch], Some(props));
+        (data, physical_schema)
+    }
+
     fn lookahead_integration_predicate(schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
         let sum = LOOKAHEAD_COLUMNS
             .iter()
@@ -2186,6 +2216,53 @@ mod test {
         );
         assert!(metric_value(&lookahead_metrics, "predicate_cache_inner_records") > 0);
         assert!(metric_value(&lookahead_metrics, "predicate_cache_records") > 0);
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(
+            coordinator.range_permits.available_permits(),
+            crate::lookahead::MAX_IN_FLIGHT_RANGES
+        );
+    }
+
+    #[tokio::test]
+    async fn opener_limit_disables_dense_row_group_staging() {
+        let (data, schema) = dense_lookahead_integration_fixture();
+        let file = PartitionedFile::new(
+            "dense-limited.parquet".to_string(),
+            u64::try_from(data.len()).unwrap(),
+        );
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let reader_factory = Arc::new(RecordingReaderFactory::new(data));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let pool = Arc::new(UnboundedMemoryPool::default());
+        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(2, 2));
+        let mut opener = lookahead_integration_opener(
+            store,
+            Arc::clone(&schema),
+            lookahead_integration_predicate(&schema),
+            metrics.clone(),
+            reader_factory.clone(),
+            Some(LookaheadScanContext {
+                coordinator: Arc::clone(&coordinator),
+                memory_pool: pool.clone(),
+            }),
+        );
+        opener.limit = Some(1);
+
+        let batches = open_file(&opener, file)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batch_int32_values(&batches).len(), 1);
+        assert_eq!(metric_value(&metrics, "prefetch_windows"), 0);
+        assert_eq!(metric_value(&metrics, "prefetched_ranges"), 0);
+        assert_eq!(metric_value(&metrics, "prefetched_bytes"), 0);
+        assert!(
+            !reader_factory.request_sizes().contains(&2),
+            "a two-range request would be the staged next-row-group window"
+        );
         assert_eq!(pool.reserved(), 0);
         assert_eq!(
             coordinator.range_permits.available_permits(),

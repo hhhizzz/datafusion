@@ -490,6 +490,37 @@ impl PreparedAccessPlan {
         })
     }
 
+    /// Returns the row groups that still select at least one row, in decoder
+    /// order. This leaves the original plan untouched for the Arrow decoder.
+    pub(crate) fn row_group_indexes_with_selected_rows(
+        &self,
+        row_group_meta_data: &[RowGroupMetaData],
+    ) -> Result<Vec<usize>> {
+        let Some(mut selection) = self.row_selection.clone() else {
+            return Ok(self.row_group_indexes.clone());
+        };
+
+        let mut row_group_indexes = Vec::with_capacity(self.row_group_indexes.len());
+        for &row_group_index in &self.row_group_indexes {
+            let row_group = row_group_meta_data.get(row_group_index).ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "prepared parquet access plan references missing row group {row_group_index}"
+                ))
+            })?;
+            let row_count = usize::try_from(row_group.num_rows()).map_err(|_| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "row group {row_group_index} has an invalid row count {}",
+                    row_group.num_rows()
+                ))
+            })?;
+            if selection.split_off(row_count).row_count() > 0 {
+                row_group_indexes.push(row_group_index);
+            }
+        }
+
+        Ok(row_group_indexes)
+    }
+
     /// Reorder row groups by their min statistics for the given sort order.
     ///
     /// This helps TopK queries find optimal values first. Row groups are
@@ -954,6 +985,44 @@ mod test {
             .unwrap();
 
         assert_eq!(result.row_group_indexes, vec![0, 1]);
+    }
+
+    #[test]
+    fn prefetch_row_groups_exclude_zero_row_selection_in_decoder_order() {
+        let plan = PreparedAccessPlan::new(
+            vec![2, 1, 0],
+            Some(RowSelection::from(vec![
+                RowSelector::skip(30),
+                RowSelector::select(20),
+                RowSelector::skip(10),
+            ])),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.row_group_indexes_with_selected_rows(&ROW_GROUP_METADATA)
+                .unwrap(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn prefetch_row_groups_skip_an_empty_group_inside_a_window() {
+        let plan = PreparedAccessPlan::new(
+            vec![0, 1, 2],
+            Some(RowSelection::from(vec![
+                RowSelector::select(10),
+                RowSelector::skip(20),
+                RowSelector::select(30),
+            ])),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.row_group_indexes_with_selected_rows(&ROW_GROUP_METADATA)
+                .unwrap(),
+            vec![0, 2]
+        );
     }
 
     /// One row group means nothing to reorder.

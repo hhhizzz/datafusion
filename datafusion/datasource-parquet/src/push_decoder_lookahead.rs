@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
@@ -25,10 +25,9 @@ use datafusion_common::{DataFusionError, Result};
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
-use parquet::DecodeResult;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use parquet::arrow::async_reader::AsyncFileReader;
-use parquet::arrow::push_decoder::ParquetPushDecoder;
+use parquet::arrow::push_decoder::{ParquetPushDecoder, RowGroupReaderResult};
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::PushDecoderOutputState;
@@ -80,6 +79,13 @@ struct SpeculativeResources {
     range_permits: Vec<OwnedSemaphorePermit>,
 }
 
+impl SpeculativeResources {
+    fn release(&mut self) {
+        self.leases.clear();
+        self.range_permits.clear();
+    }
+}
+
 struct StagedByteTracker {
     staged_bytes: AtomicUsize,
     metrics: RowGroupPrefetchMetrics,
@@ -102,6 +108,18 @@ struct StagedReservation {
     bytes: usize,
 }
 
+/// Prevents another staged window from being admitted while the current
+/// window's resources are retained by a future reader.
+struct StagedWindowGate {
+    active: Arc<AtomicBool>,
+}
+
+impl Drop for StagedWindowGate {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
 impl Drop for StagedReservation {
     fn drop(&mut self) {
         self.tracker
@@ -118,6 +136,7 @@ struct StagedWindowResources {
     useful_bytes_by_row_group: BTreeMap<usize, usize>,
     useful_staged_bytes: usize,
     reservation: StagedReservation,
+    gate: StagedWindowGate,
 }
 
 struct StagedWindowFinalResources {
@@ -125,14 +144,14 @@ struct StagedWindowFinalResources {
     unused_staged_bytes: usize,
     metrics: RowGroupPrefetchMetrics,
     _reservation: StagedReservation,
+    _gate: StagedWindowGate,
 }
 
 impl Drop for StagedWindowFinalResources {
     fn drop(&mut self) {
         self.metrics
             .record_unused_staged_bytes(self.unused_staged_bytes);
-        self.resources.leases.clear();
-        self.resources.range_permits.clear();
+        self.resources.release();
     }
 }
 
@@ -150,7 +169,8 @@ struct PrefetchRunState {
     staging_enabled: bool,
     admissions: BTreeMap<usize, crate::row_group_prefetch::DensityAdmission>,
     claimed_row_groups: BTreeSet<usize>,
-    staged_windows: VecDeque<StagedWindowResources>,
+    staged_window: Option<StagedWindowResources>,
+    staged_window_active: Arc<AtomicBool>,
     tracker: Arc<StagedByteTracker>,
 }
 
@@ -168,7 +188,8 @@ impl PrefetchRunState {
             staging_enabled: staging_enabled && window > 0,
             admissions: BTreeMap::new(),
             claimed_row_groups: BTreeSet::new(),
-            staged_windows: VecDeque::new(),
+            staged_window: None,
+            staged_window_active: Arc::new(AtomicBool::new(false)),
             tracker: Arc::new(StagedByteTracker {
                 staged_bytes: AtomicUsize::new(0),
                 metrics,
@@ -185,7 +206,7 @@ impl PrefetchRunState {
         row_group_index: usize,
         exact_ranges: &[std::ops::Range<u64>],
     ) -> Option<StagingRequest> {
-        if !self.staging_enabled {
+        if !self.staging_enabled || self.staged_window_active.load(Ordering::Acquire) {
             return None;
         }
 
@@ -240,15 +261,27 @@ impl PrefetchRunState {
         request: StagingRequest,
         resources: SpeculativeResources,
     ) {
+        assert!(
+            self.staged_window.is_none(),
+            "only one staged window is live"
+        );
+        let already_active = self.staged_window_active.swap(true, Ordering::AcqRel);
+        assert!(
+            !already_active,
+            "staged window gate must be closed before another window is admitted"
+        );
         self.metrics
             .record_prefetch(request.ranges.len(), request.staged_bytes);
-        self.staged_windows.push_back(StagedWindowResources {
+        self.staged_window = Some(StagedWindowResources {
             remaining_row_groups: request.row_groups.into(),
             resources,
             staged_bytes: request.staged_bytes,
             useful_bytes_by_row_group: request.useful_bytes_by_row_group,
             useful_staged_bytes: 0,
             reservation: self.tracker.reserve(request.staged_bytes),
+            gate: StagedWindowGate {
+                active: Arc::clone(&self.staged_window_active),
+            },
         });
     }
 
@@ -256,7 +289,7 @@ impl PrefetchRunState {
         &mut self,
         row_group_index: usize,
     ) -> Option<StagedWindowFinalResources> {
-        let window = self.staged_windows.front_mut()?;
+        let window = self.staged_window.as_mut()?;
         if window.remaining_row_groups.front().copied() != Some(row_group_index) {
             return None;
         }
@@ -274,10 +307,53 @@ impl PrefetchRunState {
         if !window.remaining_row_groups.is_empty() {
             return None;
         }
-        let window = self
-            .staged_windows
-            .pop_front()
-            .expect("front staged window checked above");
+        self.finish_staged_window()
+    }
+
+    /// Drops staged members that the decoder skipped before returning
+    /// `row_group_index`. The caller must clear the decoder before dropping
+    /// the returned resources.
+    fn advance_to_row_group(
+        &mut self,
+        row_group_index: usize,
+    ) -> Option<StagedWindowFinalResources> {
+        let next_position = self
+            .plan
+            .row_group_order()
+            .iter()
+            .position(|index| *index == row_group_index)?;
+        let window = self.staged_window.as_mut()?;
+        let first_position = self.plan.row_group_order().iter().position(|index| {
+            Some(*index) == window.remaining_row_groups.front().copied()
+        })?;
+        let last_position = self.plan.row_group_order().iter().position(|index| {
+            Some(*index) == window.remaining_row_groups.back().copied()
+        })?;
+
+        if next_position < first_position {
+            return None;
+        }
+        if next_position > last_position {
+            return self.finish_staged_window();
+        }
+
+        while self
+            .staged_window
+            .as_ref()
+            .and_then(|window| window.remaining_row_groups.front().copied())
+            != Some(row_group_index)
+        {
+            self.staged_window
+                .as_mut()
+                .expect("staged window checked above")
+                .remaining_row_groups
+                .pop_front();
+        }
+        None
+    }
+
+    fn finish_staged_window(&mut self) -> Option<StagedWindowFinalResources> {
+        let window = self.staged_window.take()?;
         Some(StagedWindowFinalResources {
             resources: window.resources,
             unused_staged_bytes: window
@@ -285,11 +361,12 @@ impl PrefetchRunState {
                 .saturating_sub(window.useful_staged_bytes),
             metrics: self.metrics.clone(),
             _reservation: window.reservation,
+            _gate: window.gate,
         })
     }
 
-    fn discard_staged_windows(&mut self) {
-        for window in self.staged_windows.drain(..) {
+    fn discard_staged_window(&mut self) {
+        if let Some(window) = self.staged_window.take() {
             self.metrics.record_unused_staged_bytes(
                 window
                     .staged_bytes
@@ -301,7 +378,7 @@ impl PrefetchRunState {
 
 impl Drop for PrefetchRunState {
     fn drop(&mut self) {
-        self.discard_staged_windows();
+        self.discard_staged_window();
     }
 }
 
@@ -314,7 +391,7 @@ struct NextReaderOutcome {
 
 enum NextReaderResult {
     Reader {
-        reader: ParquetRecordBatchReader,
+        reader: Box<ParquetRecordBatchReader>,
         staged_window: Option<StagedWindowFinalResources>,
     },
     Finished,
@@ -543,7 +620,7 @@ impl LookaheadPushDecoderStreamState {
 
     fn accept_next_reader_outcome(&mut self, outcome: NextReaderOutcome) {
         let NextReaderOutcome {
-            decoder,
+            mut decoder,
             reader,
             result,
             resources,
@@ -556,7 +633,7 @@ impl LookaheadPushDecoderStreamState {
                 self.decoder = Some(decoder);
                 self.reader = Some(reader);
                 self.prefetched_readers.push_back(PrefetchedReader {
-                    reader: next_reader,
+                    reader: *next_reader,
                     resources,
                     staged_window,
                 });
@@ -574,46 +651,55 @@ impl LookaheadPushDecoderStreamState {
                 self.speculation_disabled = true;
             }
             NextReaderResult::Error(error) => {
+                clear_decoder_staged_buffers(&mut decoder);
+                if let Some(prefetch_plan) = self.active_prefetch_plan.as_ref() {
+                    prefetch_plan
+                        .lock()
+                        .expect("prefetch run state must not be poisoned")
+                        .discard_staged_window();
+                }
                 self.deferred_error = Some(error);
                 self.speculation_disabled = true;
-                drop(decoder);
-                drop(reader);
                 drop(resources);
+                drop(reader);
+                drop(decoder);
             }
         }
     }
 
     async fn load_foreground_reader(&mut self) -> Result<ForegroundProgress> {
         loop {
-            let next_row_group = self
-                .decoder
-                .as_ref()
-                .expect("foreground decoder must be present")
-                .peek_next_row_group()
-                .map_err(DataFusionError::from)?;
             let decode_result = self
                 .decoder
                 .as_mut()
                 .expect("foreground decoder must be present")
-                .try_next_reader()
+                .try_next_reader_with_row_group()
                 .map_err(DataFusionError::from)?;
             match decode_result {
-                DecodeResult::NeedsData(ranges) => {
-                    if let Some(row_group_index) = next_row_group {
-                        stage_admitted_window(
-                            self.decoder
-                                .as_mut()
-                                .expect("foreground decoder must be present"),
-                            self.reader
-                                .as_mut()
-                                .expect("foreground reader must be present"),
-                            &self.lookahead,
-                            self.active_prefetch_plan.as_ref(),
-                            row_group_index,
-                            &ranges,
-                        )
-                        .await?;
-                    }
+                RowGroupReaderResult::NeedsData {
+                    row_group_index,
+                    ranges,
+                } => {
+                    release_skipped_staged_window(
+                        self.decoder
+                            .as_mut()
+                            .expect("foreground decoder must be present"),
+                        self.active_prefetch_plan.as_ref(),
+                        row_group_index,
+                    );
+                    stage_admitted_window(
+                        self.decoder
+                            .as_mut()
+                            .expect("foreground decoder must be present"),
+                        self.reader
+                            .as_mut()
+                            .expect("foreground reader must be present"),
+                        &self.lookahead,
+                        self.active_prefetch_plan.as_ref(),
+                        row_group_index,
+                        &ranges,
+                    )
+                    .await?;
                     let data = self
                         .reader
                         .as_mut()
@@ -627,21 +713,38 @@ impl LookaheadPushDecoderStreamState {
                         .push_ranges(ranges, data)
                         .map_err(DataFusionError::from)?;
                 }
-                DecodeResult::Data(reader) => {
-                    let staged_window = next_row_group.and_then(|row_group_index| {
+                RowGroupReaderResult::Data {
+                    row_group_index,
+                    data: reader,
+                } => {
+                    let skipped_staged_window =
+                        self.active_prefetch_plan.as_ref().and_then(|state| {
+                            state
+                                .lock()
+                                .expect("prefetch run state must not be poisoned")
+                                .advance_to_row_group(row_group_index)
+                        });
+                    let staged_window =
                         self.active_prefetch_plan.as_ref().and_then(|state| {
                             state
                                 .lock()
                                 .expect("prefetch run state must not be poisoned")
                                 .reader_ready(row_group_index)
-                        })
-                    });
+                        });
+                    if skipped_staged_window.is_some() || staged_window.is_some() {
+                        clear_decoder_staged_buffers(
+                            self.decoder
+                                .as_mut()
+                                .expect("foreground decoder must be present"),
+                        );
+                    }
+                    drop(skipped_staged_window);
                     self.active_reader = Some(reader);
                     self.foreground_resources = SpeculativeResources::default();
                     drop(staged_window);
                     return Ok(ForegroundProgress::ReaderReady);
                 }
-                DecodeResult::Finished => {
+                RowGroupReaderResult::Finished => {
                     self.run_finished = true;
                     self.foreground_resources = SpeculativeResources::default();
                     return Ok(ForegroundProgress::RunFinished);
@@ -666,10 +769,13 @@ impl LookaheadPushDecoderStreamState {
             .active_prefetch_plan
             .take()
             .expect("active prefetch plan checked above");
+        if let Some(decoder) = self.decoder.as_mut() {
+            clear_decoder_staged_buffers(decoder);
+        }
         active_prefetch_plan
             .lock()
             .expect("prefetch run state must not be poisoned")
-            .discard_staged_windows();
+            .discard_staged_window();
         if self.pending_decoders.is_empty() != self.pending_prefetch_plans.is_empty() {
             return Err(prefetch_plan_queue_drift());
         }
@@ -686,10 +792,19 @@ impl LookaheadPushDecoderStreamState {
 
     fn terminate(&mut self) {
         self.terminated = true;
+        if let Some(decoder) = self.decoder.as_mut() {
+            clear_decoder_staged_buffers(decoder);
+        }
         self.prefetched_readers.clear();
-        self.next_reader_future = None;
-        self.foreground_resources = SpeculativeResources::default();
         self.active_reader = None;
+        self.foreground_resources.release();
+        self.next_reader_future = None;
+        if let Some(prefetch_plan) = self.active_prefetch_plan.as_ref() {
+            prefetch_plan
+                .lock()
+                .expect("prefetch run state must not be poisoned")
+                .discard_staged_window();
+        }
         self.decoder = None;
         self.reader = None;
         self.pending_decoders.clear();
@@ -724,38 +839,133 @@ async fn poll_once(
     .await
 }
 
+/// Owns a speculative decoder operation and enforces teardown ordering when a
+/// future is cancelled before it can yield an outcome.
+struct SpeculativeDriver {
+    decoder: Option<ParquetPushDecoder>,
+    reader: Option<Box<dyn AsyncFileReader>>,
+    resources: SpeculativeResources,
+    prefetch_plan: Option<Arc<Mutex<PrefetchRunState>>>,
+}
+
+impl SpeculativeDriver {
+    fn new(
+        decoder: ParquetPushDecoder,
+        reader: Box<dyn AsyncFileReader>,
+        prefetch_plan: Option<Arc<Mutex<PrefetchRunState>>>,
+    ) -> Self {
+        Self {
+            decoder: Some(decoder),
+            reader: Some(reader),
+            resources: SpeculativeResources::default(),
+            prefetch_plan,
+        }
+    }
+
+    fn decoder_mut(&mut self) -> &mut ParquetPushDecoder {
+        self.decoder
+            .as_mut()
+            .expect("speculative driver owns its decoder")
+    }
+
+    fn reader_mut(&mut self) -> &mut Box<dyn AsyncFileReader> {
+        self.reader
+            .as_mut()
+            .expect("speculative driver owns its reader")
+    }
+
+    fn decoder_and_reader_mut(
+        &mut self,
+    ) -> (&mut ParquetPushDecoder, &mut Box<dyn AsyncFileReader>) {
+        let decoder = self
+            .decoder
+            .as_mut()
+            .expect("speculative driver owns its decoder");
+        let reader = self
+            .reader
+            .as_mut()
+            .expect("speculative driver owns its reader");
+        (decoder, reader)
+    }
+
+    fn into_outcome(mut self, result: NextReaderResult) -> NextReaderOutcome {
+        self.prefetch_plan = None;
+        NextReaderOutcome {
+            decoder: self
+                .decoder
+                .take()
+                .expect("speculative driver owns its decoder"),
+            reader: self
+                .reader
+                .take()
+                .expect("speculative driver owns its reader"),
+            result,
+            resources: std::mem::take(&mut self.resources),
+        }
+    }
+}
+
+impl Drop for SpeculativeDriver {
+    fn drop(&mut self) {
+        let mut decoder = self.decoder.take();
+        if let Some(decoder) = decoder.as_mut() {
+            clear_decoder_staged_buffers(decoder);
+        }
+        if let Some(prefetch_plan) = self.prefetch_plan.take() {
+            prefetch_plan
+                .lock()
+                .expect("prefetch run state must not be poisoned")
+                .discard_staged_window();
+        }
+        self.resources.release();
+        drop(self.reader.take());
+        drop(decoder);
+    }
+}
+
 async fn drive_speculative_next_reader(
-    mut decoder: ParquetPushDecoder,
-    mut reader: Box<dyn AsyncFileReader>,
+    decoder: ParquetPushDecoder,
+    reader: Box<dyn AsyncFileReader>,
     lookahead: LookaheadFileContext,
     prefetch_plan: Option<Arc<Mutex<PrefetchRunState>>>,
 ) -> NextReaderOutcome {
-    let mut resources = SpeculativeResources::default();
+    let mut driver = SpeculativeDriver::new(decoder, reader, prefetch_plan.clone());
     let result = loop {
-        let next_row_group = decoder.peek_next_row_group().map_err(DataFusionError::from);
-        let next_row_group = match next_row_group {
-            Ok(row_group_index) => row_group_index,
-            Err(error) => break NextReaderResult::Error(error),
-        };
-        match decoder.try_next_reader() {
-            Ok(DecodeResult::NeedsData(ranges)) => {
-                if let Some(row_group_index) = next_row_group
-                    && let Err(error) = stage_admitted_window(
-                        &mut decoder,
-                        &mut reader,
-                        &lookahead,
-                        prefetch_plan.as_ref(),
-                        row_group_index,
-                        &ranges,
-                    )
-                    .await
+        match driver.decoder_mut().try_next_reader_with_row_group() {
+            Ok(RowGroupReaderResult::NeedsData {
+                row_group_index,
+                ranges,
+            }) => {
+                release_skipped_staged_window(
+                    driver.decoder_mut(),
+                    prefetch_plan.as_ref(),
+                    row_group_index,
+                );
+                let (decoder, reader) = driver.decoder_and_reader_mut();
+                if let Err(error) = stage_admitted_window(
+                    decoder,
+                    reader,
+                    &lookahead,
+                    prefetch_plan.as_ref(),
+                    row_group_index,
+                    &ranges,
+                )
+                .await
                 {
                     break NextReaderResult::Error(error);
                 }
                 if ranges.len() > MAX_RANGES_PER_FILE_FETCH {
+                    discard_staged_window_after_clearing(
+                        driver.decoder_mut(),
+                        prefetch_plan.as_ref(),
+                    );
                     break NextReaderResult::Denied;
                 }
                 let Some(bytes) = checked_range_bytes(&ranges) else {
+                    discard_staged_window_after_clearing(
+                        driver.decoder_mut(),
+                        prefetch_plan.as_ref(),
+                    );
                     break NextReaderResult::Denied;
                 };
                 let permit_count = u32::try_from(ranges.len())
@@ -763,43 +973,59 @@ async fn drive_speculative_next_reader(
                 let Ok(range_permit) = Arc::clone(&lookahead.coordinator.range_permits)
                     .try_acquire_many_owned(permit_count)
                 else {
+                    discard_staged_window_after_clearing(
+                        driver.decoder_mut(),
+                        prefetch_plan.as_ref(),
+                    );
                     break NextReaderResult::Denied;
                 };
                 let Some(lease) = lookahead.try_reserve(bytes) else {
                     drop(range_permit);
+                    discard_staged_window_after_clearing(
+                        driver.decoder_mut(),
+                        prefetch_plan.as_ref(),
+                    );
                     break NextReaderResult::Denied;
                 };
-                let data = match reader.get_byte_ranges(ranges.clone()).await {
+                driver.resources.leases.push(lease);
+                driver.resources.range_permits.push(range_permit);
+                let data = match driver.reader_mut().get_byte_ranges(ranges.clone()).await
+                {
                     Ok(data) => data,
                     Err(error) => {
-                        drop(lease);
-                        drop(range_permit);
                         break NextReaderResult::Error(DataFusionError::from(error));
                     }
                 };
-                if let Err(error) = decoder.push_ranges(ranges, data) {
-                    drop(lease);
-                    drop(range_permit);
+                if let Err(error) = driver.decoder_mut().push_ranges(ranges, data) {
                     break NextReaderResult::Error(DataFusionError::from(error));
                 }
-                resources.leases.push(lease);
-                resources.range_permits.push(range_permit);
             }
-            Ok(DecodeResult::Data(reader)) => {
-                let staged_window = next_row_group.and_then(|row_group_index| {
-                    prefetch_plan.as_ref().and_then(|state| {
-                        state
-                            .lock()
-                            .expect("prefetch run state must not be poisoned")
-                            .reader_ready(row_group_index)
-                    })
+            Ok(RowGroupReaderResult::Data {
+                row_group_index,
+                data: reader,
+            }) => {
+                let skipped_staged_window = prefetch_plan.as_ref().and_then(|state| {
+                    state
+                        .lock()
+                        .expect("prefetch run state must not be poisoned")
+                        .advance_to_row_group(row_group_index)
                 });
+                let staged_window = prefetch_plan.as_ref().and_then(|state| {
+                    state
+                        .lock()
+                        .expect("prefetch run state must not be poisoned")
+                        .reader_ready(row_group_index)
+                });
+                if skipped_staged_window.is_some() || staged_window.is_some() {
+                    clear_decoder_staged_buffers(driver.decoder_mut());
+                }
+                drop(skipped_staged_window);
                 break NextReaderResult::Reader {
-                    reader,
+                    reader: Box::new(reader),
                     staged_window,
                 };
             }
-            Ok(DecodeResult::Finished) => {
+            Ok(RowGroupReaderResult::Finished) => {
                 break NextReaderResult::Finished;
             }
             Err(error) => {
@@ -808,12 +1034,7 @@ async fn drive_speculative_next_reader(
         }
     };
 
-    NextReaderOutcome {
-        decoder,
-        reader,
-        result,
-        resources,
-    }
+    driver.into_outcome(result)
 }
 
 fn checked_range_bytes(ranges: &[std::ops::Range<u64>]) -> Option<usize> {
@@ -821,6 +1042,45 @@ fn checked_range_bytes(ranges: &[std::ops::Range<u64>]) -> Option<usize> {
         let length = usize::try_from(range.end.checked_sub(range.start)?).ok()?;
         sum.checked_add(length)
     })
+}
+
+fn clear_decoder_staged_buffers(decoder: &mut ParquetPushDecoder) {
+    decoder.clear_all_ranges();
+    debug_assert_eq!(
+        decoder.buffered_bytes(),
+        0,
+        "clearing a staged window must precede releasing its resources"
+    );
+}
+
+fn discard_staged_window_after_clearing(
+    decoder: &mut ParquetPushDecoder,
+    prefetch_plan: Option<&Arc<Mutex<PrefetchRunState>>>,
+) {
+    clear_decoder_staged_buffers(decoder);
+    if let Some(prefetch_plan) = prefetch_plan {
+        prefetch_plan
+            .lock()
+            .expect("prefetch run state must not be poisoned")
+            .discard_staged_window();
+    }
+}
+
+fn release_skipped_staged_window(
+    decoder: &mut ParquetPushDecoder,
+    prefetch_plan: Option<&Arc<Mutex<PrefetchRunState>>>,
+    row_group_index: usize,
+) {
+    let skipped_staged_window = prefetch_plan.and_then(|prefetch_plan| {
+        prefetch_plan
+            .lock()
+            .expect("prefetch run state must not be poisoned")
+            .advance_to_row_group(row_group_index)
+    });
+    if skipped_staged_window.is_some() {
+        clear_decoder_staged_buffers(decoder);
+    }
+    drop(skipped_staged_window);
 }
 
 async fn stage_admitted_window(
@@ -904,7 +1164,9 @@ mod tests {
     use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
     use parquet::arrow::arrow_reader::{ArrowPredicateFn, ArrowReaderOptions, RowFilter};
     use parquet::arrow::async_reader::AsyncFileReader;
-    use parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
+    use parquet::arrow::push_decoder::{
+        ParquetPushDecoder, ParquetPushDecoderBuilder, RowGroupReaderResult,
+    };
     use parquet::arrow::{ArrowWriter, ProjectionMask};
     use parquet::errors::Result as ParquetResult;
     use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
@@ -915,7 +1177,10 @@ mod tests {
     use super::super::{
         LookaheadPushDecoderStreamState, PushDecoderOutputState, PushDecoderStreamState,
     };
-    use super::{PrefetchPlanQueue, PrefetchRunState};
+    use super::{
+        PrefetchPlanQueue, PrefetchRunState, SpeculativeResources, StagingRequest,
+        checked_range_bytes, clear_decoder_staged_buffers, stage_admitted_window,
+    };
     use crate::lookahead::{
         LookaheadFileContext, MAX_IN_FLIGHT_RANGES, MAX_SPECULATIVE_BYTES,
         ParquetLookaheadCoordinator,
@@ -1343,7 +1608,40 @@ mod tests {
         }
 
         fn dense_prefetch(row_group_count: usize) -> Self {
-            let rows_per_group = 300_000;
+            Self::dense_prefetch_with_rows_and_filter_columns(
+                row_group_count,
+                300_000,
+                &[],
+            )
+        }
+
+        fn dense_prefetch_with_rows(
+            row_group_count: usize,
+            rows_per_group: usize,
+        ) -> Self {
+            Self::dense_prefetch_with_rows_and_filter_columns(
+                row_group_count,
+                rows_per_group,
+                &[],
+            )
+        }
+
+        fn dense_prefetch_with_filter_columns(
+            row_group_count: usize,
+            filter_columns: &[&'static str],
+        ) -> Self {
+            Self::dense_prefetch_with_rows_and_filter_columns(
+                row_group_count,
+                300_000,
+                filter_columns,
+            )
+        }
+
+        fn dense_prefetch_with_rows_and_filter_columns(
+            row_group_count: usize,
+            rows_per_group: usize,
+            filter_columns: &[&'static str],
+        ) -> Self {
             let schema = Arc::new(Schema::new(
                 FILTER_COLUMNS
                     .iter()
@@ -1411,7 +1709,7 @@ mod tests {
                     DataType::Int32,
                     false,
                 )])),
-                filter_columns: Vec::new(),
+                filter_columns: filter_columns.to_vec(),
                 rows_per_group,
             }
         }
@@ -1516,11 +1814,14 @@ mod tests {
         }
 
         fn prefetch_metrics(&self) -> RowGroupPrefetchMetrics {
-            RowGroupPrefetchMetrics::new(
-                0,
-                "scripted.parquet",
-                &ExecutionPlanMetricsSet::new(),
-            )
+            self.prefetch_metrics_for(&ExecutionPlanMetricsSet::new())
+        }
+
+        fn prefetch_metrics_for(
+            &self,
+            metrics: &ExecutionPlanMetricsSet,
+        ) -> RowGroupPrefetchMetrics {
+            RowGroupPrefetchMetrics::new(0, "scripted.parquet", metrics)
         }
 
         fn output_state(
@@ -1970,6 +2271,266 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_staged_chunk_is_reused_and_cleared_before_final_release() {
+        let fixture = ThreeRowGroupFixture::dense_prefetch_with_rows(3, 1_100_000);
+        let control = ScriptControl::new(None);
+        let (coordinator, context) =
+            fixture.lookahead_context_with_depth_and_window(2, 2);
+        let reservation = Arc::clone(&context.reservation);
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let plan = fixture.prefetch_plan(vec![0, 1, 2]);
+        let staged_ranges = plan.ranges_for(&[1, 2]);
+        assert_eq!(staged_ranges.len(), 2);
+        assert!(staged_ranges[0].end - staged_ranges[0].start > 4 * 1024 * 1024);
+
+        let prefetch_plan = Arc::new(Mutex::new(PrefetchRunState::new(
+            plan,
+            fixture.prefetch_metrics_for(&metrics_set),
+            2,
+            true,
+        )));
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let mut decoder = fixture.decoder_for_row_groups_with_filter_and_batch_size(
+            Some(vec![0, 1, 2]),
+            &arrow_reader_metrics,
+            None,
+            fixture.rows_per_group,
+        );
+        let mut reader = fixture.reader(control.clone());
+
+        let RowGroupReaderResult::NeedsData {
+            row_group_index,
+            ranges,
+        } = decoder.try_next_reader_with_row_group().unwrap()
+        else {
+            panic!("the first row group must request exact data");
+        };
+        assert_eq!(row_group_index, 0);
+        stage_admitted_window(
+            &mut decoder,
+            &mut reader,
+            &context,
+            Some(&prefetch_plan),
+            row_group_index,
+            &ranges,
+        )
+        .await
+        .unwrap();
+        assert!(decoder.buffered_bytes() > 0);
+        assert!(reservation.size() > 0);
+
+        let exact_data = reader.get_byte_ranges(ranges.clone()).await.unwrap();
+        decoder.push_ranges(ranges, exact_data).unwrap();
+
+        let mut final_resources = None;
+        let mut saw_intermediate_staged_buffer = false;
+        loop {
+            match decoder.try_next_reader_with_row_group().unwrap() {
+                RowGroupReaderResult::Data {
+                    row_group_index,
+                    data: _,
+                } => {
+                    final_resources = prefetch_plan
+                        .lock()
+                        .unwrap()
+                        .reader_ready(row_group_index)
+                        .or(final_resources);
+                    if final_resources.is_some() {
+                        break;
+                    }
+                    saw_intermediate_staged_buffer |= decoder.buffered_bytes() > 0;
+                }
+                RowGroupReaderResult::NeedsData { .. } => {
+                    panic!("the full staged chunk must satisfy later exact data needs")
+                }
+                RowGroupReaderResult::Finished => {
+                    panic!("all staged row groups must produce a reader")
+                }
+            }
+        }
+
+        assert_eq!(control.requests_for(1).len(), 1);
+        assert_eq!(control.requests_for(2).len(), 1);
+        assert_eq!(control.requests_for(1)[0].ranges, staged_ranges[0..1]);
+        assert_eq!(control.requests_for(2)[0].ranges, staged_ranges[1..2]);
+        assert!(saw_intermediate_staged_buffer);
+        assert_eq!(decoder.buffered_bytes(), 0);
+
+        clear_decoder_staged_buffers(&mut decoder);
+        assert_eq!(decoder.buffered_bytes(), 0);
+        assert!(reservation.size() > 0);
+        drop(final_resources);
+        assert_eq!(reservation.size(), 0);
+        assert_shared_budgets_released(&coordinator);
+        assert_eq!(metric_value(&metrics_set, "prefetch_windows"), 1);
+        assert_eq!(metric_value(&metrics_set, "prefetched_ranges"), 2);
+        assert_eq!(
+            metric_value(&metrics_set, "useful_staged_bytes"),
+            staged_ranges
+                .iter()
+                .map(|range| usize::try_from(range.end - range.start).unwrap())
+                .sum::<usize>()
+        );
+        assert_eq!(metric_value(&metrics_set, "unused_staged_bytes"), 0);
+    }
+
+    #[tokio::test]
+    async fn filter_phases_use_result_row_group_identity_for_staging() {
+        let fixture = ThreeRowGroupFixture::dense_prefetch_with_filter_columns(
+            3,
+            &DISJOINT_FILTER_COLUMNS,
+        );
+        let control = ScriptControl::new(None);
+        let (coordinator, context) =
+            fixture.lookahead_context_with_depth_and_window(2, 2);
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let plan = fixture.prefetch_plan(vec![0, 1, 2]);
+        let staged_ranges = plan.ranges_for(&[1, 2]);
+        let prefetch_plan = Arc::new(Mutex::new(PrefetchRunState::new(
+            plan,
+            fixture.prefetch_metrics_for(&metrics_set),
+            2,
+            true,
+        )));
+        let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+        let mut decoder = fixture.decoder_for_row_groups_with_filter_and_batch_size(
+            Some(vec![0, 1, 2]),
+            &arrow_reader_metrics,
+            Some(0),
+            fixture.rows_per_group,
+        );
+        let mut reader = fixture.reader(control.clone());
+        let mut needs_by_row_group = BTreeMap::new();
+        let mut final_resources = None;
+
+        loop {
+            match decoder.try_next_reader_with_row_group().unwrap() {
+                RowGroupReaderResult::NeedsData {
+                    row_group_index,
+                    ranges,
+                } => {
+                    *needs_by_row_group.entry(row_group_index).or_insert(0_usize) += 1;
+                    stage_admitted_window(
+                        &mut decoder,
+                        &mut reader,
+                        &context,
+                        Some(&prefetch_plan),
+                        row_group_index,
+                        &ranges,
+                    )
+                    .await
+                    .unwrap();
+                    let data = reader.get_byte_ranges(ranges.clone()).await.unwrap();
+                    decoder.push_ranges(ranges, data).unwrap();
+                }
+                RowGroupReaderResult::Data {
+                    row_group_index,
+                    data: _,
+                } => {
+                    final_resources = prefetch_plan
+                        .lock()
+                        .unwrap()
+                        .reader_ready(row_group_index)
+                        .or(final_resources);
+                    if final_resources.is_some() {
+                        break;
+                    }
+                }
+                RowGroupReaderResult::Finished => {
+                    panic!("the filter leaves rows in every dense row group")
+                }
+            }
+        }
+
+        assert_eq!(needs_by_row_group, BTreeMap::from([(0, 2), (1, 1), (2, 1)]));
+        for (row_group_index, staged_range) in [1, 2].into_iter().zip(staged_ranges) {
+            assert_eq!(
+                control
+                    .requests_for(row_group_index)
+                    .into_iter()
+                    .filter(|request| request.ranges == vec![staged_range.clone()])
+                    .count(),
+                1,
+                "the staged projected range must satisfy the later exact request"
+            );
+        }
+        clear_decoder_staged_buffers(&mut decoder);
+        drop(final_resources);
+        assert_shared_budgets_released(&coordinator);
+        assert_eq!(metric_value(&metrics_set, "prefetch_windows"), 1);
+    }
+
+    #[test]
+    fn returned_identity_skips_filtered_staged_members_without_leaking_window() {
+        let fixture = ThreeRowGroupFixture::dense_prefetch(4);
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let plan = fixture.prefetch_plan(vec![0, 1, 2, 3]);
+        let ranges = plan.ranges_for(&[1, 2]);
+        let staged_bytes = checked_range_bytes(&ranges).unwrap();
+        let useful_bytes_by_row_group = plan.staged_window_useful_bytes(&[1, 2], &ranges);
+        let mut state = PrefetchRunState::new(
+            plan,
+            fixture.prefetch_metrics_for(&metrics_set),
+            2,
+            true,
+        );
+        state.add_staged_window(
+            StagingRequest {
+                row_groups: vec![1, 2],
+                ranges,
+                staged_bytes,
+                useful_bytes_by_row_group,
+            },
+            SpeculativeResources::default(),
+        );
+
+        assert!(state.advance_to_row_group(2).is_none());
+        assert_eq!(
+            state
+                .staged_window
+                .as_ref()
+                .unwrap()
+                .remaining_row_groups
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        let final_resources = state.reader_ready(2).unwrap();
+        assert!(state.staged_window.is_none());
+        assert!(state.tracker.staged_bytes.load(Ordering::SeqCst) > 0);
+        drop(final_resources);
+        assert_eq!(state.tracker.staged_bytes.load(Ordering::SeqCst), 0);
+        assert!(metric_value(&metrics_set, "unused_staged_bytes") > 0);
+
+        let plan = fixture.prefetch_plan(vec![0, 1, 2, 3]);
+        let ranges = plan.ranges_for(&[1, 2]);
+        let staged_bytes = checked_range_bytes(&ranges).unwrap();
+        let useful_bytes_by_row_group = plan.staged_window_useful_bytes(&[1, 2], &ranges);
+        let mut state = PrefetchRunState::new(
+            plan,
+            fixture.prefetch_metrics_for(&metrics_set),
+            2,
+            true,
+        );
+        state.add_staged_window(
+            StagingRequest {
+                row_groups: vec![1, 2],
+                ranges,
+                staged_bytes,
+                useful_bytes_by_row_group,
+            },
+            SpeculativeResources::default(),
+        );
+
+        let skipped_window = state.advance_to_row_group(3).unwrap();
+        assert!(state.staged_window.is_none());
+        assert!(state.tracker.staged_bytes.load(Ordering::SeqCst) > 0);
+        drop(skipped_window);
+        assert_eq!(state.tracker.staged_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn staged_window_denial_and_fetch_error_release_every_reservation() {
         let fixture = ThreeRowGroupFixture::dense_prefetch(3);
         let control = ScriptControl::new(None);
@@ -2173,6 +2734,10 @@ mod tests {
                 .try_reserve(MAX_SPECULATIVE_BYTES)
                 .expect("the full shared byte budget must be released"),
         );
+    }
+
+    fn metric_value(metrics: &ExecutionPlanMetricsSet, name: &str) -> usize {
+        metrics.clone_inner().sum_by_name(name).unwrap().as_usize()
     }
 
     #[tokio::test]

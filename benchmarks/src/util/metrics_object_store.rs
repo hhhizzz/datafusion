@@ -60,6 +60,14 @@ struct PathMetrics {
     header_latency_ns: u64,
     body_latency_ns: u64,
     max_body_latency_ns: u64,
+    first_request_started: Option<Instant>,
+    last_request_finished: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct RequestWindow {
+    first_started: Option<Instant>,
+    last_finished: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -80,6 +88,7 @@ struct MetricsState {
     header_latencies_ns: Mutex<Vec<u64>>,
     body_latencies_ns: Mutex<Vec<u64>>,
     wire_range_sizes: Mutex<Vec<u64>>,
+    request_window: Mutex<RequestWindow>,
     paths: Mutex<HashMap<String, PathMetrics>>,
 }
 
@@ -104,6 +113,8 @@ pub struct PathMetricsSnapshot {
     pub body_latency_total_ms: f64,
     pub body_latency_mean_ms: f64,
     pub body_latency_max_ms: f64,
+    pub request_window_ms: f64,
+    pub body_throughput_mib_per_s: f64,
 }
 
 /// Serializable metrics collected since the last reset.
@@ -134,6 +145,8 @@ pub struct ObjectStoreMetricsSnapshot {
     pub body_latency_p95_ms: f64,
     pub body_latency_p99_ms: f64,
     pub body_latency_max_ms: f64,
+    pub request_window_ms: f64,
+    pub body_throughput_mib_per_s: f64,
     pub paths: Vec<PathMetricsSnapshot>,
 }
 
@@ -171,6 +184,11 @@ impl ObjectStoreMetrics {
             .lock()
             .expect("metrics mutex poisoned")
             .clear();
+        *self
+            .state
+            .request_window
+            .lock()
+            .expect("metrics mutex poisoned") = RequestWindow::default();
         self.state
             .paths
             .lock()
@@ -198,6 +216,13 @@ impl ObjectStoreMetrics {
             .lock()
             .expect("metrics mutex poisoned")
             .clone();
+        let global_request_window_ns = request_window_ns(
+            &self
+                .state
+                .request_window
+                .lock()
+                .expect("metrics mutex poisoned"),
+        );
         let mut paths = self
             .state
             .paths
@@ -207,6 +232,10 @@ impl ObjectStoreMetrics {
             .map(|(path, metrics)| {
                 let body_requests =
                     metrics.range_get_requests + metrics.full_get_requests;
+                let request_window_ns = request_window_ns(&RequestWindow {
+                    first_started: metrics.first_request_started,
+                    last_finished: metrics.last_request_finished,
+                });
                 PathMetricsSnapshot {
                     path: path.clone(),
                     head_requests: metrics.head_requests,
@@ -224,6 +253,11 @@ impl ObjectStoreMetrics {
                         ns_to_ms(metrics.body_latency_ns) / body_requests as f64
                     },
                     body_latency_max_ms: ns_to_ms(metrics.max_body_latency_ns),
+                    request_window_ms: ns_to_ms(request_window_ns),
+                    body_throughput_mib_per_s: body_throughput_mib_per_s(
+                        metrics.body_bytes,
+                        request_window_ns,
+                    ),
                 }
             })
             .collect::<Vec<_>>();
@@ -236,6 +270,7 @@ impl ObjectStoreMetrics {
         let logical_range_bytes = self.state.logical_range_bytes.load(Ordering::Relaxed);
         let response_range_bytes =
             self.state.response_range_bytes.load(Ordering::Relaxed);
+        let body_bytes = self.state.body_bytes.load(Ordering::Relaxed);
         ObjectStoreMetricsSnapshot {
             coalesce_gap_bytes: self.state.coalesce_gap_bytes.load(Ordering::Relaxed),
             get_ranges_calls: self.state.get_ranges_calls.load(Ordering::Relaxed),
@@ -245,7 +280,7 @@ impl ObjectStoreMetrics {
             range_get_requests: self.state.range_get_requests.load(Ordering::Relaxed),
             full_get_requests: self.state.full_get_requests.load(Ordering::Relaxed),
             response_range_bytes,
-            body_bytes: self.state.body_bytes.load(Ordering::Relaxed),
+            body_bytes,
             range_overfetch_bytes: response_range_bytes
                 .saturating_sub(logical_range_bytes),
             list_requests: self.state.list_requests.load(Ordering::Relaxed),
@@ -263,6 +298,11 @@ impl ObjectStoreMetrics {
             body_latency_p95_ms: ns_to_ms(percentile(&body, 95)),
             body_latency_p99_ms: ns_to_ms(percentile(&body, 99)),
             body_latency_max_ms: ns_to_ms(percentile(&body, 100)),
+            request_window_ms: ns_to_ms(global_request_window_ns),
+            body_throughput_mib_per_s: body_throughput_mib_per_s(
+                body_bytes,
+                global_request_window_ns,
+            ),
             paths,
         }
     }
@@ -279,6 +319,15 @@ impl ObjectStoreMetrics {
         self.state
             .peak_in_flight
             .fetch_max(in_flight, Ordering::Relaxed);
+        let started = Instant::now();
+        if !matches!(kind, RequestKind::Head) {
+            let mut window = self
+                .state
+                .request_window
+                .lock()
+                .expect("metrics mutex poisoned");
+            window.first_started.get_or_insert(started);
+        }
         let mut paths = self.state.paths.lock().expect("metrics mutex poisoned");
         let path_metrics = paths.entry(path.to_string()).or_default();
         match kind {
@@ -289,12 +338,16 @@ impl ObjectStoreMetrics {
         path_metrics.in_flight += 1;
         path_metrics.peak_in_flight =
             path_metrics.peak_in_flight.max(path_metrics.in_flight);
+        if !matches!(kind, RequestKind::Head) {
+            path_metrics.first_request_started.get_or_insert(started);
+        }
         drop(paths);
 
         RequestTracker {
             metrics: self.clone(),
             path: path.to_string(),
-            started: Instant::now(),
+            kind,
+            started,
             body_bytes: 0,
             failed: false,
             finished: false,
@@ -346,6 +399,7 @@ impl ObjectStoreMetrics {
 
     fn request_finished(&self, tracker: &RequestTracker) {
         let elapsed = duration_ns(tracker.started.elapsed());
+        let finished = Instant::now();
         self.state
             .body_bytes
             .fetch_add(tracker.body_bytes, Ordering::Relaxed);
@@ -355,6 +409,13 @@ impl ObjectStoreMetrics {
             .expect("metrics mutex poisoned")
             .push(elapsed);
         self.state.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if !matches!(tracker.kind, RequestKind::Head) {
+            self.state
+                .request_window
+                .lock()
+                .expect("metrics mutex poisoned")
+                .last_finished = Some(finished);
+        }
 
         let mut paths = self.state.paths.lock().expect("metrics mutex poisoned");
         let metrics = paths.entry(tracker.path.clone()).or_default();
@@ -362,6 +423,9 @@ impl ObjectStoreMetrics {
         metrics.body_latency_ns = metrics.body_latency_ns.saturating_add(elapsed);
         metrics.max_body_latency_ns = metrics.max_body_latency_ns.max(elapsed);
         metrics.in_flight = metrics.in_flight.saturating_sub(1);
+        if !matches!(tracker.kind, RequestKind::Head) {
+            metrics.last_request_finished = Some(finished);
+        }
     }
 }
 
@@ -589,6 +653,7 @@ impl<T: ObjectStore> ObjectStore for MetricsObjectStore<T> {
 struct RequestTracker {
     metrics: ObjectStoreMetrics,
     path: String,
+    kind: RequestKind,
     started: Instant,
     body_bytes: u64,
     failed: bool,
@@ -658,6 +723,22 @@ fn duration_ns(duration: Duration) -> u64 {
 
 fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
+}
+
+fn request_window_ns(window: &RequestWindow) -> u64 {
+    match (window.first_started, window.last_finished) {
+        (Some(started), Some(finished)) => {
+            duration_ns(finished.saturating_duration_since(started))
+        }
+        _ => 0,
+    }
+}
+
+fn body_throughput_mib_per_s(body_bytes: u64, request_window_ns: u64) -> f64 {
+    if request_window_ns == 0 {
+        return 0.0;
+    }
+    body_bytes as f64 * 1_000_000_000.0 / request_window_ns as f64 / (1024.0 * 1024.0)
 }
 
 fn percentile(values: &[u64], percentile: usize) -> u64 {

@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -749,7 +750,7 @@ async fn coalesce_ranges_with_parallelism<F, E, Fut>(
 where
     F: Send + FnMut(Range<u64>) -> Fut,
     E: Send,
-    Fut: std::future::Future<Output = std::result::Result<Bytes, E>> + Send,
+    Fut: Future<Output = std::result::Result<Bytes, E>> + Send,
 {
     let fetched: Vec<_> = futures::stream::iter(fetch_ranges.iter().cloned())
         .map(fetch)

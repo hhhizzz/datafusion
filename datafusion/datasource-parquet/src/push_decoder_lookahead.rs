@@ -57,6 +57,8 @@ pub(crate) struct LookaheadPushDecoderStreamState {
     run_finished: bool,
     speculation_disabled: bool,
     terminated: bool,
+    #[cfg(test)]
+    termination_phase_probe: Option<TerminationPhaseProbe>,
 }
 
 /// All prefetch state that advances in lockstep with decoder runs.
@@ -406,6 +408,51 @@ enum ForegroundProgress {
     RunFinished,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct TerminationPhaseProbe {
+    phase_one_complete: Arc<AtomicBool>,
+    events: Arc<Mutex<Vec<TerminationEvent>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminationEvent {
+    PhaseOneComplete { reservation_bytes: usize },
+    RecordReaderBufferDropped { phase_one_complete: bool },
+}
+
+#[cfg(test)]
+impl TerminationPhaseProbe {
+    fn new() -> Self {
+        Self {
+            phase_one_complete: Arc::new(AtomicBool::new(false)),
+            events: Arc::new(Mutex::new(vec![])),
+        }
+    }
+
+    fn record_phase_one_complete(&self, reservation_bytes: usize) {
+        self.phase_one_complete.store(true, Ordering::SeqCst);
+        self.events
+            .lock()
+            .unwrap()
+            .push(TerminationEvent::PhaseOneComplete { reservation_bytes });
+    }
+
+    fn record_record_reader_buffer_drop(&self) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(TerminationEvent::RecordReaderBufferDropped {
+                phase_one_complete: self.phase_one_complete.load(Ordering::SeqCst),
+            });
+    }
+
+    fn events(&self) -> Vec<TerminationEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
 impl LookaheadPushDecoderStreamState {
     pub(crate) fn new(
         decoder: ParquetPushDecoder,
@@ -430,7 +477,15 @@ impl LookaheadPushDecoderStreamState {
             run_finished: false,
             speculation_disabled: false,
             terminated: false,
+            #[cfg(test)]
+            termination_phase_probe: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_termination_phase_probe(mut self, probe: TerminationPhaseProbe) -> Self {
+        self.termination_phase_probe = Some(probe);
+        self
     }
 
     /// Creates a lookahead state with one prefetch plan for every decoder run.
@@ -798,40 +853,84 @@ impl LookaheadPushDecoderStreamState {
     }
 
     fn terminate(&mut self) {
+        if self.terminated {
+            return;
+        }
         self.terminated = true;
+
+        // Phase 1: keep all record readers alive while dismantling every
+        // shared decoder buffer, reservation, permit, and staged-window lease.
+        let active_reader = self.active_reader.take();
+        let mut queued_readers = Vec::with_capacity(self.prefetched_readers.len());
+        let mut queued_resources = Vec::with_capacity(self.prefetched_readers.len());
+        let mut staged_window_leases = Vec::with_capacity(self.prefetched_readers.len());
+        while let Some(PrefetchedReader {
+            staged_window_lease,
+            resources,
+            reader,
+        }) = self.prefetched_readers.pop_front()
+        {
+            queued_readers.push(reader);
+            queued_resources.push(resources);
+            if let Some(lease) = staged_window_lease {
+                staged_window_leases.push(lease);
+            }
+        }
+
+        // The speculative driver's source reader may be destroyed while its
+        // future is cancelled, so release exact guards first.
+        self.foreground_resources.release();
+        for resources in &mut queued_resources {
+            resources.release();
+        }
+        drop(queued_resources);
+
+        // Cancelling the speculative driver clears the buffers owned by its
+        // decoder before it discards its cloned prefetch-plan owner.
+        drop(self.next_reader_future.take());
         if let Some(decoder) = self.decoder.as_mut() {
             clear_decoder_staged_buffers(decoder);
         }
-        self.foreground_resources.release();
-        self.active_reader = None;
-        self.drop_prefetched_readers();
-        self.next_reader_future = None;
-        if let Some(prefetch_plan) = self.active_prefetch_plan.as_ref() {
+
+        let active_prefetch_plan = self.active_prefetch_plan.take();
+        let pending_prefetch_plans = std::mem::take(&mut self.pending_prefetch_plans);
+        if let Some(prefetch_plan) = active_prefetch_plan.as_ref() {
             prefetch_plan
                 .lock()
                 .expect("prefetch run state must not be poisoned")
                 .discard_staged_window();
         }
+        for prefetch_plan in &pending_prefetch_plans {
+            prefetch_plan
+                .lock()
+                .expect("prefetch run state must not be poisoned")
+                .discard_staged_window();
+        }
+        drop(active_prefetch_plan);
+        drop(pending_prefetch_plans);
+
+        drop(staged_window_leases);
+
+        debug_assert_eq!(
+            self.lookahead.reservation.size(),
+            0,
+            "all lookahead resources must release before record readers"
+        );
+        #[cfg(test)]
+        if let Some(probe) = self.termination_phase_probe.as_ref() {
+            probe.record_phase_one_complete(self.lookahead.reservation.size());
+        }
+
+        // Phase 2: only now may record readers release the Bytes they own.
+        drop(active_reader);
+        drop(queued_readers);
+
         self.decoder = None;
         self.reader = None;
         self.pending_decoders.clear();
         self.active_prefetch_plan = None;
-        self.pending_prefetch_plans.clear();
         self.deferred_error = None;
         self.run_finished = false;
-    }
-
-    fn drop_prefetched_readers(&mut self) {
-        while let Some(PrefetchedReader {
-            staged_window_lease,
-            mut resources,
-            reader,
-        }) = self.prefetched_readers.pop_front()
-        {
-            drop(staged_window_lease);
-            resources.release();
-            drop(reader);
-        }
     }
 }
 
@@ -1177,6 +1276,7 @@ mod tests {
     use arrow::compute::kernels::cmp::gt;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::Bytes;
+    use datafusion_common::DataFusionError;
     use datafusion_execution::memory_pool::{
         GreedyMemoryPool, MemoryConsumer, MemoryPool, UnboundedMemoryPool,
     };
@@ -1203,7 +1303,8 @@ mod tests {
         LookaheadPushDecoderStreamState, PushDecoderOutputState, PushDecoderStreamState,
     };
     use super::{
-        PrefetchPlanQueue, PrefetchRunState, SpeculativeResources, StagingRequest,
+        NextReaderOutcome, NextReaderResult, PrefetchPlanQueue, PrefetchRunState,
+        SpeculativeResources, StagingRequest, TerminationEvent, TerminationPhaseProbe,
         checked_range_bytes, clear_decoder_staged_buffers, stage_admitted_window,
     };
     use crate::lookahead::{
@@ -1430,12 +1531,30 @@ mod tests {
         }
     }
 
+    struct RecordReaderBufferOwner {
+        bytes: Bytes,
+        probe: TerminationPhaseProbe,
+    }
+
+    impl AsRef<[u8]> for RecordReaderBufferOwner {
+        fn as_ref(&self) -> &[u8] {
+            self.bytes.as_ref()
+        }
+    }
+
+    impl Drop for RecordReaderBufferOwner {
+        fn drop(&mut self) {
+            self.probe.record_record_reader_buffer_drop();
+        }
+    }
+
     struct ScriptedAsyncFileReader {
         data: Bytes,
         metadata: Arc<ParquetMetaData>,
         row_group_spans: Arc<Vec<Range<u64>>>,
         control: ScriptControl,
         drop_probe: Option<ReaderDropProbe>,
+        buffer_probe: Option<TerminationPhaseProbe>,
     }
 
     impl ScriptedAsyncFileReader {
@@ -1488,6 +1607,7 @@ mod tests {
             let data = self.data.clone();
             let control = self.control.clone();
             let row_group_spans = Arc::clone(&self.row_group_spans);
+            let buffer_probe = self.buffer_probe.clone();
             async move {
                 let _active_fetch = control.record_fetch(ranges_by_row_group);
                 for row_group in &row_groups {
@@ -1507,11 +1627,18 @@ mod tests {
                                 let span = &row_group_spans[row_group];
                                 range.start >= span.start && range.end <= span.end
                             });
-                        if corrupt {
+                        let bytes = if corrupt {
                             let len = usize::try_from(range.end - range.start).unwrap();
                             Bytes::from(vec![0_u8; len])
                         } else {
                             data.slice(range.start as usize..range.end as usize)
+                        };
+                        match &buffer_probe {
+                            Some(probe) => Bytes::from_owner(RecordReaderBufferOwner {
+                                bytes,
+                                probe: probe.clone(),
+                            }),
+                            None => bytes,
                         }
                     })
                     .collect())
@@ -1834,12 +1961,30 @@ mod tests {
             control: ScriptControl,
             drop_probe: Option<ReaderDropProbe>,
         ) -> Box<dyn AsyncFileReader> {
+            self.reader_with_probes(control, drop_probe, None)
+        }
+
+        fn reader_with_buffer_probe(
+            &self,
+            control: ScriptControl,
+            buffer_probe: TerminationPhaseProbe,
+        ) -> Box<dyn AsyncFileReader> {
+            self.reader_with_probes(control, None, Some(buffer_probe))
+        }
+
+        fn reader_with_probes(
+            &self,
+            control: ScriptControl,
+            drop_probe: Option<ReaderDropProbe>,
+            buffer_probe: Option<TerminationPhaseProbe>,
+        ) -> Box<dyn AsyncFileReader> {
             Box::new(ScriptedAsyncFileReader {
                 data: self.data.clone(),
                 metadata: Arc::clone(&self.metadata),
                 row_group_spans: Arc::clone(&self.row_group_spans),
                 control,
                 drop_probe,
+                buffer_probe,
             })
         }
 
@@ -2121,6 +2266,41 @@ mod tests {
                 context,
             )
             .unwrap()
+        }
+
+        fn staged_state_with_record_reader_buffer_probe(
+            &self,
+            control: ScriptControl,
+            context: LookaheadFileContext,
+            batch_size: usize,
+            remaining_limit: Option<usize>,
+            probe: TerminationPhaseProbe,
+        ) -> LookaheadPushDecoderStreamState {
+            let row_group_order = (0..self.metadata.num_row_groups()).collect::<Vec<_>>();
+            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+            let decoder = self.decoder_for_row_groups_with_filter_and_batch_size(
+                Some(row_group_order.clone()),
+                &arrow_reader_metrics,
+                None,
+                batch_size,
+            );
+            let mut output = self.output_state(arrow_reader_metrics);
+            output.remaining_limit = remaining_limit;
+            LookaheadPushDecoderStreamState::new_with_prefetch_plans(
+                decoder,
+                VecDeque::new(),
+                PrefetchPlanQueue {
+                    active: self.prefetch_plan(row_group_order),
+                    pending: VecDeque::new(),
+                    metrics: self.prefetch_metrics(),
+                    staging_enabled: true,
+                },
+                self.reader_with_buffer_probe(control, probe.clone()),
+                output,
+                context,
+            )
+            .unwrap()
+            .with_termination_phase_probe(probe)
         }
 
         fn lookahead_stream(
@@ -2681,6 +2861,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_stream_drop_releases_all_leases_before_record_reader_buffers() {
+        let fixture = ThreeRowGroupFixture::dense_prefetch(3);
+        let control = ScriptControl::new(None);
+        let (coordinator, context) =
+            fixture.lookahead_context_with_depth_and_window(2, 2);
+        let reservation = Arc::clone(&context.reservation);
+        let probe = TerminationPhaseProbe::new();
+        let mut stream = fixture
+            .staged_state_with_record_reader_buffer_probe(
+                control.clone(),
+                context,
+                100_000,
+                None,
+                probe.clone(),
+            )
+            .into_stream();
+
+        assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), 100_000);
+        assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), 100_000);
+        assert!(control.has_request_for(1));
+        assert!(control.has_request_for(2));
+        assert!(reservation.size() > 0);
+
+        drop(stream);
+
+        assert_eq!(reservation.size(), 0);
+        assert_shared_budgets_released(&coordinator);
+        assert_record_reader_buffers_drop_after_phase_one(&probe);
+    }
+
+    #[tokio::test]
+    async fn limit_termination_releases_all_leases_before_record_reader_buffers() {
+        let fixture = ThreeRowGroupFixture::dense_prefetch(3);
+        let control = ScriptControl::new(None);
+        let (coordinator, context) =
+            fixture.lookahead_context_with_depth_and_window(2, 2);
+        let reservation = Arc::clone(&context.reservation);
+        let probe = TerminationPhaseProbe::new();
+        let mut stream = fixture
+            .staged_state_with_record_reader_buffer_probe(
+                control.clone(),
+                context,
+                1,
+                Some(2),
+                probe.clone(),
+            )
+            .into_stream();
+
+        assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), 1);
+        assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), 1);
+        assert!(control.has_request_for(1));
+        assert!(control.has_request_for(2));
+        assert_eq!(reservation.size(), 0);
+        assert!(stream.next().await.is_none());
+
+        assert_shared_budgets_released(&coordinator);
+        assert_record_reader_buffers_drop_after_phase_one(&probe);
+    }
+
+    #[tokio::test]
+    async fn deferred_error_termination_releases_all_leases_before_record_reader_buffers()
+    {
+        let fixture = ThreeRowGroupFixture::dense_prefetch(3);
+        let control = ScriptControl::new(None);
+        let (coordinator, context) =
+            fixture.lookahead_context_with_depth_and_window(2, 2);
+        let reservation = Arc::clone(&context.reservation);
+        let probe = TerminationPhaseProbe::new();
+        let mut state = fixture.staged_state_with_record_reader_buffer_probe(
+            control,
+            context,
+            100_000,
+            None,
+            probe.clone(),
+        );
+
+        let (_, next_state) = state.transition().await.unwrap();
+        state = next_state;
+        let (_, next_state) = state.transition().await.unwrap();
+        state = next_state;
+        assert!(state.active_reader.is_some());
+        assert_eq!(state.prefetched_readers.len(), 2);
+        assert!(
+            state
+                .prefetched_readers
+                .iter()
+                .all(|reader| reader.staged_window_lease.is_some())
+        );
+
+        let decoder = state.decoder.take().unwrap();
+        let reader = state.reader.take().unwrap();
+        state.accept_next_reader_outcome(NextReaderOutcome {
+            decoder,
+            reader,
+            result: NextReaderResult::Error(DataFusionError::Execution(
+                "scripted deferred termination".to_string(),
+            )),
+            resources: SpeculativeResources::default(),
+        });
+        assert!(state.deferred_error.is_some());
+        state.terminate();
+
+        assert_eq!(reservation.size(), 0);
+        assert_shared_budgets_released(&coordinator);
+        assert_record_reader_buffers_drop_after_phase_one(&probe);
+    }
+
+    #[tokio::test]
     async fn dense_window_four_fetches_the_next_four_row_groups_before_exact_needs() {
         let fixture = ThreeRowGroupFixture::dense_prefetch(5);
         let control = ScriptControl::new(None);
@@ -3187,6 +3475,42 @@ mod tests {
             .unwrap()
             .values()
             .to_vec()
+    }
+
+    fn assert_record_reader_buffers_drop_after_phase_one(probe: &TerminationPhaseProbe) {
+        let events = probe.events();
+        let phase_one = events
+            .iter()
+            .position(|event| matches!(event, TerminationEvent::PhaseOneComplete { .. }))
+            .expect("two-phase termination must mark completed resource release");
+        assert_eq!(
+            events[phase_one],
+            TerminationEvent::PhaseOneComplete {
+                reservation_bytes: 0
+            }
+        );
+
+        let reader_buffer_drops = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                TerminationEvent::RecordReaderBufferDropped { phase_one_complete } => {
+                    Some((index, *phase_one_complete))
+                }
+                TerminationEvent::PhaseOneComplete { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            reader_buffer_drops.len() >= 3,
+            "active plus two queued record readers must own instrumented buffers: {events:?}"
+        );
+        assert!(
+            reader_buffer_drops
+                .iter()
+                .all(|(index, phase_one_complete)| {
+                    *index > phase_one && *phase_one_complete
+                })
+        );
     }
 
     fn assert_shared_budgets_released(coordinator: &Arc<ParquetLookaheadCoordinator>) {

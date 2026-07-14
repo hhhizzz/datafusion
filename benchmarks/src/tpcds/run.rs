@@ -16,7 +16,8 @@
 // under the License.
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::q39_reuse::{self, Q39_REUSE_TABLE};
@@ -105,10 +106,13 @@ struct IterationExecution {
     physical_plans: Vec<Arc<dyn ExecutionPlan>>,
 }
 
-struct TpcdsQueryResult {
+struct TpcdsIterationEvidence {
+    query: usize,
+    iteration: usize,
     elapsed: std::time::Duration,
     row_count: usize,
     result_hash: String,
+    row_group_prefetch_metrics: RowGroupPrefetchMetrics,
 }
 
 /// Benchmark projection of Route B metrics.
@@ -198,6 +202,70 @@ fn row_group_prefetch_metrics_line(
     Ok(format!(
         "{ROW_GROUP_PREFETCH_METRICS_LABEL} query={query} iteration={iteration} {json}"
     ))
+}
+
+fn commit_query_evidence(
+    benchmark_run: &mut BenchmarkRun,
+    committed_evidence: &mut Vec<TpcdsIterationEvidence>,
+    query_run: Result<Vec<TpcdsIterationEvidence>>,
+) -> Result<()> {
+    let evidence = match query_run {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            benchmark_run.mark_failed();
+            return Err(error);
+        }
+    };
+    for record in &evidence {
+        benchmark_run.write_iter_with_result_hash(
+            record.elapsed,
+            record.row_count,
+            Some(record.result_hash.clone()),
+        );
+    }
+    committed_evidence.extend(evidence);
+    Ok(())
+}
+
+fn publish_evidence_records(
+    evidence: &[TpcdsIterationEvidence],
+    output: &mut impl Write,
+) -> Result<()> {
+    let lines = evidence
+        .iter()
+        .map(|record| {
+            let result_hash = format!(
+                "TPCDS_RESULT_HASH query={} iteration={} sha256={} rows={}",
+                record.query, record.iteration, record.result_hash, record.row_count
+            );
+            let metrics = row_group_prefetch_metrics_line(
+                record.query,
+                record.iteration,
+                &record.row_group_prefetch_metrics,
+            )?;
+            Ok([result_hash, metrics])
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for [result_hash, metrics] in lines {
+        writeln!(output, "{result_hash}")
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        writeln!(output, "{metrics}")
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    }
+    Ok(())
+}
+
+fn commit_benchmark_and_publish(
+    benchmark_run: &BenchmarkRun,
+    output_path: Option<&Path>,
+    evidence: &[TpcdsIterationEvidence],
+    output: &mut impl Write,
+) -> Result<()> {
+    // `None` deliberately uses the same in-memory BenchmarkRun commit barrier
+    // as a configured JSON path before any formal evidence reaches stdout.
+    benchmark_run.maybe_write_json(output_path)?;
+    publish_evidence_records(evidence, output)
 }
 
 pub const TPCDS_TABLES: &[&str] = &[
@@ -315,6 +383,7 @@ impl RunOpt {
         };
 
         let mut benchmark_run = BenchmarkRun::new();
+        let mut committed_evidence = Vec::new();
         let mut config = self
             .common
             .config()?
@@ -341,23 +410,24 @@ impl RunOpt {
             let query_run = self
                 .benchmark_query(query_id, &ctx, object_store_metrics.as_ref())
                 .await;
-            match query_run {
-                Ok(query_results) => {
-                    for iter in query_results {
-                        benchmark_run.write_iter_with_result_hash(
-                            iter.elapsed,
-                            iter.row_count,
-                            Some(iter.result_hash),
-                        );
-                    }
-                }
-                Err(e) => {
-                    benchmark_run.mark_failed();
-                    eprintln!("Query {query_id} failed: {e}");
-                }
+            if let Err(error) = commit_query_evidence(
+                &mut benchmark_run,
+                &mut committed_evidence,
+                query_run,
+            ) {
+                eprintln!("Query {query_id} failed: {error}");
             }
         }
-        benchmark_run.maybe_write_json(self.output_path.as_ref())?;
+        {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            commit_benchmark_and_publish(
+                &benchmark_run,
+                self.output_path.as_deref(),
+                &committed_evidence,
+                &mut stdout,
+            )?;
+        }
         benchmark_run.maybe_print_failures();
         Ok(())
     }
@@ -367,10 +437,9 @@ impl RunOpt {
         query_id: usize,
         ctx: &SessionContext,
         object_store_metrics: Option<&ObjectStoreMetrics>,
-    ) -> Result<Vec<TpcdsQueryResult>> {
+    ) -> Result<Vec<TpcdsIterationEvidence>> {
         let mut millis = vec![];
-        // run benchmark
-        let mut query_results = vec![];
+        let mut evidence = vec![];
 
         let sql = &get_query_sql(self.query_path.to_str().unwrap(), query_id)?;
 
@@ -422,24 +491,21 @@ impl RunOpt {
             let result_hash =
                 canonical_result_hash(&result.output.schema, &result.output.batches)?;
             let prefetch_metrics = row_group_prefetch_metrics(&result.physical_plans);
-            let prefetch_metrics_line =
-                row_group_prefetch_metrics_line(query_id, i, &prefetch_metrics)?;
 
             if let Some(line) = object_store_metrics_line {
                 println!("{line}");
             }
-            println!("{prefetch_metrics_line}");
             info!("output:\n\n{formatted_output}\n\n");
-            println!(
-                "TPCDS_RESULT_HASH query={query_id} iteration={i} sha256={result_hash} rows={row_count}"
-            );
             println!(
                 "Query {query_id} iteration {i} took {ms:.1} ms and returned {row_count} rows"
             );
-            query_results.push(TpcdsQueryResult {
+            evidence.push(TpcdsIterationEvidence {
+                query: query_id,
+                iteration: i,
                 elapsed,
                 row_count,
                 result_hash,
+                row_group_prefetch_metrics: prefetch_metrics,
             });
         }
 
@@ -449,7 +515,7 @@ impl RunOpt {
         // Print memory stats using mimalloc (only when compiled with --features mimalloc_extended)
         print_memory_stats();
 
-        Ok(query_results)
+        Ok(evidence)
     }
 
     async fn register_tables(&self, ctx: &SessionContext) -> Result<()> {
@@ -639,7 +705,7 @@ impl RunOpt {
         let path = format!("{path}/{table}.parquet");
 
         // Check if the file exists
-        if !std::path::Path::new(&path).exists() {
+        if !Path::new(&path).exists() {
             eprintln!("Warning registering {table}: Table file does not exist: {path}");
         }
 
@@ -939,6 +1005,7 @@ fn s3_object_store_url(path: &str) -> Result<Option<ObjectStoreUrl>> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::{io, process::Command, str};
 
     use arrow::array::builder::{
         StringBuilder, StringDictionaryBuilder, StringViewBuilder,
@@ -972,6 +1039,201 @@ mod tests {
             hash,
             canonical_result_hash(&schema, &reordered_batches).unwrap()
         );
+    }
+
+    const FAILED_LATER_ITERATION_CHILD_ENV: &str =
+        "DATAFUSION_TPCDS_FAILED_LATER_ITERATION_CHILD";
+
+    #[test]
+    fn failed_later_iteration_does_not_publish_formal_evidence() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tpcds::run::tests::failed_later_iteration_child",
+                "--nocapture",
+            ])
+            .env(FAILED_LATER_ITERATION_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = str::from_utf8(&output.stdout).unwrap();
+        assert!(!stdout.contains("TPCDS_RESULT_HASH"), "{stdout}");
+        assert!(
+            !stdout.contains("TPCDS_ROW_GROUP_PREFETCH_METRICS"),
+            "{stdout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_later_iteration_child() {
+        if std::env::var(FAILED_LATER_ITERATION_CHILD_ENV).as_deref() != Ok("1") {
+            return;
+        }
+
+        let query_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            query_dir.path().join("1.sql"),
+            "CREATE TABLE evidence_once AS VALUES (1);",
+        )
+        .unwrap();
+        let mut runner = q39_reuse_runner();
+        runner.common.iterations = 2;
+        runner.query_path = query_dir.path().to_path_buf();
+
+        let result = runner
+            .benchmark_query(1, &SessionContext::new(), None)
+            .await;
+        assert!(result.is_err(), "second iteration must fail");
+    }
+
+    #[test]
+    fn failed_query_discards_all_staged_evidence_before_commit() {
+        let query_run: Result<Vec<_>> = vec![
+            Ok(test_evidence(0, 'a')),
+            Err(DataFusionError::Execution("iteration 1 failed".into())),
+        ]
+        .into_iter()
+        .collect();
+        let mut benchmark_run = BenchmarkRun::new();
+        benchmark_run.start_new_case("Query 72");
+        let mut committed_evidence = Vec::new();
+
+        assert!(
+            commit_query_evidence(
+                &mut benchmark_run,
+                &mut committed_evidence,
+                query_run,
+            )
+            .is_err()
+        );
+        assert!(committed_evidence.is_empty());
+
+        let benchmark: serde_json::Value =
+            serde_json::from_str(&benchmark_run.to_json()).unwrap();
+        assert_eq!(benchmark["queries"][0]["success"], false);
+        assert_eq!(benchmark["queries"][0]["iterations"], serde_json::json!([]));
+
+        let mut published = Vec::new();
+        commit_benchmark_and_publish(
+            &benchmark_run,
+            None,
+            &committed_evidence,
+            &mut published,
+        )
+        .unwrap();
+        assert!(published.is_empty());
+    }
+
+    #[test]
+    fn successful_query_publishes_two_lines_per_iteration_after_json_commit() {
+        let mut benchmark_run = BenchmarkRun::new();
+        benchmark_run.start_new_case("Query 72");
+        let mut committed_evidence = Vec::new();
+        commit_query_evidence(
+            &mut benchmark_run,
+            &mut committed_evidence,
+            Ok(vec![test_evidence(0, 'a'), test_evidence(1, 'b')]),
+        )
+        .unwrap();
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let json_path = output_dir.path().join("run.json");
+        let mut publisher = JsonCommitObserver::new(json_path.clone());
+        commit_benchmark_and_publish(
+            &benchmark_run,
+            Some(json_path.as_path()),
+            &committed_evidence,
+            &mut publisher,
+        )
+        .unwrap();
+
+        assert!(publisher.saw_committed_json_before_output);
+        let benchmark: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(json_path).unwrap()).unwrap();
+        let lines = str::from_utf8(&publisher.output)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), committed_evidence.len() * 2);
+        for (index, evidence) in committed_evidence.iter().enumerate() {
+            assert_eq!(
+                lines[index * 2],
+                format!(
+                    "TPCDS_RESULT_HASH query={} iteration={} sha256={} rows={}",
+                    evidence.query,
+                    evidence.iteration,
+                    evidence.result_hash,
+                    evidence.row_count,
+                )
+            );
+            let metrics_json = lines[index * 2 + 1]
+                .strip_prefix(&format!(
+                    "TPCDS_ROW_GROUP_PREFETCH_METRICS query={} iteration={} ",
+                    evidence.query, evidence.iteration
+                ))
+                .unwrap();
+            let metrics: serde_json::Value = serde_json::from_str(metrics_json).unwrap();
+            assert_eq!(metrics["prefetch_windows"], index + 1);
+            assert_eq!(
+                benchmark["queries"][0]["iterations"][index]["result_hash"],
+                evidence.result_hash
+            );
+        }
+    }
+
+    fn test_evidence(iteration: usize, hash_byte: char) -> TpcdsIterationEvidence {
+        TpcdsIterationEvidence {
+            query: 72,
+            iteration,
+            elapsed: std::time::Duration::from_millis(iteration as u64 + 1),
+            row_count: iteration + 10,
+            result_hash: hash_byte.to_string().repeat(64),
+            row_group_prefetch_metrics: RowGroupPrefetchMetrics {
+                prefetch_windows: iteration + 1,
+                ..Default::default()
+            },
+        }
+    }
+
+    struct JsonCommitObserver {
+        json_path: PathBuf,
+        output: Vec<u8>,
+        saw_committed_json_before_output: bool,
+    }
+
+    impl JsonCommitObserver {
+        fn new(json_path: PathBuf) -> Self {
+            Self {
+                json_path,
+                output: Vec::new(),
+                saw_committed_json_before_output: false,
+            }
+        }
+    }
+
+    impl Write for JsonCommitObserver {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.output.is_empty() && !buf.is_empty() {
+                self.saw_committed_json_before_output =
+                    fs::read_to_string(&self.json_path)
+                        .ok()
+                        .and_then(|json| {
+                            serde_json::from_str::<serde_json::Value>(&json).ok()
+                        })
+                        .is_some();
+            }
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]

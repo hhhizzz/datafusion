@@ -183,6 +183,7 @@ impl PushDecoderOutputState {
 }
 
 /// Compatibility serial driver used by the lookahead test oracle.
+#[cfg(test)]
 pub(crate) struct PushDecoderStreamState {
     pub(crate) decoder: ParquetPushDecoder,
     pub(crate) pending_decoders: VecDeque<ParquetPushDecoder>,
@@ -190,6 +191,7 @@ pub(crate) struct PushDecoderStreamState {
     pub(crate) output: PushDecoderOutputState,
 }
 
+#[cfg(test)]
 impl PushDecoderStreamState {
     pub(crate) fn into_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
         futures::stream::unfold(self, |state| async move { state.transition().await })

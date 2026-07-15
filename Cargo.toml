@@ -112,6 +112,7 @@ arrow-ipc = { version = "59.1.0", default-features = false, features = [
     "zstd",
 ] }
 arrow-ord = { version = "59.1.0", default-features = false }
+arrow-row = { version = "59.1.0", default-features = false }
 arrow-schema = { version = "59.1.0", default-features = false }
 async-trait = "0.1.89"
 bigdecimal = "0.4.8"

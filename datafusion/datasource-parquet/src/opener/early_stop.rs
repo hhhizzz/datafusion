@@ -123,8 +123,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use arrow::datatypes::Schema;
-    use datafusion_common::{ScalarValue, Statistics};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::stats::Precision;
+    use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
     use datafusion_datasource::PartitionedFile;
     use datafusion_physical_expr::expressions::Literal;
     use datafusion_physical_plan::metrics::Count;
@@ -170,10 +171,30 @@ mod tests {
     }
 
     fn always_pruning_file_pruner(schema: &Arc<Schema>) -> FilePruner {
-        let file = PartitionedFile::new("early-stop.parquet", 0)
-            .with_statistics(Arc::new(Statistics::new_unknown(schema)));
+        let file = PartitionedFile::new("early-stop.parquet", 0).with_statistics(
+            Arc::new(Statistics {
+                num_rows: Precision::Exact(1),
+                total_byte_size: Precision::Absent,
+                column_statistics: vec![ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    max_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                    min_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                    sum_value: Precision::Absent,
+                    distinct_count: Precision::Exact(1),
+                    byte_size: Precision::Absent,
+                }],
+            }),
+        );
         let predicate = Arc::new(Literal::new(ScalarValue::Boolean(Some(false))));
         FilePruner::try_new(predicate, schema, &file, Count::new()).unwrap()
+    }
+
+    fn test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]))
     }
 
     fn pruning_metrics() -> PruningMetrics {
@@ -184,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_transition_drops_inner_before_returning_eof() {
-        let schema = Arc::new(Schema::empty());
+        let schema = test_schema();
         let batch = RecordBatch::new_empty(Arc::clone(&schema));
         let (inner, dropped) = DropObservedStream::new([Ok(batch)]);
         let mut stream = EarlyStoppingStream::new(
@@ -203,7 +224,7 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_eof_drops_inner_and_remains_fused() {
-        let schema = Arc::new(Schema::empty());
+        let schema = test_schema();
         let (inner, dropped) = DropObservedStream::new([]);
         let mut stream = EarlyStoppingStream::new(
             inner,
@@ -221,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn item_error_preserves_inner_for_later_poll() {
-        let schema = Arc::new(Schema::empty());
+        let schema = test_schema();
         let batch = RecordBatch::new_empty(Arc::clone(&schema));
         let error = datafusion_common::DataFusionError::Execution(
             "scripted inner error".to_string(),

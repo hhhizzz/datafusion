@@ -1726,6 +1726,7 @@ name = "datafusion-benchmarks"
 version = "54.0.0"
 dependencies = [
  "arrow",
+ "arrow-row",
  "async-trait",
  "bytes",
  "clap",
@@ -1745,6 +1746,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "snmalloc-rs",
  "tempfile",
  "tokio",

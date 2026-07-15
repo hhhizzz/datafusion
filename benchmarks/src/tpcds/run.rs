@@ -493,7 +493,7 @@ impl RunOpt {
         let path = format!("{path}/{table}.parquet");
 
         // Check if the file exists
-        if !std::path::Path::new(&path).exists() {
+        if !Path::new(&path).exists() {
             eprintln!("Warning registering {table}: Table file does not exist: {path}");
         }
 

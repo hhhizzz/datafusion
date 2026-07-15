@@ -29,7 +29,7 @@ use arrow::datatypes::{
     SchemaRef, TimeUnit, UnionMode,
 };
 use arrow::ipc::writer::{
-    CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+    DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions,
 };
 use datafusion_common::parsers::CsvQuoteStyle;
 use datafusion_common::{
@@ -949,6 +949,7 @@ impl TryFrom<&ParquetOptions> for protobuf::ParquetOptions {
             coerce_int96_opt: value.coerce_int96.clone().map(protobuf::parquet_options::CoerceInt96Opt::CoerceInt96),
             coerce_int96_tz_opt: value.coerce_int96_tz.clone().map(protobuf::parquet_options::CoerceInt96TzOpt::CoerceInt96Tz),
             max_predicate_cache_size_opt: value.max_predicate_cache_size.map(|v| protobuf::parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(v as u64)),
+            max_row_group_bytes_opt: value.max_row_group_bytes.map(|v| protobuf::parquet_options::MaxRowGroupBytesOpt::MaxRowGroupBytes(v.get() as u64)),
             content_defined_chunking: Some((&value.content_defined_chunking).into()),
         })
     }
@@ -1122,7 +1123,7 @@ fn encode_scalar_nested_value(
         &mut dict_tracker,
         &write_options,
     );
-    let mut compression_context = CompressionContext::default();
+    let mut compression_context = IpcWriteContext::default();
     let (encoded_dictionaries, encoded_message) = ipc_gen
         .encode(
             &batch,

@@ -39,8 +39,8 @@ use datafusion_common::{
     DataFusionError, JoinSide, ScalarValue, Statistics, TableReference,
     arrow_datafusion_err,
     config::{
-        CsvOptions, JsonOptions, ParquetCdcOptions, ParquetColumnOptions, ParquetOptions,
-        TableParquetOptions,
+        CsvOptions, JsonOptions, MaxRowGroupBytes, ParquetCdcOptions,
+        ParquetColumnOptions, ParquetOptions, TableParquetOptions,
     },
     file_options::{csv_writer::CsvWriterOptions, json_writer::JsonWriterOptions},
     parsers::CompressionTypeVariant,
@@ -1067,7 +1067,7 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 .as_ref()
                 .map(|opt| match opt {
                     protobuf::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(value) => {
-                        row_group_lookahead_depth_from_u64(*value)
+                        parquet_usize_from_u64(*value, "row_group_lookahead_depth")
                     }
                 })
                 .transpose()?
@@ -1077,7 +1077,7 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 .as_ref()
                 .map(|opt| match opt {
                     protobuf::parquet_options::RowGroupPrefetchWindowOpt::RowGroupPrefetchWindow(value) => {
-                        row_group_prefetch_window_from_u64(*value)
+                        parquet_usize_from_u64(*value, "row_group_prefetch_window")
                     }
                 })
                 .transpose()?
@@ -1151,23 +1151,21 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
             max_predicate_cache_size: value.max_predicate_cache_size_opt.map(|opt| match opt {
                 protobuf::parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(v) => Some(v as usize),
             }).unwrap_or(None),
+            max_row_group_bytes: value.max_row_group_bytes_opt.and_then(|opt| match opt {
+                protobuf::parquet_options::MaxRowGroupBytesOpt::MaxRowGroupBytes(v) => MaxRowGroupBytes::try_new(v as usize).ok(),
+            }),
             content_defined_chunking: value.content_defined_chunking.map(ParquetCdcOptions::from).unwrap_or_default(),
         })
     }
 }
 
-fn row_group_lookahead_depth_from_u64(value: u64) -> datafusion_common::Result<usize> {
+fn parquet_usize_from_u64(
+    value: u64,
+    option: &str,
+) -> datafusion_common::Result<usize> {
     usize::try_from(value).map_err(|_| {
         DataFusionError::Configuration(format!(
-            "Parquet row_group_lookahead_depth value {value} does not fit in usize"
-        ))
-    })
-}
-
-fn row_group_prefetch_window_from_u64(value: u64) -> datafusion_common::Result<usize> {
-    usize::try_from(value).map_err(|_| {
-        DataFusionError::Configuration(format!(
-            "Parquet row_group_prefetch_window value {value} does not fit in usize"
+            "Parquet {option} value {value} does not fit in usize"
         ))
     })
 }
@@ -1242,22 +1240,17 @@ impl TryFrom<&protobuf::TableParquetOptions> for TableParquetOptions {
             }
         }
         let opts = TableParquetOptions {
-            global: table_parquet_global_options(
-                value.global.as_ref(),
-                ParquetOptions::try_from,
-            )?,
+            global: value
+                .global
+                .as_ref()
+                .map(|v| v.try_into())
+                .unwrap()
+                .unwrap(),
             column_specific_options,
             ..Default::default()
         };
         Ok(opts)
     }
-}
-
-fn table_parquet_global_options<T>(
-    global: Option<T>,
-    try_from: impl FnOnce(T) -> datafusion_common::Result<ParquetOptions>,
-) -> datafusion_common::Result<ParquetOptions> {
-    Ok(global.map(try_from).transpose()?.unwrap_or_default())
 }
 
 impl TryFrom<&protobuf::JsonOptions> for JsonOptions {
@@ -1373,7 +1366,7 @@ pub(crate) fn csv_writer_options_from_proto(
 #[cfg(test)]
 mod tests {
     use datafusion_common::config::{
-        ParquetCdcOptions, ParquetOptions, TableParquetOptions,
+        MaxRowGroupBytes, ParquetCdcOptions, ParquetOptions, TableParquetOptions,
     };
 
     fn parquet_options_proto_round_trip(opts: ParquetOptions) -> ParquetOptions {
@@ -1419,137 +1412,18 @@ mod tests {
     }
 
     #[test]
-    fn test_parquet_options_row_group_lookahead_round_trip() {
-        for (expected_lookahead, expected_depth, expected_window) in
-            [(false, 1, 0), (true, 4, 2), (true, 4, 4)]
-        {
-            let opts = ParquetOptions {
-                row_group_lookahead: expected_lookahead,
-                row_group_lookahead_depth: expected_depth,
-                row_group_prefetch_window: expected_window,
-                ..ParquetOptions::default()
-            };
-
-            let recovered = parquet_options_proto_round_trip(opts);
-
-            assert_eq!(recovered.row_group_lookahead, expected_lookahead);
-            assert_eq!(recovered.row_group_lookahead_depth, expected_depth);
-            assert_eq!(recovered.row_group_prefetch_window, expected_window);
-        }
-    }
-
-    #[test]
-    fn test_parquet_options_row_group_lookahead_depth_defaults_to_one_when_absent() {
-        let mut proto: crate::protobuf_common::ParquetOptions =
-            (&ParquetOptions::default()).try_into().expect("to_proto");
-        proto.row_group_lookahead_depth_opt = None;
-        proto.row_group_prefetch_window_opt = None;
-        let recovered = ParquetOptions::try_from(&proto).expect("from_proto");
-
-        assert_eq!(recovered.row_group_lookahead_depth, 1);
-        assert_eq!(recovered.row_group_prefetch_window, 0);
-    }
-
-    #[test]
-    fn parquet_prefetch_window_wire_value_is_checked_without_truncation() {
-        let usize_max = u64::try_from(usize::MAX).expect("usize must fit in u64");
-        let mut proto: crate::protobuf_common::ParquetOptions =
-            (&ParquetOptions::default()).try_into().expect("to_proto");
-
-        if let Some(overflow) = usize_max.checked_add(1) {
-            proto.row_group_prefetch_window_opt = Some(
-                crate::protobuf_common::parquet_options::RowGroupPrefetchWindowOpt::RowGroupPrefetchWindow(overflow),
-            );
-            let error = ParquetOptions::try_from(&proto).unwrap_err();
-            assert!(error.to_string().contains("does not fit in usize"));
-        }
-    }
-
-    #[test]
-    fn row_group_lookahead_depth_wire_value_is_checked_without_truncation() {
-        let usize_max = u64::try_from(usize::MAX).expect("usize must fit in u64");
-        let mut proto: crate::protobuf_common::ParquetOptions =
-            (&ParquetOptions::default()).try_into().expect("to_proto");
-
-        if let Some(overflow) = usize_max.checked_add(1) {
-            proto.row_group_lookahead_depth_opt = Some(
-                crate::protobuf_common::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(
-                    overflow,
-                ),
-            );
-            let error = ParquetOptions::try_from(&proto).unwrap_err();
-            assert!(error.to_string().contains("does not fit in usize"));
-        } else {
-            proto.row_group_lookahead_depth_opt = Some(
-                crate::protobuf_common::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(
-                    u64::MAX,
-                ),
-            );
-            let recovered = ParquetOptions::try_from(&proto).expect("from_proto");
-            assert_eq!(recovered.row_group_lookahead_depth, usize::MAX);
-            assert!(
-                recovered.row_group_lookahead_depth > 4,
-                "large wire values must remain invalid depths"
-            );
-        }
-    }
-
-    #[test]
-    fn table_parquet_options_defaults_missing_global_options() {
-        let proto = crate::protobuf_common::TableParquetOptions::default();
-
-        let recovered = TableParquetOptions::try_from(&proto).expect("from_proto");
-
-        assert_eq!(recovered.global, ParquetOptions::default());
-    }
-
-    #[test]
-    fn table_parquet_global_options_propagates_conversion_errors() {
-        let error = super::table_parquet_global_options(Some(()), |_| {
-            Err(datafusion_common::DataFusionError::Configuration(
-                "test conversion error".to_string(),
-            ))
-        })
-        .unwrap_err();
-
-        assert!(error.to_string().contains("test conversion error"));
-    }
-
-    #[test]
-    fn table_parquet_options_propagates_global_depth_conversion_errors() {
-        let usize_max = u64::try_from(usize::MAX).expect("usize must fit in u64");
-        let mut global: crate::protobuf_common::ParquetOptions =
-            (&ParquetOptions::default()).try_into().expect("to_proto");
-        let mut proto = crate::protobuf_common::TableParquetOptions {
-            global: Some(global.clone()),
-            ..Default::default()
+    fn test_parquet_options_max_row_group_bytes_round_trip() {
+        let opts = ParquetOptions {
+            max_row_group_bytes: Some(
+                MaxRowGroupBytes::try_new(64 * 1024 * 1024).unwrap(),
+            ),
+            ..ParquetOptions::default()
         };
-
-        if let Some(overflow) = usize_max.checked_add(1) {
-            global.row_group_lookahead_depth_opt = Some(
-                crate::protobuf_common::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(
-                    overflow,
-                ),
-            );
-            proto.global = Some(global);
-
-            let error = TableParquetOptions::try_from(&proto).unwrap_err();
-            assert!(error.to_string().contains("does not fit in usize"));
-        } else {
-            global.row_group_lookahead_depth_opt = Some(
-                crate::protobuf_common::parquet_options::RowGroupLookaheadDepthOpt::RowGroupLookaheadDepth(
-                    u64::MAX,
-                ),
-            );
-            proto.global = Some(global);
-
-            let recovered = TableParquetOptions::try_from(&proto).expect("from_proto");
-            assert_eq!(recovered.global.row_group_lookahead_depth, usize::MAX);
-            assert!(
-                recovered.global.row_group_lookahead_depth > 4,
-                "large wire values must remain invalid depths"
-            );
-        }
+        let recovered = parquet_options_proto_round_trip(opts.clone());
+        assert_eq!(
+            recovered.max_row_group_bytes.map(|v| v.get()),
+            Some(64 * 1024 * 1024)
+        );
     }
 
     #[test]

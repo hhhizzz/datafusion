@@ -33,7 +33,7 @@ use datafusion_common::utils::{
 use datafusion_common::{
     Result, exec_err, internal_err, plan_err, types::NativeType, utils::list_ndims,
 };
-use datafusion_expr_common::signature::ArrayFunctionArgument;
+use datafusion_expr_common::signature::{ArrayFunctionArgument, EncodingPreservation};
 use datafusion_expr_common::type_coercion::binary::type_union_resolution;
 use datafusion_expr_common::{
     signature::{ArrayFunctionSignature, FIXED_SIZE_LIST_WILDCARD, TIMEZONE_WILDCARD},
@@ -586,6 +586,52 @@ fn get_valid_types(
         arguments: &[ArrayFunctionArgument],
         array_coercion: Option<&ListCoercion>,
     ) -> Result<Vec<Vec<DataType>>> {
+        fn rebuild_array_type(
+            current_type: &DataType,
+            element_type: &DataType,
+            nullable: bool,
+            large_list: bool,
+            fixed_size: Option<i32>,
+        ) -> DataType {
+            // Preserve the original list field when possible so field name or
+            // metadata differences do not introduce otherwise unnecessary casts.
+            let field = match current_type {
+                DataType::List(field)
+                | DataType::LargeList(field)
+                | DataType::FixedSizeList(field, _) => Some(Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(element_type.clone())
+                        .with_nullable(nullable),
+                )),
+                _ => None,
+            };
+
+            if large_list {
+                field.map_or_else(
+                    || DataType::new_large_list(element_type.clone(), nullable),
+                    DataType::LargeList,
+                )
+            } else if let Some(size) = fixed_size {
+                field.map_or_else(
+                    || {
+                        DataType::new_fixed_size_list(
+                            element_type.clone(),
+                            size,
+                            nullable,
+                        )
+                    },
+                    |field| DataType::FixedSizeList(field, size),
+                )
+            } else {
+                field.map_or_else(
+                    || DataType::new_list(element_type.clone(), nullable),
+                    DataType::List,
+                )
+            }
+        }
+
         if current_types.len() != arguments.len() {
             return Ok(vec![vec![]]);
         }
@@ -657,21 +703,13 @@ fn get_valid_types(
                     ArrayFunctionArgument::Array => {
                         if current_type.is_null() {
                             DataType::Null
-                        } else if large_list {
-                            DataType::new_large_list(
-                                element_type.clone(),
-                                is_nested_item_nullable.unwrap_or(true),
-                            )
-                        } else if let Some(size) = list_sizes.next() {
-                            DataType::new_fixed_size_list(
-                                element_type.clone(),
-                                size,
-                                is_nested_item_nullable.unwrap_or(true),
-                            )
                         } else {
-                            DataType::new_list(
-                                element_type.clone(),
+                            rebuild_array_type(
+                                current_type,
+                                &element_type,
                                 is_nested_item_nullable.unwrap_or(true),
+                                large_list,
+                                list_sizes.next(),
                             )
                         }
                     }
@@ -835,9 +873,39 @@ fn get_valid_types(
         TypeSignature::Coercible(param_types) => {
             function_length_check(function_name, current_types.len(), param_types.len())?;
 
+            fn cast_origin(
+                current_type: &DataType,
+                encoding_preservation: EncodingPreservation,
+            ) -> &DataType {
+                if encoding_preservation.preserve_dictionary()
+                    && let DataType::Dictionary(_, value_type) = current_type
+                {
+                    value_type
+                } else {
+                    current_type
+                }
+            }
+
+            fn preserve_encoding(
+                current_type: &DataType,
+                casted_type: DataType,
+                encoding_preservation: EncodingPreservation,
+            ) -> DataType {
+                if encoding_preservation.preserve_dictionary()
+                    && let DataType::Dictionary(key_type, _) = current_type
+                    && !matches!(casted_type, DataType::Dictionary(_, _))
+                {
+                    DataType::Dictionary(key_type.clone(), Box::new(casted_type))
+                } else {
+                    casted_type
+                }
+            }
+
             let mut new_types = Vec::with_capacity(current_types.len());
             for (current_type, param) in current_types.iter().zip(param_types.iter()) {
                 let current_native_type: NativeType = current_type.into();
+                let encoding_preservation = param.encoding_preservation();
+                let cast_origin = cast_origin(current_type, encoding_preservation);
 
                 if param
                     .desired_type()
@@ -845,9 +913,13 @@ fn get_valid_types(
                 {
                     let casted_type = param
                         .desired_type()
-                        .default_casted_type(&current_native_type, current_type)?;
+                        .default_casted_type(&current_native_type, cast_origin)?;
 
-                    new_types.push(casted_type);
+                    new_types.push(preserve_encoding(
+                        current_type,
+                        casted_type,
+                        encoding_preservation,
+                    ));
                 } else if param
                     .allowed_source_types()
                     .iter()
@@ -856,8 +928,12 @@ fn get_valid_types(
                     // If the condition is met which means `implicit coercion`` is provided so we can safely unwrap
                     let default_casted_type = param.default_casted_type().unwrap();
                     let casted_type =
-                        default_casted_type.default_cast_for(current_type)?;
-                    new_types.push(casted_type);
+                        default_casted_type.default_cast_for(cast_origin)?;
+                    new_types.push(preserve_encoding(
+                        current_type,
+                        casted_type,
+                        encoding_preservation,
+                    ));
                 } else {
                     let hint = if matches!(current_native_type, NativeType::Binary) {
                         "\n\nHint: Binary types are not automatically coerced to String. Use CAST(column AS VARCHAR) to convert Binary data to String."
@@ -987,12 +1063,8 @@ fn maybe_data_types(
             // attempt to coerce.
             // TODO: Replace with `can_cast_types` after failing cases are resolved
             // (they need new signature that returns exactly valid types instead of list of possible valid types).
-            if let Some(coerced_type) = coerced_from(valid_type, current_type) {
-                new_type.push(coerced_type)
-            } else {
-                // not possible
-                return None;
-            }
+            let coerced_type = coerced_from(valid_type, current_type)?;
+            new_type.push(coerced_type)
         }
     }
     Some(new_type)
@@ -1176,11 +1248,11 @@ mod tests {
     use arrow::datatypes::IntervalUnit;
     use datafusion_common::{
         assert_contains,
-        types::{logical_binary, logical_int64},
+        types::{logical_binary, logical_int64, logical_string},
     };
     use datafusion_expr_common::{
         columnar_value::ColumnarValue,
-        signature::{Coercion, TypeSignatureClass},
+        signature::{Coercion, EncodingPreservation, TypeSignatureClass},
     };
 
     #[test]
@@ -1665,6 +1737,31 @@ mod tests {
     }
 
     #[test]
+    fn test_get_valid_types_array_and_index_preserves_list_field_name() -> Result<()> {
+        let struct_fields = vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("prim", DataType::Boolean, true),
+        ];
+        let current_type = DataType::List(Arc::new(Field::new(
+            "element",
+            DataType::Struct(struct_fields.into()),
+            true,
+        )));
+        let signature = Signature::array_and_index(Volatility::Immutable);
+
+        assert_eq!(
+            get_valid_types(
+                "array_element",
+                &signature.type_signature,
+                &[current_type.clone(), DataType::Int64],
+            )?,
+            vec![vec![current_type, DataType::Int64]]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_get_valid_types_element_and_array() -> Result<()> {
         let function = "element_and_array";
         let signature = Signature::element_and_array(Volatility::Immutable);
@@ -1764,6 +1861,112 @@ mod tests {
             NativeType::Int64,
         ))?;
         assert_eq!(vec![dictionary.clone()], output);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_coercible_dictionary_preserves_encoding() -> Result<()> {
+        fn dictionary_input(
+            value_type: DataType,
+            coercion: Coercion,
+        ) -> Result<Vec<DataType>> {
+            fields_with_udf(
+                &[Field::new(
+                    "field",
+                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(value_type)),
+                    true,
+                )
+                .into()],
+                &MockUdf(Signature::coercible(vec![coercion], Volatility::Immutable)),
+            )
+            .map(|v| v.into_iter().map(|f| f.data_type().clone()).collect())
+        }
+
+        let coercion = Coercion::new_exact(TypeSignatureClass::Native(logical_string()))
+            .with_encoding_preservation(EncodingPreservation::dictionary());
+
+        assert_eq!(
+            dictionary_input(DataType::LargeUtf8, coercion.clone())?,
+            vec![DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::LargeUtf8),
+            )]
+        );
+        assert_eq!(
+            dictionary_input(
+                DataType::BinaryView,
+                Coercion::new_implicit(
+                    TypeSignatureClass::Native(logical_string()),
+                    vec![TypeSignatureClass::Native(logical_binary())],
+                    NativeType::String,
+                )
+                .with_encoding_preservation(EncodingPreservation::dictionary()),
+            )?,
+            vec![DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::Utf8View),
+            )]
+        );
+        // Contrast: without encoding_preservation, Native strips dictionary entirely
+        assert_eq!(
+            dictionary_input(
+                DataType::Int32,
+                Coercion::new_implicit(
+                    TypeSignatureClass::Native(logical_int64()),
+                    vec![TypeSignatureClass::Integer],
+                    NativeType::Int64,
+                ),
+            )?,
+            vec![DataType::Int64]
+        );
+        // With encoding_preservation, dictionary wrapper is preserved, value coerced
+        assert_eq!(
+            dictionary_input(
+                DataType::Int32,
+                Coercion::new_implicit(
+                    TypeSignatureClass::Native(logical_int64()),
+                    vec![TypeSignatureClass::Integer],
+                    NativeType::Int64,
+                )
+                .with_encoding_preservation(EncodingPreservation::dictionary()),
+            )?,
+            vec![DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::Int64),
+            )]
+        );
+        // Contrast: without encoding_preservation, non-Native already passes through
+        assert_eq!(
+            dictionary_input(
+                DataType::Int32,
+                Coercion::new_implicit(
+                    TypeSignatureClass::Integer,
+                    vec![],
+                    NativeType::Int64,
+                ),
+            )?,
+            vec![DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::Int32),
+            )]
+        );
+        // With encoding_preservation, same result — no difference for non-Native
+        assert_eq!(
+            dictionary_input(
+                DataType::Int32,
+                Coercion::new_implicit(
+                    TypeSignatureClass::Integer,
+                    vec![],
+                    NativeType::Int64,
+                )
+                .with_encoding_preservation(EncodingPreservation::dictionary()),
+            )?,
+            vec![DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::Int32),
+            )]
+        );
 
         Ok(())
     }

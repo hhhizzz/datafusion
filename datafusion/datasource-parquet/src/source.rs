@@ -25,7 +25,11 @@ use crate::ParquetFileReaderFactory;
 use crate::lookahead::{LookaheadScanContext, ParquetLookaheadCoordinator};
 use crate::opener::ParquetMorselizer;
 use crate::opener::build_pruning_predicates;
+use crate::opener::build_virtual_columns_state;
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
+use arrow_schema::Fields;
+use arrow_schema::extension::ExtensionType;
+use arrow_schema::{DataType, Field};
 use datafusion_common::config::ConfigOptions;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_common::config::EncryptionFactoryOptions;
@@ -41,9 +45,14 @@ use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::{FileSource, FileSourceExecutionState};
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_execution::TaskContext;
+use datafusion_functions::core::file_row_index::FileRowIndexFunc;
+use datafusion_physical_expr::expressions::{Column, DynamicFilterTracking};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{EquivalenceProperties, conjunction};
 use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
+use datafusion_physical_expr_adapter::rewrite::{
+    expr_references_scalar_udf, rewrite_file_row_index_projection,
+};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_plan::DisplayFormatType;
@@ -61,6 +70,7 @@ use datafusion_execution::parquet_encryption::EncryptionFactory;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use itertools::Itertools;
 use object_store::ObjectStore;
+use parquet::arrow::RowNumber;
 #[cfg(feature = "parquet_encryption")]
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
@@ -209,6 +219,12 @@ use parquet::encryption::decrypt::FileDecryptionProperties;
 /// used to implement external indexes on top of parquet files and select only
 /// portions of the files.
 ///
+/// If the external index naturally produces a file-level
+/// [`RowSelection`](parquet::arrow::arrow_reader::RowSelection), wrap it in
+/// [`ParquetRowSelection`](crate::ParquetRowSelection) and provide it as an
+/// extension. DataFusion will use the parquet metadata to split the selection
+/// into row-group-level access.
+///
 /// The `DataSourceExec` will try and reduce any provided `ParquetAccessPlan`
 /// further based on the contents of `ParquetMetadata` and other settings.
 ///
@@ -348,7 +364,11 @@ impl ParquetSource {
         self
     }
 
-    /// Set predicate information
+    /// Set predicate information.
+    ///
+    /// Predicates referencing virtual columns must go through
+    /// [`Self::try_pushdown_filters`]. Passing them here with pushdown
+    /// enabled trips a debug assert in the opener.
     #[expect(clippy::needless_pass_by_value)]
     pub fn with_predicate(&self, predicate: Arc<dyn PhysicalExpr>) -> Self {
         let mut conf = self.clone();
@@ -551,15 +571,6 @@ fn lookahead_context(
 }
 
 impl ParquetSource {
-    fn validate_lookahead_config(&self) -> datafusion_common::Result<()> {
-        let options = &self.table_parquet_options.global;
-        ParquetLookaheadCoordinator::validate_options(
-            options.row_group_lookahead,
-            options.row_group_lookahead_depth,
-            options.row_group_prefetch_window,
-        )
-    }
-
     fn create_morselizer_internal(
         &self,
         object_store: Arc<dyn ObjectStore>,
@@ -606,6 +617,22 @@ impl ParquetSource {
             );
         }
 
+        // Validate virtual columns (extension-type allowlist) and, when
+        // pushdown is enabled, reject predicates that reference them. Both
+        // checks depend only on morselizer-level state, so we pay their cost
+        // once per scan partition rather than per file.
+        //
+        // Gating predicate validation on `pushdown_filters` is deliberate:
+        // when pushdown is off the predicate stays above the scan as a
+        // `FilterExec` and resolves virtual columns there; the row-filter
+        // ban only applies to the pushdown path.
+        let virtual_state = build_virtual_columns_state(
+            self.table_schema.virtual_columns(),
+            self.table_schema.file_schema(),
+            self.predicate.as_ref(),
+            self.pushdown_filters(),
+        )?;
+
         Ok(Box::new(ParquetMorselizer {
             partition_index: partition,
             projection: self.projection.clone(),
@@ -635,6 +662,7 @@ impl ParquetSource {
             max_predicate_cache_size: self.max_predicate_cache_size(),
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
+            virtual_state,
             lookahead,
         }))
     }
@@ -670,7 +698,6 @@ impl FileSource for ParquetSource {
         base_config: &FileScanConfig,
         partition: usize,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
-        self.validate_lookahead_config()?;
         self.create_morselizer_internal(object_store, base_config, partition, None)
     }
 
@@ -682,7 +709,6 @@ impl FileSource for ParquetSource {
         context: Arc<TaskContext>,
         state: Option<FileSourceExecutionState>,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
-        self.validate_lookahead_config()?;
         let lookahead = lookahead_context(state, context.as_ref())?;
         self.create_morselizer_internal(object_store, base_config, partition, lookahead)
     }
@@ -718,7 +744,28 @@ impl FileSource for ParquetSource {
         projection: &ProjectionExprs,
     ) -> datafusion_common::Result<Option<Arc<dyn FileSource>>> {
         let mut source = self.clone();
-        source.projection = self.projection.try_merge(projection)?;
+
+        // If there's no reference to `FileRowIndexFunc` in the projection, we can just merge
+        // both projections as-is, there's no need to modify the projection first.
+        if !projection.iter().any(|projection_expr| {
+            expr_references_scalar_udf::<FileRowIndexFunc>(&projection_expr.expr)
+        }) {
+            source.projection = self.projection.try_merge(projection)?;
+            return Ok(Some(Arc::new(source)));
+        }
+
+        // If we can find a reference to `FileRowIndexFunc`, we add it as a virtual column
+        // or re-use an existing one in the table's schema.
+        let (table_schema, row_index_col) =
+            table_schema_with_row_index_col(self.table_schema());
+
+        source.table_schema = table_schema;
+        source.projection = rewrite_file_row_index_projection(
+            &self.projection,
+            projection,
+            &row_index_col,
+        )?;
+
         Ok(Some(Arc::new(source)))
     }
 
@@ -751,6 +798,33 @@ impl FileSource for ParquetSource {
                 }
                 if self.reverse_row_groups {
                     write!(f, ", reverse_row_groups=true")?;
+                }
+
+                // Plan-time marker for dynamic RG-level pruning: if the
+                // predicate is dynamic (e.g. a TopK threshold expression),
+                // the parquet opener will pause the single decoder at row
+                // group boundaries and consult `RowGroupPruner` to drop
+                // RGs the current threshold proves unwinnable, rebuilding
+                // the decoder via `into_builder().with_row_groups(...)` to
+                // skip them. The actual pruning count appears as
+                // `row_groups_pruned_dynamic_filter` in EXPLAIN ANALYZE.
+                // We use `contains_dynamic_filter()` (matches both `Watching`
+                // and `AllComplete`) rather than the stricter `Watching(_)`
+                // check the opener uses to construct the pruner. Reason: the
+                // opener gate is evaluated at file-open time, when a TopK
+                // threshold has not yet been pushed — at that moment a still-
+                // useful pruner needs `Watching`. `fmt_extra`, on the other
+                // hand, is called *also* by `EXPLAIN ANALYZE` after execution
+                // completes, at which point TopK has marked its dynamic
+                // filter complete and `classify` returns `AllComplete`. The
+                // marker is plan-time metadata ("this scan was eligible for
+                // runtime RG pruning"), so it should still show in that
+                // post-run rendering.
+                if let Some(predicate) = self.filter()
+                    && DynamicFilterTracking::classify(&predicate)
+                        .contains_dynamic_filter()
+                {
+                    write!(f, ", dynamic_rg_pruning=eligible")?;
                 }
 
                 // Try to build the pruning predicates.
@@ -798,7 +872,12 @@ impl FileSource for ParquetSource {
         filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &ConfigOptions,
     ) -> datafusion_common::Result<FilterPushdownPropagation<Arc<dyn FileSource>>> {
-        let table_schema = self.table_schema.table_schema();
+        // Use the schema excluding virtual columns: virtual columns (e.g.
+        // Parquet `row_number`) are produced by the reader itself and cannot
+        // be referenced inside a RowFilter, so predicates that reference them
+        // must not be marked as pushed down — otherwise the scan would
+        // silently drop them and produce wrong results.
+        let pushable_schema = self.table_schema.schema_without_virtual_columns();
         // Determine if based on configs we should push filters down.
         // If either the table / scan itself or the config has pushdown enabled,
         // we will push down the filters.
@@ -814,7 +893,7 @@ impl FileSource for ParquetSource {
         let filters: Vec<PushedDownPredicate> = filters
             .into_iter()
             .map(|filter| {
-                if can_expr_be_pushed_down_with_schemas(&filter, table_schema) {
+                if can_expr_be_pushed_down_with_schemas(&filter, pushable_schema) {
                     PushedDownPredicate::supported(filter)
                 } else {
                     PushedDownPredicate::unsupported(filter)
@@ -996,15 +1075,12 @@ impl FileSource for ParquetSource {
             reversed_eq_properties.ordering_satisfy(order.iter().cloned())?;
         let sort_order = LexOrdering::new(order.iter().cloned());
         let column_in_file_schema = sort_order.as_ref().is_some_and(|s| {
-            s.first()
-                .expr
-                .downcast_ref::<datafusion_physical_expr::expressions::Column>()
-                .is_some_and(|col| {
-                    self.table_schema
-                        .file_schema()
-                        .field_with_name(col.name())
-                        .is_ok()
-                })
+            s.first().expr.downcast_ref::<Column>().is_some_and(|col| {
+                self.table_schema
+                    .file_schema()
+                    .field_with_name(col.name())
+                    .is_ok()
+            })
         });
 
         if !column_in_file_schema && !reversed_satisfies {
@@ -1033,200 +1109,74 @@ impl FileSource for ParquetSource {
     }
 }
 
+/// Returns the a [`TableSchema`] containing a [`RowNumber`] virtual column and a [`Column`] expression referencing its row index column.
+/// The expression is then merged into a projection.
+///
+/// - If the schema already has a virtual column with the [`RowNumber`] type, it returns the schema unchanged.
+/// - If the schema doesn't have the appropriate virtual column, it returns a modified schema with the virtual column appended to it.
+fn table_schema_with_row_index_col(table_schema: &TableSchema) -> (TableSchema, Column) {
+    // If we can find a virtual column with the `RowNumber` type, we just return the schema
+    // and create the appropriate `column` we're going to use
+    if let Some((idx, field)) =
+        table_schema
+            .virtual_columns()
+            .iter()
+            .enumerate()
+            .find(|(_, field)| {
+                field
+                    .extension_type_name()
+                    .is_some_and(|name| name == RowNumber::NAME)
+            })
+    {
+        let virtual_offset = table_schema.file_schema().fields().len()
+            + table_schema.table_partition_cols().len();
+
+        return (
+            table_schema.clone(),
+            Column::new(field.name(), virtual_offset + idx),
+        );
+    }
+
+    // The hidden field is shared across all files in this scan, but it must
+    // have a unique table-schema name because later rewrites resolve it by
+    // column name and index.
+    let base_row_index_name = "__datafusion_file_row_index";
+    let mut row_index_name = base_row_index_name.to_string();
+    let mut suffix = 0;
+    while table_schema
+        .table_schema()
+        .field_with_name(&row_index_name)
+        .is_ok()
+    {
+        suffix += 1;
+        row_index_name = format!("{base_row_index_name}_{suffix}");
+    }
+
+    let row_index_table_idx = table_schema.table_schema().fields().len();
+    let row_index_field = Arc::new(
+        Field::new(&row_index_name, DataType::Int64, true).with_extension_type(RowNumber),
+    );
+    (
+        TableSchema::builder(Arc::clone(table_schema.file_schema()))
+            .with_table_partition_cols(table_schema.table_partition_cols().clone())
+            .with_virtual_columns(
+                table_schema
+                    .virtual_columns()
+                    .iter()
+                    .cloned()
+                    .chain([row_index_field])
+                    .collect::<Fields>(),
+            )
+            .build(),
+        Column::new(&row_index_name, row_index_table_idx),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lookahead::ParquetLookaheadCoordinator;
     use arrow::datatypes::Schema;
-    use datafusion_datasource::PartitionedFile;
-    use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
-    use datafusion_execution::TaskContext;
-    use datafusion_execution::object_store::ObjectStoreUrl;
     use datafusion_physical_expr::expressions::lit;
-    use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
-    use object_store::memory::InMemory;
-    use parquet::arrow::async_reader::AsyncFileReader;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[derive(Debug, Default)]
-    struct ReaderFactorySentinel {
-        create_reader_calls: AtomicUsize,
-    }
-
-    impl ParquetFileReaderFactory for ReaderFactorySentinel {
-        fn create_reader(
-            &self,
-            _partition_index: usize,
-            _partitioned_file: PartitionedFile,
-            _metadata_size_hint: Option<usize>,
-            _metrics: &ExecutionPlanMetricsSet,
-        ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>> {
-            self.create_reader_calls.fetch_add(1, Ordering::SeqCst);
-            panic!("reader factory must not be called while creating the morselizer")
-        }
-    }
-
-    fn source_with_lookahead(
-        enabled: bool,
-        depth: usize,
-        factory: Arc<ReaderFactorySentinel>,
-    ) -> ParquetSource {
-        source_with_lookahead_window(enabled, depth, 0, factory)
-    }
-
-    fn source_with_lookahead_window(
-        enabled: bool,
-        depth: usize,
-        window: usize,
-        factory: Arc<ReaderFactorySentinel>,
-    ) -> ParquetSource {
-        let mut options = TableParquetOptions::default();
-        options.global.row_group_lookahead = enabled;
-        options.global.row_group_lookahead_depth = depth;
-        options.global.row_group_prefetch_window = window;
-
-        let mut source = ParquetSource::new(Arc::new(Schema::empty()))
-            .with_table_parquet_options(options)
-            .with_parquet_file_reader_factory(factory);
-        source.batch_size = Some(1);
-        source
-    }
-
-    fn create_morselizer_with_context(
-        source: &ParquetSource,
-        state: Option<FileSourceExecutionState>,
-    ) -> datafusion_common::Result<Box<dyn Morselizer>> {
-        let base_config = FileScanConfigBuilder::new(
-            ObjectStoreUrl::local_filesystem(),
-            Arc::new(source.clone()),
-        )
-        .build();
-
-        FileSource::create_morselizer_with_context(
-            source,
-            Arc::new(InMemory::new()),
-            &base_config,
-            0,
-            Arc::new(TaskContext::default()),
-            state,
-        )
-    }
-
-    #[test]
-    fn lookahead_execution_state_is_opt_in() {
-        let schema = Arc::new(Schema::empty());
-        let default_source = ParquetSource::new(Arc::clone(&schema));
-        assert!(default_source.create_execution_state().is_none());
-
-        let mut options = TableParquetOptions::default();
-        options.global.row_group_lookahead = true;
-        let enabled_source =
-            ParquetSource::new(schema).with_table_parquet_options(options);
-
-        let state = enabled_source
-            .create_execution_state()
-            .expect("enabled lookahead should create scan state");
-        assert!(state.downcast::<ParquetLookaheadCoordinator>().is_ok());
-    }
-
-    #[test]
-    fn lookahead_context_rejects_incorrectly_typed_execution_state() {
-        let context = TaskContext::default();
-        assert!(lookahead_context(None, &context).unwrap().is_none());
-
-        let wrong_state: FileSourceExecutionState = Arc::new(());
-        let error = lookahead_context(Some(wrong_state), &context).unwrap_err();
-        assert!(matches!(error, DataFusionError::Internal(_)));
-
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(1, 0));
-        let state: FileSourceExecutionState = coordinator.clone();
-        let lookahead = lookahead_context(Some(state), &context)
-            .unwrap()
-            .expect("correctly typed state should enable lookahead");
-
-        assert!(Arc::ptr_eq(&lookahead.coordinator, &coordinator));
-        assert!(Arc::ptr_eq(&lookahead.memory_pool, context.memory_pool()));
-    }
-
-    #[test]
-    fn lookahead_context_rejects_invalid_depth_before_file_io() {
-        let context = TaskContext::default();
-        let coordinator = Arc::new(ParquetLookaheadCoordinator::new(0, 0));
-        let state: FileSourceExecutionState = coordinator;
-
-        let error = lookahead_context(Some(state), &context).unwrap_err();
-
-        assert!(matches!(error, DataFusionError::Configuration(_)));
-    }
-
-    #[test]
-    fn create_morselizer_with_context_rejects_enabled_depth_zero_before_reader_io() {
-        let factory = Arc::new(ReaderFactorySentinel::default());
-        let source = source_with_lookahead(true, 0, Arc::clone(&factory));
-
-        let error =
-            create_morselizer_with_context(&source, source.create_execution_state())
-                .unwrap_err();
-
-        assert!(matches!(error, DataFusionError::Configuration(_)));
-        assert_eq!(factory.create_reader_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn create_morselizer_with_context_rejects_enabled_depth_five_before_reader_io() {
-        let factory = Arc::new(ReaderFactorySentinel::default());
-        let source = source_with_lookahead(true, 5, Arc::clone(&factory));
-
-        let error =
-            create_morselizer_with_context(&source, source.create_execution_state())
-                .unwrap_err();
-
-        assert!(matches!(error, DataFusionError::Configuration(_)));
-        assert_eq!(factory.create_reader_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn create_morselizer_rejects_invalid_prefetch_windows_before_reader_io() {
-        for (enabled, depth, window) in [(true, 4, 1), (true, 2, 4), (false, 4, 2)] {
-            let factory = Arc::new(ReaderFactorySentinel::default());
-            let source = source_with_lookahead_window(
-                enabled,
-                depth,
-                window,
-                Arc::clone(&factory),
-            );
-
-            let error =
-                create_morselizer_with_context(&source, source.create_execution_state())
-                    .unwrap_err();
-
-            assert!(matches!(error, DataFusionError::Configuration(_)));
-            assert_eq!(factory.create_reader_calls.load(Ordering::SeqCst), 0);
-        }
-    }
-
-    #[test]
-    fn create_morselizer_with_context_rejects_incorrectly_typed_state_before_reader_io() {
-        let factory = Arc::new(ReaderFactorySentinel::default());
-        let source = source_with_lookahead(true, 1, Arc::clone(&factory));
-        let wrong_state: FileSourceExecutionState = Arc::new(());
-
-        let error =
-            create_morselizer_with_context(&source, Some(wrong_state)).unwrap_err();
-
-        assert!(matches!(error, DataFusionError::Internal(_)));
-        assert_eq!(factory.create_reader_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn create_morselizer_with_context_ignores_disabled_invalid_depth() {
-        let factory = Arc::new(ReaderFactorySentinel::default());
-        let source = source_with_lookahead(false, 0, Arc::clone(&factory));
-
-        create_morselizer_with_context(&source, source.create_execution_state()).unwrap();
-
-        assert_eq!(factory.create_reader_calls.load(Ordering::SeqCst), 0);
-    }
 
     #[test]
     #[expect(deprecated)]
@@ -1319,6 +1269,88 @@ mod tests {
 
         assert!(source.reverse_row_groups());
         assert!(source.filter().is_some());
+    }
+
+    /// Render a `ParquetSource`'s `fmt_extra` output as a `String` for
+    /// inspection in tests.
+    fn render_fmt_extra(source: &ParquetSource, t: DisplayFormatType) -> String {
+        use std::fmt::Display;
+
+        struct Wrap<'a> {
+            source: &'a ParquetSource,
+            t: DisplayFormatType,
+        }
+        impl Display for Wrap<'_> {
+            fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+                self.source.fmt_extra(self.t, f)
+            }
+        }
+        Wrap { source, t }.to_string()
+    }
+
+    /// EXPLAIN must surface a `dynamic_rg_pruning=eligible` marker when the
+    /// predicate carries a `DynamicFilterPhysicalExpr`. This is the
+    /// plan-time signal that the runtime row-group pruner will fire at
+    /// every RG boundary.
+    #[test]
+    fn fmt_extra_marks_dynamic_predicate_as_pruning_eligible() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("v", 0))],
+            lit(true),
+        )) as Arc<dyn PhysicalExpr>;
+
+        let source =
+            ParquetSource::new(Arc::clone(&schema)).with_predicate(Arc::clone(&dynamic));
+
+        let rendered = render_fmt_extra(&source, DisplayFormatType::Default);
+        assert!(
+            rendered.contains("dynamic_rg_pruning=eligible"),
+            "expected marker in Default fmt_extra, got: {rendered}"
+        );
+
+        let rendered_verbose = render_fmt_extra(&source, DisplayFormatType::Verbose);
+        assert!(
+            rendered_verbose.contains("dynamic_rg_pruning=eligible"),
+            "expected marker in Verbose fmt_extra, got: {rendered_verbose}"
+        );
+    }
+
+    /// EXPLAIN must NOT show the dynamic-RG-pruning marker when the
+    /// predicate is purely static — the optimization will not fire, so
+    /// surfacing it would mislead the reader.
+    #[test]
+    fn fmt_extra_omits_marker_for_static_predicate() {
+        use arrow::datatypes::Schema;
+
+        let schema = Arc::new(Schema::empty());
+        let predicate = lit(true);
+        let source = ParquetSource::new(schema).with_predicate(predicate);
+
+        let rendered = render_fmt_extra(&source, DisplayFormatType::Default);
+        assert!(
+            !rendered.contains("dynamic_rg_pruning"),
+            "did not expect marker for static predicate, got: {rendered}"
+        );
+    }
+
+    /// EXPLAIN must NOT show the marker when there is no predicate at all
+    /// (e.g. unfiltered table scan).
+    #[test]
+    fn fmt_extra_omits_marker_when_no_predicate() {
+        use arrow::datatypes::Schema;
+
+        let schema = Arc::new(Schema::empty());
+        let source = ParquetSource::new(schema);
+
+        let rendered = render_fmt_extra(&source, DisplayFormatType::Default);
+        assert!(
+            !rendered.contains("dynamic_rg_pruning"),
+            "did not expect marker for predicate-less scan, got: {rendered}"
+        );
     }
 
     /// Helpers for the `try_pushdown_sort` regression tests below.
@@ -1547,7 +1579,9 @@ mod tests {
         let file_schema =
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
         let partition_b = Arc::new(Field::new("b", DataType::Int32, true));
-        let table_schema = TableSchema::new(file_schema, vec![partition_b]);
+        let table_schema = TableSchema::builder(file_schema)
+            .with_table_partition_cols(vec![partition_b])
+            .build();
         let source = ParquetSource::new(table_schema);
 
         // EquivalenceProperties is built on the *full* table schema so
@@ -1840,5 +1874,82 @@ mod tests {
                 "{mode:?} display must surface sort_order_for_reorder, got: {out}",
             );
         }
+    }
+
+    #[test]
+    fn test_try_pushdown_filters_rejects_virtual_column_refs() {
+        // Virtual columns are produced by the reader and cannot be referenced
+        // inside a RowFilter. `try_pushdown_filters` must report such filters
+        // as `PushedDown::No` so the FilterExec above the scan stays in
+        // place — otherwise the scan would silently drop the predicate and
+        // produce wrong results.
+        use arrow::datatypes::{DataType, Field, FieldRef, Schema};
+        use datafusion_common::config::ConfigOptions;
+        use datafusion_datasource::TableSchema;
+        use datafusion_expr::{col, lit as logical_lit};
+        use datafusion_functions::core::expr_fn::file_row_index;
+        use datafusion_physical_expr::planner::logical2physical;
+        use datafusion_physical_expr_adapter::rewrite::rewrite_file_row_index_expr;
+        use datafusion_physical_plan::filter_pushdown::PushedDown;
+        use parquet::arrow::RowNumber;
+
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let row_number_field: FieldRef = Arc::new(
+            Field::new("row_number", DataType::Int64, false)
+                .with_extension_type(RowNumber),
+        );
+        let table_schema = TableSchema::builder(file_schema)
+            .with_virtual_columns(vec![row_number_field])
+            .build();
+
+        let source = ParquetSource::new(table_schema).with_pushdown_filters(true);
+
+        let full_schema = source.table_schema.table_schema();
+
+        let pushable = logical2physical(&col("value").eq(logical_lit(1i64)), full_schema);
+        let virtual_only =
+            logical2physical(&col("row_number").eq(logical_lit(2i64)), full_schema);
+        let mixed = logical2physical(
+            &col("row_number")
+                .eq(logical_lit(2i64))
+                .or(col("value").eq(logical_lit(4i64))),
+            full_schema,
+        );
+        let (_, row_index_col) = table_schema_with_row_index_col(source.table_schema());
+        let row_index = rewrite_file_row_index_expr(
+            logical2physical(&file_row_index().gt(logical_lit(2i64)), full_schema),
+            row_index_col.name(),
+            row_index_col.index(),
+        )
+        .expect("file_row_index should rewrite to the row_number virtual column");
+
+        let config = ConfigOptions::default();
+        let prop = source
+            .try_pushdown_filters(vec![pushable, virtual_only, mixed, row_index], &config)
+            .expect("try_pushdown_filters must not error");
+
+        assert_eq!(prop.filters.len(), 4);
+        assert!(
+            matches!(prop.filters[0], PushedDown::Yes),
+            "file-column filter should be pushable"
+        );
+        assert!(
+            matches!(prop.filters[1], PushedDown::No),
+            "filter referencing only a virtual column must not be pushed down"
+        );
+        assert!(
+            matches!(prop.filters[2], PushedDown::No),
+            "filter mixing a virtual column with a file column must not be \
+             pushed down (row filter would silently drop it)"
+        );
+        assert!(
+            matches!(prop.filters[3], PushedDown::No),
+            "file_row_index() rewrites to a virtual column and must not be \
+             pushed down"
+        );
     }
 }

@@ -38,6 +38,7 @@ use datafusion::datasource::listing::{
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::metrics::MetricValue;
@@ -64,6 +65,9 @@ pub const TPCDS_QUERY_END_ID: usize = 99;
 const OBJECT_STORE_COALESCE_GAP_ENV: &str = "TPCDS_OBJECT_STORE_COALESCE_GAP_BYTES";
 const OBJECT_STORE_COALESCE_PARALLELISM_ENV: &str =
     "TPCDS_OBJECT_STORE_COALESCE_PARALLELISM";
+const OBJECT_STORE_EXACT_RANGE_CACHE_BYTES_ENV: &str =
+    "TPCDS_OBJECT_STORE_EXACT_RANGE_CACHE_BYTES";
+const OBJECT_STORE_EXACT_RANGE_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 const Q39_REUSE_CONTROL_ENV: &str = "TPCDS_Q39_REUSE_CONTROL";
 const ROW_GROUP_PREFETCH_METRICS_LABEL: &str = "TPCDS_ROW_GROUP_PREFETCH_METRICS";
 // `q39_reuse::materialize` does not expose its physical plan. Keep this query
@@ -889,6 +893,13 @@ fn register_s3_object_store(
         .is_ok_and(|value| parse_bool_flag(&value));
     let coalesce_gap = object_store_coalesce_gap_from_env()?;
     let coalesce_parallelism = object_store_coalesce_parallelism_from_env()?;
+    let exact_range_cache_bytes =
+        object_store_exact_range_cache_bytes_from_env()?.unwrap_or_default();
+    if exact_range_cache_bytes != 0 && !metrics_enabled {
+        return Err(DataFusionError::Configuration(format!(
+            "{OBJECT_STORE_EXACT_RANGE_CACHE_BYTES_ENV} requires TPCDS_OBJECT_STORE_METRICS=true"
+        )));
+    }
 
     if metrics_enabled {
         let effective_gap = coalesce_gap.unwrap_or(OBJECT_STORE_COALESCE_DEFAULT);
@@ -899,12 +910,20 @@ fn register_s3_object_store(
             effective_gap,
             effective_parallelism,
         );
+        let store = if exact_range_cache_bytes == 0 {
+            store
+        } else {
+            let reservation = MemoryConsumer::new("TPCDSExactRangeCache")
+                .register(&ctx.runtime_env().memory_pool);
+            store.with_exact_range_cache(exact_range_cache_bytes, Arc::new(reservation))
+        };
         let metrics = store.metrics();
         ctx.register_object_store(object_store_url_ref, Arc::new(store));
         println!(
             "Registered instrumented S3 object store for {object_store_url} \
              coalesce_gap_bytes={effective_gap} \
-             coalesce_parallelism={effective_parallelism}"
+             coalesce_parallelism={effective_parallelism} \
+             exact_range_cache_bytes={exact_range_cache_bytes}"
         );
         Ok(Some(metrics))
     } else if coalesce_gap.is_some() || coalesce_parallelism.is_some() {
@@ -988,6 +1007,38 @@ fn parse_object_store_coalesce_parallelism(value: Option<&str>) -> Result<Option
                 )));
             }
             Ok(parallelism)
+        })
+        .transpose()
+}
+
+fn object_store_exact_range_cache_bytes_from_env() -> Result<Option<usize>> {
+    match std::env::var(OBJECT_STORE_EXACT_RANGE_CACHE_BYTES_ENV) {
+        Ok(value) => parse_object_store_exact_range_cache_bytes(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(DataFusionError::Configuration(format!(
+                "{OBJECT_STORE_EXACT_RANGE_CACHE_BYTES_ENV} must contain a UTF-8 byte value between 0 and {OBJECT_STORE_EXACT_RANGE_CACHE_MAX_BYTES}"
+            )))
+        }
+    }
+}
+
+fn parse_object_store_exact_range_cache_bytes(
+    value: Option<&str>,
+) -> Result<Option<usize>> {
+    value
+        .map(|value| {
+            let bytes = value.parse::<usize>().map_err(|error| {
+                DataFusionError::Configuration(format!(
+                    "invalid {OBJECT_STORE_EXACT_RANGE_CACHE_BYTES_ENV} value '{value}': {error}"
+                ))
+            })?;
+            if bytes > OBJECT_STORE_EXACT_RANGE_CACHE_MAX_BYTES {
+                return Err(DataFusionError::Configuration(format!(
+                    "invalid {OBJECT_STORE_EXACT_RANGE_CACHE_BYTES_ENV} value '{value}': expected 0..={OBJECT_STORE_EXACT_RANGE_CACHE_MAX_BYTES}"
+                )));
+            }
+            Ok(bytes)
         })
         .transpose()
 }
@@ -1721,6 +1772,32 @@ mod tests {
                 error
                     .to_string()
                     .contains("TPCDS_OBJECT_STORE_COALESCE_PARALLELISM")
+            );
+        }
+    }
+
+    #[test]
+    fn parses_object_store_exact_range_cache_bytes() {
+        assert_eq!(
+            parse_object_store_exact_range_cache_bytes(None).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_object_store_exact_range_cache_bytes(Some("0")).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            parse_object_store_exact_range_cache_bytes(Some("134217728")).unwrap(),
+            Some(OBJECT_STORE_EXACT_RANGE_CACHE_MAX_BYTES)
+        );
+
+        for value in ["134217729", "invalid"] {
+            let error =
+                parse_object_store_exact_range_cache_bytes(Some(value)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("TPCDS_OBJECT_STORE_EXACT_RANGE_CACHE_BYTES")
             );
         }
     }

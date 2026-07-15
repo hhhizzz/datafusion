@@ -1120,7 +1120,7 @@ mod tests {
         StringBuilder, StringDictionaryBuilder, StringViewBuilder,
     };
     use arrow::array::{Array, ArrayRef, Int32Array, ListArray};
-    use arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use datafusion::execution::TaskContext;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::metrics::{
@@ -1480,15 +1480,8 @@ mod tests {
     }
 
     #[test]
-    fn result_hash_rejects_unsupported_arrow_types_cleanly() {
-        let entries = Field::new(
-            "entries",
-            DataType::Struct(Fields::from(vec![
-                Field::new("key", DataType::Utf8, false),
-                Field::new("value", DataType::Int32, true),
-            ])),
-            false,
-        );
+    fn result_hash_rejects_invalid_map_shape_cleanly() {
+        let entries = Field::new("entries", DataType::Int32, false);
         let schema = Arc::new(Schema::new(vec![Field::new(
             "unsupported_map",
             DataType::Map(Arc::new(entries), false),
@@ -1500,7 +1493,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("Row format support"));
+        assert!(error.to_string().contains("expected struct field in map"));
     }
 
     fn hash_schema(name: &str, nullable: bool) -> SchemaRef {

@@ -22,10 +22,13 @@ pub(crate) mod sort_pushdown;
 
 use crate::file_groups::FileGroup;
 use crate::{
-    PartitionedFile, display::FileGroupsDisplay,
+    PartitionedFile,
+    display::FileGroupsDisplay,
     file::{FileSource, FileSourceExecutionState},
-    file_compression_type::FileCompressionType, file_stream::FileStreamBuilder,
-    file_stream::work_source::SharedWorkSource, source::DataSource,
+    file_compression_type::FileCompressionType,
+    file_stream::FileStreamBuilder,
+    file_stream::work_source::SharedWorkSource,
+    source::DataSource,
     statistics::MinMaxStatistics,
 };
 use arrow::datatypes::Fields;

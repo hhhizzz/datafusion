@@ -29,8 +29,7 @@ use crate::lookahead::{LookaheadFileContext, LookaheadScanContext};
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{
     DecoderBuilderConfig, LookaheadPushDecoderStreamState, PrefetchPlanQueue,
-    PruningPushDecoderStreamState, PushDecoderOutputState, RgPlanEntry,
-    RowGroupPruner,
+    PruningPushDecoderStreamState, PushDecoderOutputState, RgPlanEntry, RowGroupPruner,
 };
 use crate::row_filter::RowFilterGenerator;
 use crate::row_group_filter::RowGroupAccessPlanFilter;
@@ -1444,14 +1443,15 @@ impl RowGroupsPrunedParquetOpen {
             };
 
             let prepared_access_plan = prepare_access_plan(access_plan)?;
-            let prefetch_row_group_indexes = prepared_access_plan
-                .row_group_indexes_with_selected_rows(rg_metadata)?;
+            let prefetch_row_group_indexes =
+                prepared_access_plan.row_group_indexes_with_selected_rows(rg_metadata)?;
             let prefetch_plan = RowGroupPrefetchPlan::new(
                 file_metadata.as_ref(),
                 decoder_projection.projection_mask(),
                 prefetch_row_group_indexes,
             );
-            prefetch_metrics.record_candidate_bytes(prefetch_plan.projected_payload_bytes());
+            prefetch_metrics
+                .record_candidate_bytes(prefetch_plan.projected_payload_bytes());
             let rg_plan: VecDeque<RgPlanEntry> = prepared_access_plan
                 .row_group_indexes
                 .iter()

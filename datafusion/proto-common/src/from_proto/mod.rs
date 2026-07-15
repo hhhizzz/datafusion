@@ -1159,10 +1159,7 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
     }
 }
 
-fn parquet_usize_from_u64(
-    value: u64,
-    option: &str,
-) -> datafusion_common::Result<usize> {
+fn parquet_usize_from_u64(value: u64, option: &str) -> datafusion_common::Result<usize> {
     usize::try_from(value).map_err(|_| {
         DataFusionError::Configuration(format!(
             "Parquet {option} value {value} does not fit in usize"

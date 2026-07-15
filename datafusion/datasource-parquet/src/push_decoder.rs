@@ -54,8 +54,8 @@ use parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder
 use parquet::file::metadata::ParquetMetaData;
 
 use datafusion_common::{DataFusionError, Result};
-use datafusion_physical_expr::projection::Projector;
 use datafusion_physical_expr::expressions::DynamicFilterTracking;
+use datafusion_physical_expr::projection::Projector;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Gauge};
 use datafusion_pruning::{PruningPredicate, build_pruning_predicate};

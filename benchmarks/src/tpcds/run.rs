@@ -1487,11 +1487,7 @@ mod tests {
             DataType::Map(Arc::new(entries), false),
             true,
         )]));
-        let error = canonical_result_hash(
-            &schema,
-            &[RecordBatch::new_empty(Arc::clone(&schema))],
-        )
-        .unwrap_err();
+        let error = canonical_result_hash(&schema, &[]).unwrap_err();
 
         assert!(error.to_string().contains("expected struct field in map"));
     }

@@ -285,7 +285,7 @@ impl RunOpt {
             let ms = elapsed.as_secs_f64() * 1000.0;
             millis.push(ms);
             info!(
-                "optional_mapper_route query={query_id} iteration={i} mapped_fragments={} logical_rows={} present_rows={} selected_logical_rows={} selected_present_rows={} current_fragments={} adaptive_fragments={} bmi2_fragments={} compact_batches={} lazy_validity_omitted_batches={} materialized_validity_batches={}",
+                "optional_mapper_route query={query_id} iteration={i} mapped_fragments={} logical_rows={} present_rows={} selected_logical_rows={} selected_present_rows={} current_fragments={} adaptive_fragments={} bmi2_fragments={} compact_leaf_batches={} lazy_validity_omitted_leaf_batches={} materialized_validity_leaf_batches={}",
                 mapper.mapped_fragments,
                 mapper.logical_rows,
                 mapper.present_rows,
@@ -294,9 +294,9 @@ impl RunOpt {
                 mapper.current_scalar_fragments,
                 mapper.adaptive_scalar_fragments,
                 mapper.bmi2_pext_fragments,
-                mapper.compact_output_batches,
-                mapper.lazy_validity_omitted_batches,
-                mapper.materialized_validity_batches,
+                mapper.compact_output_leaf_batches,
+                mapper.lazy_validity_omitted_leaf_batches,
+                mapper.materialized_validity_leaf_batches,
             );
             info!("output:\n\n{}\n\n", pretty_format_batches(&result)?);
             let row_count = result.iter().map(|b| b.num_rows()).sum();

@@ -285,7 +285,7 @@ impl RunOpt {
             let ms = elapsed.as_secs_f64() * 1000.0;
             millis.push(ms);
             info!(
-                "optional_mapper_route query={query_id} iteration={i} mapped_fragments={} logical_rows={} present_rows={} selected_logical_rows={} selected_present_rows={} current_fragments={} adaptive_fragments={} bmi2_fragments={} compact_leaf_batches={} lazy_validity_omitted_leaf_batches={} materialized_validity_leaf_batches={}",
+                "optional_mapper_route query={query_id} iteration={i} mapped_fragments={} logical_rows={} present_rows={} selected_logical_rows={} selected_present_rows={} current_fragments={} adaptive_fragments={} bmi2_fragments={} physical_compression_calls={} output_compression_calls={} current_scalar_compression_calls={} adaptive_physical_sparse_calls={} adaptive_physical_fallback_calls={} adaptive_output_sparse_calls={} adaptive_output_fallback_calls={} bmi2_pext_calls={} compact_leaf_batches={} lazy_validity_omitted_leaf_batches={} materialized_validity_leaf_batches={}",
                 mapper.mapped_fragments,
                 mapper.logical_rows,
                 mapper.present_rows,
@@ -294,6 +294,14 @@ impl RunOpt {
                 mapper.current_scalar_fragments,
                 mapper.adaptive_scalar_fragments,
                 mapper.bmi2_pext_fragments,
+                mapper.physical_compression_calls,
+                mapper.output_compression_calls,
+                mapper.current_scalar_compression_calls,
+                mapper.adaptive_physical_sparse_calls,
+                mapper.adaptive_physical_fallback_calls,
+                mapper.adaptive_output_sparse_calls,
+                mapper.adaptive_output_fallback_calls,
+                mapper.bmi2_pext_calls,
                 mapper.compact_output_leaf_batches,
                 mapper.lazy_validity_omitted_leaf_batches,
                 mapper.materialized_validity_leaf_batches,

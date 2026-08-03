@@ -75,7 +75,3 @@ tempfile = { workspace = true }
 [[bench]]
 harness = false
 name = "sql"
-
-[[bench]]
-harness = false
-name = "optional_mapper_reader"

@@ -272,6 +272,14 @@ codegen-units = 16
 lto = false
 strip = false        # Retain debug info for flamegraphs
 
+# The typed dfexp Cargo BenchSpec intentionally does not accept an arbitrary
+# Cargo profile. Keep this experiment harness on the same optimized non-LTO
+# shape as `release-nonlto` while retaining `cargo bench`'s fixed invocation.
+[profile.bench]
+codegen-units = 16
+lto = false
+strip = false
+
 [profile.profiling]
 inherits = "release"
 debug = true

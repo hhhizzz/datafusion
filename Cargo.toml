@@ -65,6 +65,7 @@ members = [
     "test-utils",
     "benchmarks",
     "benchmarks/optional-mapper-reader",
+    "benchmarks/paper-select-fourarm",
     "datafusion/macros",
     "datafusion/doc",
 ]

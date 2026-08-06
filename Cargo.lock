@@ -4461,6 +4461,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "paper-select-fourarm-bench"
+version = "54.1.0"
+dependencies = [
+ "bytes",
+ "criterion",
+ "parquet",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

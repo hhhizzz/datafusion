@@ -1,0 +1,56 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[package]
+name = "v19-static-census"
+description = "Static structural census (facts 1-4) for experiment arrow-selected-lane-incidence-census-v19"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Only `parquet`'s stock, always-public `column`/`file`/`schema`/`basic` modules are used (see
+# benches/v19_static_census.rs's module doc comment for the exact API surface and why the
+# "experimental" feature is not needed here, unlike benchmarks/paper-select-fourarm which uses
+# `parquet::encodings::rle::RleDecoder`). `default-features = true` is needed to pull in the
+# compression codecs (snap/zstd/lz4/brotli/flate2) so `PageReader` can transparently decompress
+# whatever codec the target datasets used; the workspace default of `default-features = false`
+# is deliberately overridable per-crate (see the comment atop the root Cargo.toml's
+# `[workspace.dependencies]` block).
+parquet = { workspace = true, default-features = true }
+bytes = { workspace = true }
+# Already a workspace dependency (root Cargo.toml `[workspace.dependencies]`); used to emit the
+# structured JSON section of the report. Built via `serde_json::json!`/`Value`/`Map` only, so
+# plain `serde` (not itself a workspace dependency) is never needed.
+serde_json = { workspace = true }
+
+# `[[bench]]`, not `[[bin]]`: the guarded K8s bench runner invokes `cargo bench -p <package>
+# --bench <target>` (see codex/dfexp/debug_runner/run-debug.sh), which only resolves
+# `[[bench]]`-declared targets. This is a one-shot analysis program, not a Criterion benchmark
+# (harness = false, same as benchmarks/paper-select-fourarm/benches/paper_select_fourarm.rs),
+# but it must be declared this way to be reachable through that pipeline at all.
+[[bench]]
+name = "v19_static_census"
+harness = false

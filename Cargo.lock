@@ -6758,6 +6758,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "v19-static-census"
+version = "54.1.0"
+dependencies = [
+ "bytes",
+ "parquet",
+ "serde_json",
+]
+
+[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -148,7 +148,19 @@ const CLICKBENCH_DIR_NAME: &str = "clickbench-100m-single-v1";
 const TPCDS_DIR_NAME: &str = "tpcds-sf10-v1";
 
 fn main() {
-    let root = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_DATASET_ROOT.to_string());
+    // `cargo bench` unconditionally injects a bare `--bench` into argv[1] for every
+    // `[[bench]]` target it runs, even with `harness = false` (a legacy libtest-compat
+    // convention baked into Cargo itself, independent of anything this crate declares) --
+    // confirmed empirically by a real K8s run: without this filter, `args().nth(1)` picked up
+    // the literal string "--bench" as a dataset-root override. Skip any leading argv entries
+    // that look like flags (start with `-`) and take the first genuine positional argument, if
+    // any, as the override -- this also makes a real override still reachable via
+    // `--bench-arg <root>` in the guarded runner, since Cargo passes those through after its
+    // own `--bench`.
+    let root = std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .unwrap_or_else(|| DEFAULT_DATASET_ROOT.to_string());
     let root = PathBuf::from(root);
     println!("v19-static-census (static structural census, v19 facts 1-4 only)");
     println!("dataset root: {}", root.display());

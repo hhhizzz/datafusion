@@ -327,6 +327,17 @@ fn run_direct_gather_checked(decoder: &mut RleDecoder, page: &ReplayPage, dict: 
     written
 }
 
+fn run_tiered(decoder: &mut RleDecoder, page: &ReplayPage, dict: &[i64], out: &mut [i64]) -> usize {
+    decoder.set_data(page.rle_data.clone()).expect("tiered: set_data failed");
+    let selection = PackedSelection::new(&page.mask_bytes, 0, page.n_values)
+        .expect("tiered: PackedSelection::new failed");
+    let (consumed, written) = decoder
+        .get_batch_with_dict_selected_direct_gather_tiered(dict, out, selection)
+        .expect("tiered: get_batch_with_dict_selected_direct_gather_tiered failed");
+    assert_eq!(consumed, page.n_values, "tiered: RleDecoder did not consume the whole page");
+    written
+}
+
 fn run_decode_all_indices_compact(
     decoder: &mut RleDecoder,
     page: &ReplayPage,
@@ -437,11 +448,13 @@ fn bench_density_point(c: &mut Criterion, loaded: &LoadedFixture, query: &str, d
         let mut decoder_cursor = RleDecoder::new(k);
         let mut decoder_dg = RleDecoder::new(k);
         let mut decoder_dgc = RleDecoder::new(k);
+        let mut decoder_tiered = RleDecoder::new(k);
         let mut decoder_c = RleDecoder::new(k);
         let mut decoder_d = RleDecoder::new(k);
         let mut out_cursor = vec![0i64; max_selected];
         let mut out_dg = vec![0i64; max_selected];
         let mut out_dgc = vec![0i64; max_selected];
+        let mut out_tiered = vec![0i64; max_selected];
         let mut idx_buf = [0i32; RLE_CHUNK];
         let mut val_buf = [0i64; RLE_CHUNK];
         let mut out_c = Vec::with_capacity(max_selected);
@@ -450,6 +463,7 @@ fn bench_density_point(c: &mut Criterion, loaded: &LoadedFixture, query: &str, d
         let written_cursor = run_cursor(&mut decoder_cursor, &page, dict, &mut out_cursor);
         let written_dg = run_direct_gather(&mut decoder_dg, &page, dict, &mut out_dg);
         let written_dgc = run_direct_gather_checked(&mut decoder_dgc, &page, dict, &mut out_dgc);
+        let written_tiered = run_tiered(&mut decoder_tiered, &page, dict, &mut out_tiered);
         run_decode_all_indices_compact(&mut decoder_c, &page, dict, &mut idx_buf, &mut out_c);
         run_materialize_then_filter(&mut decoder_d, &page, dict, &mut val_buf, &mut out_d);
 
@@ -459,6 +473,7 @@ fn bench_density_point(c: &mut Criterion, loaded: &LoadedFixture, query: &str, d
                 ("cursor", kernel::fnv1a64(&out_cursor[..written_cursor])),
                 ("direct_gather", kernel::fnv1a64(&out_dg[..written_dg])),
                 ("direct_gather_checked", kernel::fnv1a64(&out_dgc[..written_dgc])),
+                ("tiered", kernel::fnv1a64(&out_tiered[..written_tiered])),
                 ("decode_all_indices_compact", kernel::fnv1a64(&out_c)),
                 ("materialize_then_filter", kernel::fnv1a64(&out_d)),
             ],
@@ -501,6 +516,17 @@ fn bench_density_point(c: &mut Criterion, loaded: &LoadedFixture, query: &str, d
         group.bench_function(format!("direct_gather_checked/{cell_desc}"), |b| {
             b.iter(|| {
                 let written = run_direct_gather_checked(&mut decoder, &page, dict, &mut out);
+                hint::black_box(&out[..written]);
+            });
+        });
+    }
+    {
+        let mut decoder = RleDecoder::new(k);
+        let mut out = vec![0i64; max_selected];
+        let _ = run_tiered(&mut decoder, &page, dict, &mut out);
+        group.bench_function(format!("tiered/{cell_desc}"), |b| {
+            b.iter(|| {
+                let written = run_tiered(&mut decoder, &page, dict, &mut out);
                 hint::black_box(&out[..written]);
             });
         });

@@ -34,6 +34,15 @@
 //! - `direct_gather_checked`: `RleDecoder::get_batch_with_dict_selected_direct_gather_checked`,
 //!   its always-checked, always-direct-gather-algorithm sibling (kill gate 3's "checked
 //!   treatment" sub-arm).
+//! - `tiered`: `RleDecoder::get_batch_with_dict_selected_direct_gather_tiered` (2026-08-08
+//!   addition, see the experiment doc's "Tiered-admission arm" section) -- splits
+//!   `direct_gather`'s single preflight into two independent per-run checks so a run whose only
+//!   failure is an undersized dictionary gets a checked-dictionary direct gather instead of the
+//!   full decode-all-then-filter fallback. Group 4 (undersized dictionary) is this arm's own
+//!   primary target: its cells exercise the new checked-dictionary path (`direct_gather`
+//!   /`direct_gather_checked` do not distinguish "checked dict, unchecked read" from either of
+//!   their own two paths). Groups 1's page-final runs and group 3's third multi-call chunk
+//!   continue to incidentally exercise the shared fallback branch (see their own entries below).
 //! - `decode_all_indices_compact` / `materialize_then_filter`: the same two independent,
 //!   decoder-internals-agnostic witnesses `rle_fill.rs`/`rle_fill_r15.rs` already use (stock
 //!   `get_batch`/`get_batch_with_dict` plus a harness-level selection-word walk) -- included in
@@ -243,6 +252,17 @@ fn run_direct_gather_checked(decoder: &mut RleDecoder, page: &Page, dict: &[i64]
     written
 }
 
+fn run_tiered(decoder: &mut RleDecoder, page: &Page, dict: &[i64], out: &mut [i64]) -> usize {
+    decoder.set_data(page.buffer.clone()).expect("tiered: set_data failed");
+    let selection = PackedSelection::new(&page.mask_bytes, 0, N_TOTAL)
+        .expect("tiered: PackedSelection::new failed");
+    let (consumed, written) = decoder
+        .get_batch_with_dict_selected_direct_gather_tiered(dict, out, selection)
+        .expect("tiered: get_batch_with_dict_selected_direct_gather_tiered failed");
+    assert_eq!(consumed, N_TOTAL, "tiered: RleDecoder did not consume the whole page");
+    written
+}
+
 /// Independent witness (arm C-equivalent): stock `RleDecoder::get_batch::<i32>` in `RLE_CHUNK`
 /// -value chunks, then a harness-level selection-word walk gathering `dict[idx]`. Unchanged
 /// from `rle_fill.rs`/`rle_fill_r15.rs`'s own `run_arm_c`.
@@ -377,6 +397,23 @@ fn run_multi_call_direct_gather_checked(
     written
 }
 
+fn run_multi_call_tiered(decoder: &mut RleDecoder, page: &Page, dict: &[i64], out: &mut [i64]) -> usize {
+    decoder.set_data(page.buffer.clone()).expect("multi-call tiered: set_data failed");
+    let mut chunk_start = 0usize;
+    let mut written = 0usize;
+    for &chunk_len in &MULTI_CALL_SPLITS {
+        let selection = PackedSelection::new(&page.mask_bytes, chunk_start, chunk_len)
+            .expect("multi-call tiered: PackedSelection::new failed");
+        let (consumed, w) = decoder
+            .get_batch_with_dict_selected_direct_gather_tiered(dict, &mut out[written..], selection)
+            .expect("multi-call tiered: get_batch_with_dict_selected_direct_gather_tiered failed");
+        assert_eq!(consumed, chunk_len, "multi-call tiered: did not consume the whole chunk");
+        written += w;
+        chunk_start += chunk_len;
+    }
+    written
+}
+
 // -----------------------------------------------------------------------------------------
 // Cross-arm digest verification (untimed, at setup).
 // -----------------------------------------------------------------------------------------
@@ -414,11 +451,13 @@ fn run_single_call_cell(c: &mut Criterion, cell_desc: &str, k: u8, dict: &[i64],
         let mut decoder_cursor = RleDecoder::new(k);
         let mut decoder_dg = RleDecoder::new(k);
         let mut decoder_dgc = RleDecoder::new(k);
+        let mut decoder_tiered = RleDecoder::new(k);
         let mut decoder_c = RleDecoder::new(k);
         let mut decoder_d = RleDecoder::new(k);
         let mut out_cursor = vec![0i64; max_selected];
         let mut out_dg = vec![0i64; max_selected];
         let mut out_dgc = vec![0i64; max_selected];
+        let mut out_tiered = vec![0i64; max_selected];
         let mut idx_buf = [0i32; RLE_CHUNK];
         let mut val_buf = [0i64; RLE_CHUNK];
         let mut out_c = Vec::with_capacity(max_selected);
@@ -428,6 +467,7 @@ fn run_single_call_cell(c: &mut Criterion, cell_desc: &str, k: u8, dict: &[i64],
             let written_cursor = run_cursor(&mut decoder_cursor, page, dict, &mut out_cursor);
             let written_dg = run_direct_gather(&mut decoder_dg, page, dict, &mut out_dg);
             let written_dgc = run_direct_gather_checked(&mut decoder_dgc, page, dict, &mut out_dgc);
+            let written_tiered = run_tiered(&mut decoder_tiered, page, dict, &mut out_tiered);
             out_c.clear();
             run_decode_all_indices_compact(&mut decoder_c, page, dict, &mut idx_buf, &mut out_c);
             out_d.clear();
@@ -441,6 +481,7 @@ fn run_single_call_cell(c: &mut Criterion, cell_desc: &str, k: u8, dict: &[i64],
                     ("cursor", kernel::fnv1a64(&out_cursor[..written_cursor])),
                     ("direct_gather", kernel::fnv1a64(&out_dg[..written_dg])),
                     ("direct_gather_checked", kernel::fnv1a64(&out_dgc[..written_dgc])),
+                    ("tiered", kernel::fnv1a64(&out_tiered[..written_tiered])),
                     ("decode_all_indices_compact", kernel::fnv1a64(&out_c)),
                     ("materialize_then_filter", kernel::fnv1a64(&out_d)),
                 ],
@@ -499,6 +540,20 @@ fn run_single_call_cell(c: &mut Criterion, cell_desc: &str, k: u8, dict: &[i64],
     {
         let mut cursor_pos = 0usize;
         let mut decoder = RleDecoder::new(k);
+        let mut out = vec![0i64; max_selected];
+        let _ = run_tiered(&mut decoder, &pages[0], dict, &mut out);
+        group.bench_function(format!("tiered/{cell_desc}"), |b| {
+            b.iter(|| {
+                let page = &pages[cursor_pos];
+                cursor_pos = (cursor_pos + 1) % pages.len();
+                let written = run_tiered(&mut decoder, page, dict, &mut out);
+                hint::black_box(&out[..written]);
+            });
+        });
+    }
+    {
+        let mut cursor_pos = 0usize;
+        let mut decoder = RleDecoder::new(k);
         let mut idx_buf = [0i32; RLE_CHUNK];
         let mut out = Vec::with_capacity(max_selected);
         run_decode_all_indices_compact(&mut decoder, &pages[0], dict, &mut idx_buf, &mut out);
@@ -531,7 +586,7 @@ fn run_single_call_cell(c: &mut Criterion, cell_desc: &str, k: u8, dict: &[i64],
     group.finish();
 }
 
-/// Group 3's core: 3 arms (no C/D -- see the module doc comment's group 3 entry), multi-call.
+/// Group 3's core: 4 arms (no C/D -- see the module doc comment's group 3 entry), multi-call.
 fn run_multi_call_cell(c: &mut Criterion, cell_desc: &str, k: u8, dict: &[i64], pages: &[Page]) {
     let max_selected = pages.iter().map(|p| kernel::popcount_words(&p.mask_words)).max().unwrap_or(0);
 
@@ -540,15 +595,18 @@ fn run_multi_call_cell(c: &mut Criterion, cell_desc: &str, k: u8, dict: &[i64], 
         let mut decoder_cursor = RleDecoder::new(k);
         let mut decoder_dg = RleDecoder::new(k);
         let mut decoder_dgc = RleDecoder::new(k);
+        let mut decoder_tiered = RleDecoder::new(k);
         let mut out_cursor = vec![0i64; max_selected];
         let mut out_dg = vec![0i64; max_selected];
         let mut out_dgc = vec![0i64; max_selected];
+        let mut out_tiered = vec![0i64; max_selected];
 
         for (page_idx, page) in pages.iter().enumerate() {
             let written_cursor = run_multi_call_cursor(&mut decoder_cursor, page, dict, &mut out_cursor);
             let written_dg = run_multi_call_direct_gather(&mut decoder_dg, page, dict, &mut out_dg);
             let written_dgc =
                 run_multi_call_direct_gather_checked(&mut decoder_dgc, page, dict, &mut out_dgc);
+            let written_tiered = run_multi_call_tiered(&mut decoder_tiered, page, dict, &mut out_tiered);
 
             verify_digests(
                 "bitpacked_direct_gather",
@@ -558,6 +616,7 @@ fn run_multi_call_cell(c: &mut Criterion, cell_desc: &str, k: u8, dict: &[i64], 
                     ("cursor", kernel::fnv1a64(&out_cursor[..written_cursor])),
                     ("direct_gather", kernel::fnv1a64(&out_dg[..written_dg])),
                     ("direct_gather_checked", kernel::fnv1a64(&out_dgc[..written_dgc])),
+                    ("tiered", kernel::fnv1a64(&out_tiered[..written_tiered])),
                 ],
             );
         }
@@ -607,6 +666,20 @@ fn run_multi_call_cell(c: &mut Criterion, cell_desc: &str, k: u8, dict: &[i64], 
                 let page = &pages[cursor_pos];
                 cursor_pos = (cursor_pos + 1) % pages.len();
                 let written = run_multi_call_direct_gather_checked(&mut decoder, page, dict, &mut out);
+                hint::black_box(&out[..written]);
+            });
+        });
+    }
+    {
+        let mut cursor_pos = 0usize;
+        let mut decoder = RleDecoder::new(k);
+        let mut out = vec![0i64; max_selected];
+        let _ = run_multi_call_tiered(&mut decoder, &pages[0], dict, &mut out);
+        group.bench_function(format!("tiered/{cell_desc}"), |b| {
+            b.iter(|| {
+                let page = &pages[cursor_pos];
+                cursor_pos = (cursor_pos + 1) % pages.len();
+                let written = run_multi_call_tiered(&mut decoder, page, dict, &mut out);
                 hint::black_box(&out[..written]);
             });
         });

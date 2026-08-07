@@ -38,3 +38,7 @@ parquet = { workspace = true, default-features = true, features = ["experimental
 [[bench]]
 harness = false
 name = "rle_fill"
+
+[[bench]]
+harness = false
+name = "rle_fill_r15"

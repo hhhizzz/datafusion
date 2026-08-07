@@ -273,7 +273,6 @@ fn load_fixture(f: &RealFixture) -> LoadedFixture {
 
 struct ReplayPage {
     rle_data: Bytes,
-    bit_width: u8,
     n_values: usize,
     mask_bytes: Vec<u8>,
     mask_words: Vec<u64>,
@@ -285,7 +284,6 @@ fn build_replay_page(loaded: &LoadedFixture, density: f64, mean_run: f64, seed: 
     let mask_bytes = kernel::words_to_packed_bytes(&mask_words);
     ReplayPage {
         rle_data: loaded.rle_data.clone(),
-        bit_width: loaded.bit_width,
         n_values: loaded.physical_n_values,
         mask_bytes,
         mask_words,

@@ -295,3 +295,79 @@ pub fn fnv1a64(values: &[i64]) -> u64 {
     }
     hash
 }
+
+// =========================================================================================
+// Bit-packed run encoding (experiment v23, `arrow-bitpacked-direct-gather-gate-v23`).
+//
+// Same run-header framing as the pure-RLE encoder above (see this module's doc comment): a
+// bit-packed run's ULEB128 header is `(num_groups << 1) | 1` (low bit *set*, unlike an RLE
+// run's clear low bit), followed by `num_groups * 8` values flat-packed at `bit_width` bits
+// each, LSB-first: value `i` (0-indexed within the run) occupies bit range
+// `[i*bit_width, i*bit_width+bit_width)` of the payload, flat bit `b` at byte `b/8` bit `b%8`.
+// Confirmed against the same pinned commit as the RLE encoder above
+// (`RleDecoder::reload`'s bit-packed arm and `BitReader::get_batch`).
+// =========================================================================================
+
+/// Appends one bit-packed run's header and payload to `out`. `values.len()` must be a multiple
+/// of 8 (the hybrid format's own group-of-8 requirement); every `values[i]` must be `< 1 <<
+/// bit_width` (not enforced here -- the only callers in this module mask by construction).
+pub fn write_bit_packed_run(out: &mut Vec<u8>, values: &[u64], bit_width: u8) {
+    assert_eq!(values.len() % 8, 0, "bit-packed runs group values in multiples of 8");
+    let num_groups = (values.len() / 8) as u64;
+    write_uleb128(out, (num_groups << 1) | 1);
+    let k = bit_width as u64;
+    let total_bits = values.len() as u64 * k;
+    let start = out.len();
+    out.resize(start + total_bits.div_ceil(8) as usize, 0u8);
+    let mut bit_pos: u64 = 0;
+    for &v in values {
+        debug_assert!(k == 64 || v < (1u64 << k), "value does not fit in bit_width bits");
+        let mut remaining = k;
+        let mut src = v;
+        let mut b = bit_pos;
+        while remaining > 0 {
+            let byte_idx = start + (b / 8) as usize;
+            let bit_in_byte = (b % 8) as u32;
+            let space = 8 - bit_in_byte;
+            let take = remaining.min(space as u64) as u32;
+            let chunk = (src & ((1u64 << take) - 1)) as u8;
+            out[byte_idx] |= chunk << bit_in_byte;
+            src >>= take;
+            remaining -= take as u64;
+            b += take as u64;
+        }
+        bit_pos += k;
+    }
+}
+
+/// Generates `n_values` pseudo-random dictionary indices, each uniform in `[0, 1 << bit_width)`,
+/// rounded up to a multiple of 8 with zero-padding (see [`write_bit_packed_run`]'s group-of-8
+/// requirement) -- the padding values are never selected by any mask this module builds for
+/// exactly `n_values` logical positions, since [`generate_random_mask`]/friends zero every bit
+/// at or beyond `n_values`.
+pub fn generate_bitpacked_values(n_values: usize, bit_width: u8, rng: &mut Xorshift64Star) -> Vec<u64> {
+    let index_mask = if bit_width >= 64 { u64::MAX } else { (1u64 << bit_width) - 1 };
+    let padded = n_values.div_ceil(8) * 8;
+    (0..padded).map(|i| if i < n_values { rng.next_u64() & index_mask } else { 0 }).collect()
+}
+
+/// Like [`generate_bitpacked_values`], but every produced value is uniform in `[0, dict_len)`
+/// rather than the run's full `[0, 1 << bit_width)` code space. Models a dictionary smaller
+/// than its run's declared bit width -- the common case for a real Parquet writer, which picks
+/// the smallest `bit_width` with `dict_len <= 1 << bit_width`, so `dict_len` is an exact power
+/// of 2 only by coincidence. Requires `dict_len <= 1 << bit_width` (asserted) and `dict_len >=
+/// 1`, so every produced value still fits in `bit_width` bits.
+pub fn generate_bitpacked_values_bounded(
+    n_values: usize,
+    bit_width: u8,
+    dict_len: usize,
+    rng: &mut Xorshift64Star,
+) -> Vec<u64> {
+    assert!(dict_len >= 1, "dict_len must be at least 1");
+    assert!(
+        bit_width >= 64 || dict_len as u64 <= (1u64 << bit_width),
+        "dict_len must fit within bit_width bits"
+    );
+    let padded = n_values.div_ceil(8) * 8;
+    (0..padded).map(|i| if i < n_values { rng.next_u64() % dict_len as u64 } else { 0 }).collect()
+}

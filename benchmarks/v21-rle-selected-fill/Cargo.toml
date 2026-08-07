@@ -42,3 +42,7 @@ name = "rle_fill"
 [[bench]]
 harness = false
 name = "rle_fill_r15"
+
+[[bench]]
+harness = false
+name = "bitpacked_direct_gather"

@@ -80,6 +80,9 @@ use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 use parquet::encodings::rle::{PackedSelection, RleDecoder};
 
+// kernel.rs is shared across this crate's bench binaries (rle_fill/rle_fill_r15
+// /bitpacked_direct_gather); not every helper it exports is used by every binary.
+#[allow(dead_code)]
 #[path = "rle_fill/kernel.rs"]
 mod kernel;
 

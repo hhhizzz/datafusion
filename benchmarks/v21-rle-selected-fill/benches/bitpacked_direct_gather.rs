@@ -106,6 +106,9 @@ use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 use parquet::encodings::rle::{PackedSelection, RleDecoder};
 
+// kernel.rs is shared across this crate's bench binaries; not every helper it exports is used
+// by every binary (e.g. this file uses generate_random_mask but not generate_dense_mask).
+#[allow(dead_code)]
 #[path = "rle_fill/kernel.rs"]
 mod kernel;
 

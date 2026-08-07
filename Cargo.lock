@@ -6767,6 +6767,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "v21-rle-selected-fill-bench"
+version = "54.1.0"
+dependencies = [
+ "bytes",
+ "criterion",
+ "parquet",
+]
+
+[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

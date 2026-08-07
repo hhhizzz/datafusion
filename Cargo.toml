@@ -67,6 +67,7 @@ members = [
     "benchmarks/optional-mapper-reader",
     "benchmarks/paper-select-fourarm",
     "benchmarks/v19-static-census",
+    "benchmarks/v21-rle-selected-fill",
     "datafusion/macros",
     "datafusion/doc",
 ]

@@ -49,7 +49,7 @@ use crate::{
 
 use super::dml::InsertOp;
 use arrow::compute::can_cast_types;
-use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, FieldRef, Fields, Metadata, Schema, SchemaRef};
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::metadata::FieldMetadata;
@@ -1765,7 +1765,7 @@ pub fn build_join_schema(
         _ => (right, left),
     };
 
-    let metadata = schema1
+    let metadata: Metadata = schema1
         .metadata()
         .clone()
         .into_iter()

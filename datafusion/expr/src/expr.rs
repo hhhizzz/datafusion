@@ -32,7 +32,7 @@ use crate::type_coercion::functions::value_fields_with_higher_order_udf;
 use crate::{AggregateUDF, LambdaParametersProgress, ValueOrLambda, Volatility};
 use crate::{ExprSchemable, Operator, Signature, WindowFrame, WindowUDF};
 
-use arrow::datatypes::{DataType, Field, FieldRef};
+use arrow::datatypes::{DataType, Field, FieldRef, Metadata};
 use datafusion_common::cse::{HashNode, NormalizeEq, Normalizeable};
 use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::metadata::format_type_and_metadata;
@@ -622,7 +622,7 @@ impl<'a> TreeNodeContainer<'a, Self> for Expr {
 /// See the [default_column_values.rs] example implementation.
 ///
 /// [default_column_values.rs]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/custom_data_source/default_column_values.rs
-pub type SchemaFieldMetadata = std::collections::HashMap<String, String>;
+pub type SchemaFieldMetadata = Metadata;
 
 /// Intersects multiple metadata instances for UNION operations.
 ///
@@ -656,13 +656,18 @@ pub fn intersect_metadata_for_union<'a>(
         if metadata.is_empty() {
             continue;
         }
-        match &mut intersected {
+        match &intersected {
             None => {
                 intersected = Some(metadata.clone());
             }
             Some(current) => {
                 // Only keep keys that exist in both with the same value
-                current.retain(|k, v| metadata.get(k) == Some(&*v));
+                let retained: SchemaFieldMetadata = current
+                    .iter()
+                    .filter(|(k, v)| metadata.get(k.as_str()) == Some(*v))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                intersected = Some(retained);
             }
         }
     }

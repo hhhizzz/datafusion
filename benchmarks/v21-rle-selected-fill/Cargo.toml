@@ -62,3 +62,7 @@ name = "long_rle_fill_grid"
 [[bench]]
 harness = false
 name = "long_rle_fill_diag"
+
+[[bench]]
+harness = false
+name = "tiered_rle_admission_grid"

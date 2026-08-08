@@ -58,3 +58,7 @@ name = "bitpacked_direct_gather_replay"
 [[bench]]
 harness = false
 name = "long_rle_fill_grid"
+
+[[bench]]
+harness = false
+name = "long_rle_fill_diag"

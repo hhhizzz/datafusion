@@ -62,6 +62,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
+use arrow::array::{Array, BooleanArray, Int64Array};
+use arrow::buffer::{BooleanBuffer, Buffer};
+use arrow::compute::filter;
 use parquet::encodings::rle::{PackedSelection, RleDecoder};
 
 #[allow(dead_code)]
@@ -79,6 +82,12 @@ struct Page {
     buffer: Bytes,
     mask_bytes: Vec<u8>,
     mask_words: Vec<u64>,
+    /// Precomputed once per page, not per timed call -- see `run_production_shape`.
+    predicate: BooleanArray,
+}
+
+fn build_predicate(mask_bytes: &[u8], len: usize) -> BooleanArray {
+    BooleanArray::new(BooleanBuffer::new(Buffer::from(mask_bytes.to_vec()), 0, len), None)
 }
 
 #[derive(Clone, Copy)]
@@ -98,7 +107,8 @@ fn build_uniform_page(l: usize, survival: f64, seed: u64) -> Page {
     let buffer = kernel::build_rle_page(N_TOTAL, l, BIT_WIDTH, &mut rng);
     let mask_words = kernel::generate_random_mask(N_TOTAL, survival, &mut rng);
     let mask_bytes = kernel::words_to_packed_bytes(&mask_words);
-    Page { buffer: Bytes::from(buffer), mask_bytes, mask_words }
+    let predicate = build_predicate(&mask_bytes, N_TOTAL);
+    Page { buffer: Bytes::from(buffer), mask_bytes, mask_words, predicate }
 }
 
 fn build_dense_page(l: usize, seed: u64) -> Page {
@@ -106,7 +116,8 @@ fn build_dense_page(l: usize, seed: u64) -> Page {
     let buffer = kernel::build_rle_page(N_TOTAL, l, BIT_WIDTH, &mut rng);
     let mask_words = kernel::generate_dense_mask(N_TOTAL);
     let mask_bytes = kernel::words_to_packed_bytes(&mask_words);
-    Page { buffer: Bytes::from(buffer), mask_bytes, mask_words }
+    let predicate = build_predicate(&mask_bytes, N_TOTAL);
+    Page { buffer: Bytes::from(buffer), mask_bytes, mask_words, predicate }
 }
 
 // -----------------------------------------------------------------------------------------
@@ -183,6 +194,28 @@ fn run_decode_all_indices_compact(
     }
 }
 
+/// The actual production shape (see `bitpacked_direct_gather_replay.rs`'s module doc comment
+/// for the full rationale): full decode via stock `get_batch_with_dict`, then arrow's own SIMD
+/// `filter` kernel. Added post-Step-0 for experiment `arrow-selected-decode-reader-wiring-v26`
+/// to answer whether `tiered`'s win survives against what a real reader calls today, not just
+/// against this program's own hand-written `materialize_then_filter` baseline.
+fn run_production_shape(decoder: &mut RleDecoder, page: &Page, dict: &[i64]) -> Int64Array {
+    decoder.set_data(page.buffer.clone()).expect("production_shape: set_data failed");
+    let mut values = vec![0i64; N_TOTAL];
+    let got = decoder
+        .get_batch_with_dict::<i64>(dict, &mut values, N_TOTAL)
+        .expect("production_shape: get_batch_with_dict failed");
+    assert_eq!(got, N_TOTAL, "production_shape: fewer values than the page promised");
+
+    let array = Int64Array::from(values);
+    let filtered = filter(&array, &page.predicate).expect("production_shape: filter failed");
+    filtered
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("production_shape: filter did not return an Int64Array")
+        .clone()
+}
+
 fn digest_i64(values: &[i64]) -> u64 {
     kernel::fnv1a64(values)
 }
@@ -224,12 +257,14 @@ fn run_cell(c: &mut Criterion, cell_desc: &str, dict: &[i64], pages: &[Page]) {
         let mut idx_buf = [0i32; RLE_CHUNK];
         let mut out_c = Vec::with_capacity(max_selected);
 
+        let mut dec_p = RleDecoder::new(BIT_WIDTH);
         for (page_idx, page) in pages.iter().enumerate() {
             let wt = run_tiered(&mut dec_t, page, dict, &mut out_t);
             let wta = run_tiered_admitted(&mut dec_ta, page, dict, &mut out_ta);
             let we = run_cursor(&mut dec_e, page, dict, &mut out_e);
             out_c.clear();
             run_decode_all_indices_compact(&mut dec_c, page, dict, &mut idx_buf, &mut out_c);
+            let out_p = run_production_shape(&mut dec_p, page, dict);
 
             verify_digests(
                 cell_desc,
@@ -239,6 +274,7 @@ fn run_cell(c: &mut Criterion, cell_desc: &str, dict: &[i64], pages: &[Page]) {
                     ("tiered", digest_i64(&out_t[..wt])),
                     ("tiered_admitted", digest_i64(&out_ta[..wta])),
                     ("decode_all_indices_compact", digest_i64(&out_c)),
+                    ("production_shape", digest_i64(out_p.values())),
                 ],
             );
         }
@@ -328,6 +364,19 @@ fn run_cell(c: &mut Criterion, cell_desc: &str, dict: &[i64], pages: &[Page]) {
                 out.clear();
                 run_decode_all_indices_compact(&mut decoder, page, dict, &mut idx_buf, &mut out);
                 hint::black_box(out.as_slice());
+            });
+        });
+    }
+    {
+        let mut pos = 0usize;
+        let mut decoder = RleDecoder::new(BIT_WIDTH);
+        let _ = run_production_shape(&mut decoder, &pages[0], dict);
+        group.bench_function(format!("production_shape/{cell_desc}"), |b| {
+            b.iter(|| {
+                let page = &pages[pos];
+                pos = (pos + 1) % pages.len();
+                let result = run_production_shape(&mut decoder, page, dict);
+                hint::black_box(result.values());
             });
         });
     }

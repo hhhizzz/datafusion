@@ -113,13 +113,26 @@
 //!
 //! ## Arms and protocol
 //!
-//! Same 5-arm set, same untimed cross-arm FNV-1a-64 digest verification before any timed
-//! measurement, same Criterion parameters as `bitpacked_direct_gather_grid.rs` -- see that file's
-//! module doc comment for what each arm does.
+//! Same 5-arm set as `bitpacked_direct_gather_grid.rs` (see that file's module doc comment for
+//! what each does), plus a 6th arm added for experiment
+//! `arrow-selected-decode-reader-wiring-v26`'s post-Step-0 analysis:
+//!
+//! - `production_shape`: what a real reader actually calls today, with no selection pushdown at
+//!   all -- full decode via the stock, dict-fused `get_batch_with_dict` (not this file's own
+//!   hand-rolled `materialize_then_filter` loop), then arrow's own SIMD `filter` kernel (not a
+//!   hand-written bit-walk). Every other arm here has only ever been compared against
+//!   `materialize_then_filter`'s scalar loop; this is the first time this program measures
+//!   against what production would actually pay if none of this experiment's work landed.
+//!
+//! Same untimed cross-arm FNV-1a-64 digest verification before any timed measurement, same
+//! Criterion parameters as `bitpacked_direct_gather_grid.rs`.
 
 use std::hint;
 use std::time::Duration;
 
+use arrow::array::{Array, BooleanArray, Int64Array};
+use arrow::buffer::{BooleanBuffer, Buffer};
+use arrow::compute::filter;
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 use parquet::encodings::rle::{PackedSelection, RleDecoder};
@@ -276,17 +289,26 @@ struct ReplayPage {
     n_values: usize,
     mask_bytes: Vec<u8>,
     mask_words: Vec<u64>,
+    /// Precomputed once per page, mirroring how `mask_bytes`/`mask_words` are precomputed once
+    /// and only wrapped (not copied) inside each timed call -- see `run_production_shape`, which
+    /// must not pay a fresh mask-materialization cost per call that no other arm pays either.
+    predicate: BooleanArray,
 }
 
 fn build_replay_page(loaded: &LoadedFixture, density: f64, mean_run: f64, seed: u64) -> ReplayPage {
     let mut rng = kernel::Xorshift64Star::new(seed);
     let mask_words = kernel::generate_clustered_mask(loaded.physical_n_values, density, mean_run, &mut rng);
     let mask_bytes = kernel::words_to_packed_bytes(&mask_words);
+    let predicate = BooleanArray::new(
+        BooleanBuffer::new(Buffer::from(mask_bytes.clone()), 0, loaded.physical_n_values),
+        None,
+    );
     ReplayPage {
         rle_data: loaded.rle_data.clone(),
         n_values: loaded.physical_n_values,
         mask_bytes,
         mask_words,
+        predicate,
     }
 }
 
@@ -336,6 +358,29 @@ fn run_tiered(decoder: &mut RleDecoder, page: &ReplayPage, dict: &[i64], out: &m
         .expect("tiered: get_batch_with_dict_selected_direct_gather_tiered failed");
     assert_eq!(consumed, page.n_values, "tiered: RleDecoder did not consume the whole page");
     written
+}
+
+/// The actual production shape: full decode via the *stock* dict-fused `get_batch_with_dict`
+/// (paying its whole-page materialization cost, same as every real Parquet read that has no
+/// selection pushdown at all today), then filter with arrow's own SIMD `filter` kernel -- not a
+/// hand-rolled bit-walk loop. This is the baseline none of this program's leaf-level comparisons
+/// have measured against before: every other arm here is compared to `materialize_then_filter`'s
+/// hand-written scalar loop, not to what a real reader actually calls.
+fn run_production_shape(decoder: &mut RleDecoder, page: &ReplayPage, dict: &[i64]) -> Int64Array {
+    decoder.set_data(page.rle_data.clone()).expect("production_shape: set_data failed");
+    let mut values = vec![0i64; page.n_values];
+    let got = decoder
+        .get_batch_with_dict::<i64>(dict, &mut values, page.n_values)
+        .expect("production_shape: get_batch_with_dict failed");
+    assert_eq!(got, page.n_values, "production_shape: fewer values than the page promised");
+
+    let array = Int64Array::from(values);
+    let filtered = filter(&array, &page.predicate).expect("production_shape: filter failed");
+    filtered
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("production_shape: filter did not return an Int64Array")
+        .clone()
 }
 
 fn run_decode_all_indices_compact(
@@ -466,6 +511,8 @@ fn bench_density_point(c: &mut Criterion, loaded: &LoadedFixture, query: &str, d
         let written_tiered = run_tiered(&mut decoder_tiered, &page, dict, &mut out_tiered);
         run_decode_all_indices_compact(&mut decoder_c, &page, dict, &mut idx_buf, &mut out_c);
         run_materialize_then_filter(&mut decoder_d, &page, dict, &mut val_buf, &mut out_d);
+        let mut decoder_prod = RleDecoder::new(k);
+        let out_prod = run_production_shape(&mut decoder_prod, &page, dict);
 
         verify_digests(
             &cell_desc,
@@ -476,6 +523,7 @@ fn bench_density_point(c: &mut Criterion, loaded: &LoadedFixture, query: &str, d
                 ("tiered", kernel::fnv1a64(&out_tiered[..written_tiered])),
                 ("decode_all_indices_compact", kernel::fnv1a64(&out_c)),
                 ("materialize_then_filter", kernel::fnv1a64(&out_d)),
+                ("production_shape", kernel::fnv1a64(out_prod.values())),
             ],
         );
     }
@@ -554,6 +602,16 @@ fn bench_density_point(c: &mut Criterion, loaded: &LoadedFixture, query: &str, d
                 out.clear();
                 run_materialize_then_filter(&mut decoder, &page, dict, &mut val_buf, &mut out);
                 hint::black_box(out.as_slice());
+            });
+        });
+    }
+    {
+        let mut decoder = RleDecoder::new(k);
+        let _ = run_production_shape(&mut decoder, &page, dict);
+        group.bench_function(format!("production_shape/{cell_desc}"), |b| {
+            b.iter(|| {
+                let result = run_production_shape(&mut decoder, &page, dict);
+                hint::black_box(result.values());
             });
         });
     }

@@ -7002,6 +7002,7 @@ dependencies = [
 name = "v21-rle-selected-fill-bench"
 version = "54.1.0"
 dependencies = [
+ "arrow",
  "bytes",
  "criterion",
  "parquet",

@@ -31,6 +31,7 @@ publish = false
 workspace = true
 
 [dependencies]
+arrow = { workspace = true }
 bytes = { workspace = true }
 criterion = { workspace = true }
 parquet = { workspace = true, default-features = true, features = ["experimental"] }

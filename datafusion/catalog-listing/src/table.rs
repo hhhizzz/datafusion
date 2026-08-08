@@ -960,7 +960,7 @@ impl ListingTable {
                 .iter()
                 .map(|(name, data_type)| Field::new(name, data_type.clone(), true))
                 .collect(),
-            Default::default(),
+            arrow::datatypes::Metadata::default(),
         )?;
 
         file_groups

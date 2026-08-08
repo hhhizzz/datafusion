@@ -82,8 +82,10 @@ impl TypePlanner for SqlLogicTestTypePlanner {
         match sql_type {
             ast::DataType::Uuid => Ok(Some(Arc::new(
                 Field::new("", DataType::FixedSizeBinary(16), true).with_metadata(
-                    [("ARROW:extension:name".to_string(), "arrow.uuid".to_string())]
-                        .into(),
+                    arrow::datatypes::Metadata::from([(
+                        "ARROW:extension:name".to_string(),
+                        "arrow.uuid".to_string(),
+                    )]),
                 ),
             ))),
             _ => Ok(None),

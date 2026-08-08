@@ -47,7 +47,7 @@ use crate::statistics::{ChildStats, StatisticsArgs};
 use crate::stream::ObservedStream;
 
 use arrow::array::RecordBatchOptions;
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{Field, Metadata, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::NdvFallback;
@@ -914,7 +914,7 @@ fn union_schema(inputs: &[Arc<dyn ExecutionPlan>]) -> Result<SchemaRef> {
         })
         .collect::<Vec<_>>();
 
-    let all_metadata_merged = inputs
+    let all_metadata_merged: Metadata = inputs
         .iter()
         .flat_map(|i| i.schema().metadata().clone().into_iter())
         .collect();

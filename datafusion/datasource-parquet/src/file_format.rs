@@ -265,7 +265,10 @@ fn clear_metadata(
             .fields()
             .iter()
             .map(|field| {
-                field.as_ref().clone().with_metadata(Default::default()) // clear meta
+                field
+                    .as_ref()
+                    .clone()
+                    .with_metadata(arrow::datatypes::Metadata::default()) // clear meta
             })
             .collect::<Fields>();
         Schema::new(fields)

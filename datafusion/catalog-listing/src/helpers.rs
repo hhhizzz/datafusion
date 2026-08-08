@@ -423,7 +423,7 @@ pub async fn pruned_partition_list<'a>(
                 .iter()
                 .map(|(n, d)| Field::new(n, d.clone(), true))
                 .collect(),
-            Default::default(),
+            arrow::datatypes::Metadata::default(),
         )?;
 
         Ok(objects

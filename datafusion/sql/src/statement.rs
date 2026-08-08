@@ -2928,7 +2928,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let mut planner_context =
             PlannerContext::new().with_prepare_param_data_types(prepare_param_data_types);
         planner_context.set_table_schema(Some(DFSchemaRef::new(
-            DFSchema::from_unqualified_fields(fields.clone(), Default::default())?,
+            DFSchema::from_unqualified_fields(
+                fields.clone(),
+                arrow::datatypes::Metadata::default(),
+            )?,
         )));
         let source = self.query_to_plan(*source, &mut planner_context)?;
         if fields.len() != source.schema().fields().len() {

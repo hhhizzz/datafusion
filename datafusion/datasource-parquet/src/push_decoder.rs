@@ -74,6 +74,8 @@ pub(crate) struct DecoderBuilderConfig<'a> {
     pub(crate) batch_size: usize,
     pub(crate) arrow_reader_metrics: &'a ArrowReaderMetrics,
     pub(crate) force_filter_selections: bool,
+    /// EXPERIMENTAL: see `datafusion.execution.parquet.selected_decode`.
+    pub(crate) selected_decode: bool,
     pub(crate) decoder_limit: Option<usize>,
 }
 
@@ -91,7 +93,8 @@ impl DecoderBuilderConfig<'_> {
         let mut builder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
             .with_projection(self.projection_mask.clone())
             .with_batch_size(self.batch_size)
-            .with_metrics(self.arrow_reader_metrics.clone());
+            .with_metrics(self.arrow_reader_metrics.clone())
+            .with_selected_decode(self.selected_decode);
         if self.force_filter_selections {
             builder = builder.with_row_selection_policy(RowSelectionPolicy::Selectors);
         }

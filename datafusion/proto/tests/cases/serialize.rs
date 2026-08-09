@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
@@ -148,9 +149,10 @@ fn roundtrip_placeholder_with_metadata() {
         "placeholder_id".to_string(),
         Some(
             Field::new("", DataType::Utf8, false)
-                .with_metadata(
-                    [("some_key".to_string(), "some_value".to_string())].into(),
-                )
+                .with_metadata(HashMap::from([(
+                    "some_key".to_string(),
+                    "some_value".to_string(),
+                )]))
                 .into(),
         ),
     ));

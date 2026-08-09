@@ -547,6 +547,11 @@ mod parquet {
                 pushdown_filters: proto.pushdown_filters,
                 reorder_filters: proto.reorder_filters,
                 force_filter_selections: proto.force_filter_selections,
+                // Experimental, not part of the proto wire format (experiment
+                // `arrow-selected-decode-reader-wiring-v26`) -- always decodes
+                // as off; this option is not intended for distributed
+                // round-tripping in v0.
+                selected_decode: false,
                 data_pagesize_limit: proto.data_pagesize_limit as usize,
                 write_batch_size: proto.write_batch_size as usize,
                 writer_version,

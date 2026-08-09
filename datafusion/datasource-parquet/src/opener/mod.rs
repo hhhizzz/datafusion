@@ -263,6 +263,10 @@ pub(super) struct ParquetMorselizer {
     pub reorder_filters: bool,
     /// Should we force the reader to use RowSelections for filtering
     pub force_filter_selections: bool,
+    /// EXPERIMENTAL: push row selections into the decoder for eligible
+    /// columns instead of decoding then filtering. See
+    /// `datafusion.execution.parquet.selected_decode`.
+    pub selected_decode: bool,
     /// Should the page index be read from parquet files, if present, to skip
     /// data pages
     pub enable_page_index: bool,
@@ -447,6 +451,7 @@ struct PreparedParquetOpen {
     reorder_predicates: bool,
     pushdown_filters: bool,
     force_filter_selections: bool,
+    selected_decode: bool,
     enable_page_index: bool,
     enable_bloom_filter: bool,
     enable_row_group_stats_pruning: bool,
@@ -847,6 +852,7 @@ impl ParquetMorselizer {
             reorder_predicates: self.reorder_filters,
             pushdown_filters: self.pushdown_filters,
             force_filter_selections: self.force_filter_selections,
+            selected_decode: self.selected_decode,
             enable_page_index: self.enable_page_index,
             enable_bloom_filter: self.enable_bloom_filter,
             enable_row_group_stats_pruning: self.enable_row_group_stats_pruning,
@@ -1419,6 +1425,7 @@ impl RowGroupsPrunedParquetOpen {
                 batch_size: prepared.batch_size,
                 arrow_reader_metrics: &arrow_reader_metrics,
                 force_filter_selections: prepared.force_filter_selections,
+                selected_decode: prepared.selected_decode,
                 decoder_limit: prepared.limit,
             };
 
@@ -1758,6 +1765,7 @@ mod test {
         pushdown_filters: bool,
         reorder_filters: bool,
         force_filter_selections: bool,
+        selected_decode: bool,
         enable_page_index: bool,
         enable_bloom_filter: bool,
         enable_row_group_stats_pruning: bool,
@@ -1867,6 +1875,7 @@ mod test {
                 pushdown_filters: false,
                 reorder_filters: false,
                 force_filter_selections: false,
+                selected_decode: false,
                 enable_page_index: false,
                 enable_bloom_filter: false,
                 enable_row_group_stats_pruning: false,
@@ -1927,6 +1936,12 @@ mod test {
         /// Enable pushdown filters.
         fn with_pushdown_filters(mut self, enable: bool) -> Self {
             self.pushdown_filters = enable;
+            self
+        }
+
+        /// Enable the experimental selected-decode option.
+        fn with_selected_decode(mut self, enable: bool) -> Self {
+            self.selected_decode = enable;
             self
         }
 
@@ -2036,6 +2051,7 @@ mod test {
                 pushdown_filters: self.pushdown_filters,
                 reorder_filters: self.reorder_filters,
                 force_filter_selections: self.force_filter_selections,
+                selected_decode: self.selected_decode,
                 enable_page_index: self.enable_page_index,
                 enable_bloom_filter: self.enable_bloom_filter,
                 enable_row_group_stats_pruning: self.enable_row_group_stats_pruning,
@@ -2863,6 +2879,71 @@ mod test {
             vec![9, 10, 5, 6, 7, 8, 3, 4],
             "Reverse scan should reverse row group order while maintaining correct RowSelection for each group"
         );
+    }
+
+    /// Experiment `arrow-selected-decode-reader-wiring-v26`, Step 2: proves
+    /// `datafusion.execution.parquet.selected_decode` actually reaches the
+    /// underlying `ArrowReaderBuilder::with_selected_decode` flag through
+    /// `ParquetSource::selected_decode()` -> `ParquetMorselizer` ->
+    /// `DecoderBuilderConfig` -> `ParquetPushDecoderBuilder`, not just that
+    /// the plumbing compiles. arrow-rs's own
+    /// `arrow_reader::tests::test_selected_decode_matches_default` already
+    /// covers the RLE-admission threshold and multi-page cases thoroughly,
+    /// so this test stays focused on the DataFusion-specific gap: config ->
+    /// builder wiring, exercised through the real row-selection Mask
+    /// execution path (forced by using short alternating selector spans,
+    /// since `RowSelectionPolicy::Auto`'s default 32-row threshold would
+    /// otherwise pick the unrelated Selectors strategy for this data).
+    #[tokio::test]
+    async fn test_selected_decode_config_reaches_reader() {
+        use crate::ParquetAccessPlan;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+        // Low-cardinality, required column -> RLE_DICTIONARY-encoded.
+        let values: Vec<i32> = (0..2000).map(|i| i % 5).collect();
+        let batch = record_batch!(("a", Int32, values)).unwrap();
+        let data_len =
+            write_parquet(Arc::clone(&store), "test.parquet", batch.clone()).await;
+        let schema = batch.schema();
+
+        // Short alternating skip/select spans -> average selector length
+        // well under RowSelectionPolicy::Auto's 32-row threshold, so this
+        // reliably resolves to the Mask execution strategy.
+        let mut selectors = Vec::new();
+        for _ in 0..100 {
+            selectors.push(RowSelector::skip(10));
+            selectors.push(RowSelector::select(10));
+        }
+        let mut access_plan = ParquetAccessPlan::new_all(1);
+        access_plan.scan_selection(0, RowSelection::from(selectors));
+
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        )
+        .with_extension(access_plan);
+
+        let make_opener = |selected_decode: bool| {
+            ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(Arc::clone(&schema))
+                .with_projection_indices(&[0])
+                .with_selected_decode(selected_decode)
+                .build()
+        };
+
+        let opener_default = make_opener(false);
+        let stream_default = open_file(&opener_default, file.clone()).await.unwrap();
+        let default_values = collect_int32_values(stream_default).await;
+
+        let opener_selected = make_opener(true);
+        let stream_selected = open_file(&opener_selected, file).await.unwrap();
+        let selected_values = collect_int32_values(stream_selected).await;
+
+        assert_eq!(default_values.len(), 1000);
+        assert_eq!(default_values, selected_values);
     }
 
     #[tokio::test]

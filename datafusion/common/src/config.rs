@@ -1148,6 +1148,15 @@ config_namespace! {
         /// pattern of selected rows.
         pub force_filter_selections: bool, default = false
 
+        /// (reading) EXPERIMENTAL: when a row selection is being applied (e.g. via
+        /// pushdown_filters), push the selection into the decoder for eligible
+        /// columns (flat, non-nullable, non-repeated, dictionary-encoded) so it
+        /// produces already-filtered output directly, instead of decoding every
+        /// value and filtering afterward. Default off; a query whose projected
+        /// columns are not uniformly eligible gets no effect from this option,
+        /// not a partial one.
+        pub selected_decode: bool, default = false
+
         /// (reading) If true, parquet reader will read columns of `Utf8/Utf8Large` with `Utf8View`,
         /// and `Binary/BinaryLarge` with `BinaryView`.
         pub schema_force_view_types: bool, default = true

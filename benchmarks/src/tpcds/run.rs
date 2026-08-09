@@ -265,6 +265,11 @@ impl RunOpt {
             println!("=== SQL for query {query_id} ===\n{}\n", sql.join(";\n"));
         }
 
+        // Experiment `arrow-selected-decode-reader-wiring-v26`, gate G-W2:
+        // report how much of this query actually reached the selected-decode
+        // path, as a counter rather than an inference. Reset per query so the
+        // reading is this query's own, not cumulative.
+        parquet::arrow::selected_decode_metrics::reset();
         for i in 0..self.iterations() {
             let start = Instant::now();
 
@@ -289,6 +294,20 @@ impl RunOpt {
 
         let avg = millis.iter().sum::<f64>() / millis.len() as f64;
         println!("Query {query_id} avg time: {avg:.2} ms");
+
+        let coverage = parquet::arrow::selected_decode_metrics::snapshot();
+        println!(
+            "DFEXP_SELECTED_DECODE_COVERAGE=q{query_id} selected_rows={} fallback_rows={} \
+             selected_chunks={} fallback_chunks={} selected_batches={} fallback_batches={} \
+             selected_row_fraction={:.6}",
+            coverage.selected_rows,
+            coverage.fallback_rows,
+            coverage.selected_chunks,
+            coverage.fallback_chunks,
+            coverage.selected_batches,
+            coverage.fallback_batches,
+            coverage.selected_row_fraction(),
+        );
 
         // Print memory stats using mimalloc (only when compiled with --features mimalloc_extended)
         print_memory_stats(&*ctx.runtime_env().memory_pool);

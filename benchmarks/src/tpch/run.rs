@@ -19,17 +19,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{
-    TPCH_QUERY_END_ID, TPCH_QUERY_START_ID, TPCH_TABLES, get_query_sql_for_scale_factor,
-    get_tbl_tpch_table_schema, get_tpch_table_schema, table_constraints,
+    get_query_sql_for_scale_factor, get_tbl_tpch_table_schema, get_tpch_table_schema,
+    table_constraints, TPCH_QUERY_END_ID, TPCH_QUERY_START_ID, TPCH_TABLES,
 };
-use crate::util::{BenchmarkRun, CommonOpt, QueryResult, print_memory_stats};
+use crate::util::{print_memory_stats, BenchmarkRun, CommonOpt, QueryResult};
 
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::{self, pretty_format_batches};
 use datafusion::common::exec_err;
-use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
@@ -135,8 +135,34 @@ impl RunOpt {
             self.enable_piecewise_merge_join;
         config.options_mut().execution.hash_join_buffering_capacity =
             self.hash_join_buffering_capacity;
+        // Experiment `arrow-selected-decode-reader-wiring-v27`. Env-driven so a
+        // single binary can run both arms; the cluster's admission policy pins
+        // the runner's argument list, so a new CLI flag is not available.
+        // Only overrides when the variable is set, so a value already supplied
+        // through `SessionConfig::from_env` survives.
+        if let Ok(raw) = std::env::var("DFEXP_SELECTED_DECODE") {
+            config.options_mut().execution.parquet.selected_decode =
+                matches!(raw.as_str(), "1" | "true");
+        }
+        println!(
+            "DFEXP_SELECTED_DECODE_ARM=selected_decode={} pushdown_filters={}",
+            config.options().execution.parquet.selected_decode,
+            config.options().execution.parquet.pushdown_filters,
+        );
         let rt = self.common.build_runtime()?;
         let ctx = SessionContext::new_with_config_rt(config, rt);
+        // The scan reads `table_parquet_options.global`, not `execution.parquet`;
+        // report the value the reader will actually see.
+        println!(
+            "DFEXP_SELECTED_DECODE_EFFECTIVE=table_options={} execution={}",
+            ctx.state().table_options().parquet.global.selected_decode,
+            ctx.state()
+                .config()
+                .options()
+                .execution
+                .parquet
+                .selected_decode,
+        );
         benchmark_run.set_memory_pool(&ctx.runtime_env().memory_pool);
         // register tables
         self.register_tables(&ctx).await?;
@@ -174,6 +200,12 @@ impl RunOpt {
 
         let sql = &get_query_sql_for_scale_factor(query_id, scale_factor)?;
 
+        // Experiment `arrow-selected-decode-reader-wiring-v27`: report how much
+        // of this query actually reached the selected-decode path, as a counter
+        // rather than an inference. Reset per query so the reading is this
+        // query's own, not cumulative. Mirrors the ClickBench/TPC-DS harnesses.
+        parquet::arrow::selected_decode_metrics::reset();
+
         for i in 0..self.iterations() {
             let start = Instant::now();
 
@@ -207,6 +239,20 @@ impl RunOpt {
 
         let avg = millis.iter().sum::<f64>() / millis.len() as f64;
         println!("Query {query_id} avg time: {avg:.2} ms");
+
+        let coverage = parquet::arrow::selected_decode_metrics::snapshot();
+        println!(
+            "DFEXP_SELECTED_DECODE_COVERAGE=q{query_id} selected_rows={} fallback_rows={} \
+             selected_chunks={} fallback_chunks={} selected_batches={} fallback_batches={} \
+             selected_row_fraction={:.6}",
+            coverage.selected_rows,
+            coverage.fallback_rows,
+            coverage.selected_chunks,
+            coverage.fallback_chunks,
+            coverage.selected_batches,
+            coverage.fallback_batches,
+            coverage.selected_row_fraction(),
+        );
 
         // Print memory stats using mimalloc (only when compiled with --features mimalloc_extended)
         print_memory_stats(&*ctx.runtime_env().memory_pool);

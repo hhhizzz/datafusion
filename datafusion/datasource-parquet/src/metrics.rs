@@ -101,6 +101,16 @@ pub struct ParquetFileMetrics {
     /// number of rows that were stored in the cache after evaluating predicates
     /// reused for the output.
     pub predicate_cache_records: Gauge,
+    /// Per-column output decisions that stayed on the Auto32 path.
+    pub per_column_fallback_auto: Gauge,
+    /// Uniform per-column overrides lowered to one forced standard cursor.
+    pub per_column_fallback_forced: Gauge,
+    /// Per-column output readers that used divergent column strategies.
+    pub per_column_engaged: Gauge,
+    /// Per-column decisions bypassed by loaded page row ranges.
+    pub per_column_loaded_row_ranges_fallback: Gauge,
+    /// Per-column decisions bypassed by predicate-cache consumers.
+    pub per_column_cache_bypass: Gauge,
 }
 
 impl ParquetFileMetrics {
@@ -203,8 +213,20 @@ impl ParquetFileMetrics {
             .gauge("predicate_cache_inner_records", partition);
 
         let predicate_cache_records = builder
+            .clone()
             .with_category(MetricCategory::Rows)
             .gauge("predicate_cache_records", partition);
+
+        let per_column_fallback_auto =
+            builder.clone().gauge("per_column_fallback_auto", partition);
+        let per_column_fallback_forced = builder
+            .clone()
+            .gauge("per_column_fallback_forced", partition);
+        let per_column_engaged = builder.clone().gauge("per_column_engaged", partition);
+        let per_column_loaded_row_ranges_fallback = builder
+            .clone()
+            .gauge("per_column_loaded_row_ranges_fallback", partition);
+        let per_column_cache_bypass = builder.gauge("per_column_cache_bypass", partition);
 
         let row_groups_pruned_dynamic_filter = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
@@ -230,6 +252,11 @@ impl ParquetFileMetrics {
             scan_efficiency_ratio,
             predicate_cache_inner_records,
             predicate_cache_records,
+            per_column_fallback_auto,
+            per_column_fallback_forced,
+            per_column_engaged,
+            per_column_loaded_row_ranges_fallback,
+            per_column_cache_bypass,
             row_groups_pruned_dynamic_filter,
         }
     }

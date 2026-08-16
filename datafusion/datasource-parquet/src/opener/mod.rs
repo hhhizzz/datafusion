@@ -1489,6 +1489,17 @@ impl RowGroupsPrunedParquetOpen {
             prepared.file_metrics.predicate_cache_inner_records.clone();
         let predicate_cache_records =
             prepared.file_metrics.predicate_cache_records.clone();
+        let per_column_fallback_auto =
+            prepared.file_metrics.per_column_fallback_auto.clone();
+        let per_column_fallback_forced =
+            prepared.file_metrics.per_column_fallback_forced.clone();
+        let per_column_engaged = prepared.file_metrics.per_column_engaged.clone();
+        let per_column_loaded_row_ranges_fallback = prepared
+            .file_metrics
+            .per_column_loaded_row_ranges_fallback
+            .clone();
+        let per_column_cache_bypass =
+            prepared.file_metrics.per_column_cache_bypass.clone();
 
         let files_ranges_pruned_statistics =
             prepared.file_metrics.files_ranges_pruned_statistics.clone();
@@ -1536,6 +1547,11 @@ impl RowGroupsPrunedParquetOpen {
             arrow_reader_metrics,
             predicate_cache_inner_records,
             predicate_cache_records,
+            per_column_fallback_auto,
+            per_column_fallback_forced,
+            per_column_engaged,
+            per_column_loaded_row_ranges_fallback,
+            per_column_cache_bypass,
             baseline_metrics: prepared.baseline_metrics,
             row_group_pruner,
             row_groups_pruned_dynamic,

@@ -257,6 +257,11 @@ pub(crate) struct PushDecoderStreamState {
     pub(crate) arrow_reader_metrics: ArrowReaderMetrics,
     pub(crate) predicate_cache_inner_records: Gauge,
     pub(crate) predicate_cache_records: Gauge,
+    pub(crate) per_column_fallback_auto: Gauge,
+    pub(crate) per_column_fallback_forced: Gauge,
+    pub(crate) per_column_engaged: Gauge,
+    pub(crate) per_column_loaded_row_ranges_fallback: Gauge,
+    pub(crate) per_column_cache_bypass: Gauge,
     pub(crate) baseline_metrics: BaselineMetrics,
     /// Dynamic row-group pruner consulted at every row-group boundary.
     ///
@@ -422,6 +427,16 @@ impl PushDecoderStreamState {
         }
         if let Some(v) = self.arrow_reader_metrics.records_read_from_cache() {
             self.predicate_cache_records.set(v);
+        }
+        if let Some(metrics) = self.arrow_reader_metrics.decomposition() {
+            let decisions = metrics.per_column_decisions;
+            self.per_column_fallback_auto.set(decisions.fallback_auto);
+            self.per_column_fallback_forced
+                .set(decisions.fallback_forced);
+            self.per_column_engaged.set(decisions.engaged);
+            self.per_column_loaded_row_ranges_fallback
+                .set(decisions.loaded_row_ranges_fallback);
+            self.per_column_cache_bypass.set(decisions.cache_bypass);
         }
     }
 

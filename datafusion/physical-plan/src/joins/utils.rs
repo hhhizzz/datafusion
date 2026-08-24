@@ -56,7 +56,7 @@ use arrow::array::{
 use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::compute::{self, take};
 use arrow::datatypes::{
-    ArrowNativeType, Field, Schema, SchemaBuilder, UInt32Type, UInt64Type,
+    ArrowNativeType, Field, Metadata, Schema, SchemaBuilder, UInt32Type, UInt64Type,
 };
 use arrow_ord::ord::{DynComparator, make_comparator};
 use arrow_schema::{DataType, SortOptions, TimeUnit};
@@ -338,7 +338,7 @@ pub fn build_join_schema(
         _ => (right, left),
     };
 
-    let metadata = schema1
+    let metadata: Metadata = schema1
         .metadata()
         .clone()
         .into_iter()

@@ -287,6 +287,28 @@ impl<K: DFHeapSize, V: DFHeapSize> DFHeapSize for HashMap<K, V> {
     }
 }
 
+impl DFHeapSize for arrow::datatypes::Metadata {
+    fn heap_size(&self, ctx: &mut DFHeapSizeCtx) -> usize {
+        if self.is_empty() {
+            return 0;
+        }
+
+        // `Metadata` stores its entries behind a private `Arc<BTreeMap<..>>`, so
+        // (unlike the `Arc<T>` impls above) there is no accessible pointer to
+        // dedupe shared instances via `ctx`, and no accessible node layout to
+        // size precisely the way the `HashMap` impl above does for hashbrown.
+        // This is a rough per-entry estimate in the same spirit as that impl,
+        // and may overcount metadata shared across many fields/schemas.
+        let key_val_size = size_of::<(String, String)>();
+        // Approximate per-entry B-tree node overhead (child pointer + length).
+        let node_overhead = 2 * size_of::<usize>();
+
+        self.len() * (key_val_size + node_overhead)
+            + self.keys().map(|k| k.heap_size(ctx)).sum::<usize>()
+            + self.values().map(|v| v.heap_size(ctx)).sum::<usize>()
+    }
+}
+
 fn arc_ptr<T>(arc: &Arc<T>) -> usize {
     Arc::as_ptr(arc) as usize
 }

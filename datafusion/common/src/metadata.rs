@@ -17,7 +17,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use arrow::datatypes::{DataType, Field, FieldRef};
+use arrow::datatypes::{DataType, Field, FieldRef, Metadata};
 use hashbrown::HashMap;
 
 use crate::{DataFusionError, ScalarValue, error::_plan_err};
@@ -84,14 +84,8 @@ impl From<ScalarValue> for ScalarAndMetadata {
 /// Returns a planning error with suitably formatted type representations if
 /// actual and expected do not compare to equal.
 pub fn check_metadata_with_storage_equal(
-    actual: (
-        &DataType,
-        Option<&std::collections::HashMap<String, String>>,
-    ),
-    expected: (
-        &DataType,
-        Option<&std::collections::HashMap<String, String>>,
-    ),
+    actual: (&DataType, Option<&Metadata>),
+    expected: (&DataType, Option<&Metadata>),
     what: &str,
     context: &str,
 ) -> Result<(), DataFusionError> {
@@ -131,7 +125,7 @@ pub fn check_metadata_with_storage_equal(
 /// renderings.
 pub fn format_type_and_metadata(
     data_type: &DataType,
-    metadata: Option<&std::collections::HashMap<String, String>>,
+    metadata: Option<&Metadata>,
 ) -> String {
     match metadata {
         Some(metadata) if !metadata.is_empty() => {
@@ -316,6 +310,11 @@ impl FieldMetadata {
             .collect()
     }
 
+    /// Convert this `FieldMetadata` into an arrow [`Metadata`]
+    pub fn to_metadata(&self) -> Metadata {
+        (*self.inner).clone().into()
+    }
+
     /// Updates the metadata on the Field with this metadata, if it is not empty.
     pub fn add_to_field(&self, field: Field) -> Field {
         if self.inner.is_empty() {
@@ -339,6 +338,16 @@ impl FieldMetadata {
 impl From<&Field> for FieldMetadata {
     fn from(field: &Field) -> Self {
         Self::new_from_field(field)
+    }
+}
+
+impl From<&Metadata> for FieldMetadata {
+    fn from(metadata: &Metadata) -> Self {
+        let inner = metadata
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Self::new(inner)
     }
 }
 

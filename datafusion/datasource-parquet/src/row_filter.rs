@@ -464,6 +464,57 @@ pub fn build_row_filter(
         .map(|filters| Some(RowFilter::new(filters)))
 }
 
+/// Build a row filter for a decoder projection, combining conjuncts only when
+/// the resulting predicate can also provide the decoder's complete output.
+fn build_row_filter_for_output_projection(
+    expr: &Arc<dyn PhysicalExpr>,
+    file_schema: &SchemaRef,
+    metadata: &ParquetMetaData,
+    output_projection: &ProjectionMask,
+    reorder_predicates: bool,
+    file_metrics: &ParquetFileMetrics,
+) -> Result<Option<RowFilter>> {
+    let Some(row_filter) = build_row_filter(
+        expr,
+        file_schema,
+        metadata,
+        reorder_predicates,
+        file_metrics,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    if row_filter.predicates().len() < 2
+        || row_filter
+            .predicates()
+            .iter()
+            .any(|predicate| predicate.projection() != output_projection)
+    {
+        return Ok(Some(row_filter));
+    }
+
+    let Some(candidate) =
+        FilterCandidateBuilder::new(Arc::clone(expr), Arc::clone(file_schema))
+            .build(metadata)?
+    else {
+        return Ok(Some(row_filter));
+    };
+
+    if candidate.read_plan.projection_mask != *output_projection {
+        return Ok(Some(row_filter));
+    }
+
+    let predicate = DatafusionArrowPredicate::try_new(
+        candidate,
+        file_metrics.pushdown_rows_pruned.clone(),
+        file_metrics.pushdown_rows_matched.clone(),
+        file_metrics.row_pushdown_eval_time.clone(),
+    )?;
+
+    Ok(Some(RowFilter::new(vec![Box::new(predicate)])))
+}
+
 /// Builds row filters for a parquet decoder.
 ///
 /// A [`RowFilter`] is owned by a decoder. The first filter is built eagerly
@@ -473,6 +524,7 @@ pub(crate) struct RowFilterGenerator<'a> {
     predicate: Option<&'a Arc<dyn PhysicalExpr>>,
     physical_file_schema: &'a SchemaRef,
     file_metadata: &'a ParquetMetaData,
+    output_projection: &'a ProjectionMask,
     reorder_predicates: bool,
     file_metrics: &'a ParquetFileMetrics,
     first_row_filter: Option<RowFilter>,
@@ -483,6 +535,7 @@ impl<'a> RowFilterGenerator<'a> {
         predicate: Option<&'a Arc<dyn PhysicalExpr>>,
         physical_file_schema: &'a SchemaRef,
         file_metadata: &'a ParquetMetaData,
+        output_projection: &'a ProjectionMask,
         reorder_predicates: bool,
         file_metrics: &'a ParquetFileMetrics,
     ) -> Self {
@@ -490,6 +543,7 @@ impl<'a> RowFilterGenerator<'a> {
             predicate,
             physical_file_schema,
             file_metadata,
+            output_projection,
             reorder_predicates,
             file_metrics,
             first_row_filter: None,
@@ -504,10 +558,11 @@ impl<'a> RowFilterGenerator<'a> {
 
     fn build(&self) -> Option<RowFilter> {
         let predicate = self.predicate?;
-        match build_row_filter(
+        match build_row_filter_for_output_projection(
             predicate,
             self.physical_file_schema,
             self.file_metadata,
+            self.output_projection,
             self.reorder_predicates,
             self.file_metrics,
         ) {
@@ -672,6 +727,167 @@ mod test {
 
         let filtered = row_filter.evaluate(first_rb);
         assert!(matches!(filtered, Ok(a) if a == BooleanArray::from(vec![true; 8])));
+    }
+
+    fn build_output_projection_test_filter(
+        predicate_expr: Expr,
+        output_column: &str,
+    ) -> (
+        NamedTempFile,
+        RowFilter,
+        ParquetRecordBatchReaderBuilder<std::fs::File>,
+        ProjectionMask,
+        usize,
+    ) {
+        let struct_fields: Fields =
+            vec![Arc::new(Field::new("value", DataType::Int32, false))].into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("s", DataType::Struct(struct_fields.clone()), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![Arc::new(Int32Array::from(vec![5, 6, 7, 8, 9])) as _],
+                    None,
+                )),
+            ],
+        )
+        .expect("record batch");
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), schema, None).expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let reader_file = file.reopen().expect("reopen file");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(reader_file)
+            .expect("reader builder");
+        let metadata = builder.metadata().clone();
+        let file_schema = builder.schema().clone();
+        let output_projection = ProjectionMask::columns(
+            metadata.file_metadata().schema_descr(),
+            [output_column],
+        );
+        let expr = logical2physical(&predicate_expr, &file_schema);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let file_metrics =
+            ParquetFileMetrics::new(0, "output_projection.parquet", &metrics);
+
+        let split_filter =
+            build_row_filter(&expr, &file_schema, &metadata, false, &file_metrics)
+                .expect("building split row filter")
+                .expect("split row filter should exist");
+        let split_predicates = split_filter.predicates().len();
+
+        let mut generator = RowFilterGenerator::new(
+            Some(&expr),
+            &file_schema,
+            &metadata,
+            &output_projection,
+            false,
+            &file_metrics,
+        );
+        let row_filter = generator
+            .next_filter()
+            .expect("generated row filter should exist");
+
+        (
+            file,
+            row_filter,
+            builder,
+            output_projection,
+            split_predicates,
+        )
+    }
+
+    fn read_int32_output(
+        builder: ParquetRecordBatchReaderBuilder<std::fs::File>,
+        row_filter: RowFilter,
+        output_projection: ProjectionMask,
+    ) -> Vec<i32> {
+        let reader = builder
+            .with_projection(output_projection)
+            .with_row_filter(row_filter)
+            .build()
+            .expect("build reader");
+        let mut actual = vec![];
+        for batch in reader {
+            let batch = batch.expect("record batch");
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("output should be Int32");
+            actual.extend(values.iter().map(|value| value.expect("non-null value")));
+        }
+        actual
+    }
+
+    #[test]
+    fn output_projection_conjunction_combines_and_filters_equivalently() {
+        let predicate = col("a")
+            .gt(Expr::Literal(ScalarValue::Int32(Some(1)), None))
+            .and(col("a").lt(Expr::Literal(ScalarValue::Int32(Some(4)), None)));
+        let (_file, row_filter, builder, output_projection, split_predicates) =
+            build_output_projection_test_filter(predicate, "a");
+
+        assert_eq!(split_predicates, 2);
+        assert_eq!(row_filter.predicates().len(), 1);
+        assert_eq!(
+            read_int32_output(builder, row_filter, output_projection),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn output_projection_conjunction_preserves_fallbacks() {
+        let cases = [
+            (
+                "different predicate projections",
+                col("a")
+                    .gt(Expr::Literal(ScalarValue::Int32(Some(1)), None))
+                    .and(col("b").lt(Expr::Literal(ScalarValue::Int32(Some(50)), None))),
+                "a",
+                vec![2, 3],
+            ),
+            (
+                "unsupported conjunct",
+                col("a")
+                    .gt(Expr::Literal(ScalarValue::Int32(Some(1)), None))
+                    .and(col("a").lt(Expr::Literal(ScalarValue::Int32(Some(4)), None)))
+                    .and(col("s").is_not_null()),
+                "a",
+                vec![2, 3],
+            ),
+            (
+                "output projection mismatch",
+                col("a")
+                    .gt(Expr::Literal(ScalarValue::Int32(Some(1)), None))
+                    .and(col("a").lt(Expr::Literal(ScalarValue::Int32(Some(4)), None))),
+                "b",
+                vec![30, 40],
+            ),
+        ];
+
+        for (name, predicate, output_column, expected) in cases {
+            let (_file, row_filter, builder, output_projection, split_predicates) =
+                build_output_projection_test_filter(predicate, output_column);
+
+            assert_eq!(split_predicates, 2, "{name}");
+            assert_eq!(row_filter.predicates().len(), 2, "{name}");
+            assert_eq!(
+                read_int32_output(builder, row_filter, output_projection),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]

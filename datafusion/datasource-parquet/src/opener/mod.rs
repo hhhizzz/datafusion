@@ -1472,6 +1472,7 @@ impl RowGroupsPrunedParquetOpen {
                 pushdown_predicate,
                 &prepared.physical_file_schema,
                 file_metadata.as_ref(),
+                decoder_projection.projection_mask(),
                 prepared.reorder_predicates,
                 &prepared.file_metrics,
             );

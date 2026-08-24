@@ -1784,8 +1784,11 @@ async fn load_page_index<T: AsyncFileReader>(
     options: ArrowReaderOptions,
 ) -> Result<ArrowReaderMetadata> {
     let parquet_metadata = reader_metadata.metadata();
-    let missing_column_index = parquet_metadata.column_index().is_none();
-    let missing_offset_index = parquet_metadata.offset_index().is_none();
+    let page_index = parquet_metadata.page_index();
+    let missing_column_index =
+        page_index.is_none_or(|page_index| !page_index.has_column_indexes());
+    let missing_offset_index =
+        page_index.is_none_or(|page_index| !page_index.has_offset_indexes());
     // You may ask yourself: why are we even checking if the page index is already loaded here?
     // Didn't we explicitly *not* load it above?
     // Well it's possible that a custom implementation of `AsyncFileReader` gives you

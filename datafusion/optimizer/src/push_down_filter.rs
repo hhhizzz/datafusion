@@ -4263,7 +4263,7 @@ mod tests {
                 let schema = Arc::new(
                     DFSchema::new_with_metadata(
                         vec![(None, Field::new("a", DataType::Int64, false).into())],
-                        Default::default(),
+                        arrow::datatypes::Metadata::default(),
                     )
                     .unwrap(),
                 );

@@ -5726,7 +5726,7 @@ mod tests {
         let schema_without_metadata = || {
             DFSchema::from_unqualified_fields(
                 vec![Field::new("count", DataType::Int64, false)].into(),
-                HashMap::new(),
+                Metadata::default(),
             )
             .unwrap()
         };
@@ -5734,7 +5734,7 @@ mod tests {
         let schema_with_metadata = || {
             DFSchema::from_unqualified_fields(
                 vec![Field::new("count", DataType::Int64, false)].into(),
-                [("key".to_string(), "value".to_string())].into(),
+                [("key".to_string(), "value".to_string())],
             )
             .unwrap()
         };

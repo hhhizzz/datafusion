@@ -800,7 +800,7 @@ mod tests {
             produce_one_row: false,
             schema: Arc::new(DFSchema::from_unqualified_fields(
                 fields.into(),
-                Default::default(),
+                arrow::datatypes::Metadata::default(),
             )?),
         });
 

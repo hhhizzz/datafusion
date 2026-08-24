@@ -167,10 +167,10 @@ impl ContextProvider for MockContextProvider {
                 Field::new("😀", DataType::Int32, false),
             ])),
             "person_with_uuid_extension" => Ok(Schema::new(vec![
-                Field::new("id", DataType::FixedSizeBinary(16), false).with_metadata(
-                    [("ARROW:extension:name".to_string(), "arrow.uuid".to_string())]
-                        .into(),
-                ),
+                Field::new("id", DataType::FixedSizeBinary(16), false).with_metadata([(
+                    "ARROW:extension:name".to_string(),
+                    "arrow.uuid".to_string(),
+                )]),
                 Field::new("first_name", DataType::Utf8, false),
                 Field::new("last_name", DataType::Utf8, false),
             ])),
@@ -381,10 +381,10 @@ impl TypePlanner for CustomTypePlanner {
     ) -> Result<Option<FieldRef>> {
         match sql_type {
             sqlparser::ast::DataType::Uuid => Ok(Some(Arc::new(
-                Field::new("", DataType::FixedSizeBinary(16), true).with_metadata(
-                    [("ARROW:extension:name".to_string(), "arrow.uuid".to_string())]
-                        .into(),
-                ),
+                Field::new("", DataType::FixedSizeBinary(16), true).with_metadata([(
+                    "ARROW:extension:name".to_string(),
+                    "arrow.uuid".to_string(),
+                )]),
             ))),
             sqlparser::ast::DataType::Datetime(precision) => {
                 let precision = match precision {

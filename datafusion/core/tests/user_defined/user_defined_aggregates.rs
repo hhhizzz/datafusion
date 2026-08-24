@@ -1020,7 +1020,7 @@ async fn test_metadata_based_aggregate() -> Result<()> {
         Field::new("no_metadata", DataType::UInt64, true),
         Field::new("with_metadata", DataType::UInt64, true).with_metadata(
             std::iter::once(("modify_values".to_string(), "double_output".to_string()))
-                .collect(),
+                .collect::<arrow::datatypes::Metadata>(),
         ),
     ]));
 
@@ -1093,7 +1093,7 @@ async fn test_metadata_based_aggregate_as_window() -> Result<()> {
         Field::new("no_metadata", DataType::UInt64, true),
         Field::new("with_metadata", DataType::UInt64, true).with_metadata(
             std::iter::once(("modify_values".to_string(), "double_output".to_string()))
-                .collect(),
+                .collect::<arrow::datatypes::Metadata>(),
         ),
     ]));
 

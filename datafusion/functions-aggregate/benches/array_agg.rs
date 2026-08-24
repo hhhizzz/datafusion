@@ -31,10 +31,9 @@ use datafusion_functions_aggregate::array_agg::{
 
 use arrow::buffer::OffsetBuffer;
 use arrow::util::bench_util::create_primitive_array;
-use rand::Rng;
-use rand::SeedableRng;
-use rand::distr::{Distribution, StandardUniform};
-use rand::prelude::StdRng;
+use arrow::util::rand::distr::{Distribution, StandardUniform};
+use arrow::util::rand::prelude::StdRng;
+use arrow::util::rand::{RngExt, SeedableRng};
 
 /// Returns fixed seedable RNG
 pub fn seedable_rng() -> StdRng {

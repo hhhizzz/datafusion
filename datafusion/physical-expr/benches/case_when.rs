@@ -18,6 +18,10 @@
 use arrow::array::{Array, ArrayRef, Int32Array, Int32Builder, StringArray};
 use arrow::datatypes::{ArrowNativeTypeOp, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow::util::rand::RngExt;
+use arrow::util::rand::distr::Alphanumeric;
+use arrow::util::rand::distr::uniform::SampleUniform;
+use arrow::util::rand::rngs::StdRng;
 use arrow::util::test_util::seedable_rng;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
@@ -25,10 +29,6 @@ use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{BinaryExpr, case, col, lit};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use itertools::Itertools;
-use rand::distr::Alphanumeric;
-use rand::distr::uniform::SampleUniform;
-use rand::rngs::StdRng;
-use rand::{Rng, RngCore};
 use std::fmt::{Display, Formatter};
 use std::hint::black_box;
 use std::ops::Range;
@@ -251,7 +251,7 @@ struct Options<T> {
 }
 
 fn generate_other_primitive_value<T: ArrowNativeTypeOp + SampleUniform>(
-    rng: &mut impl RngCore,
+    rng: &mut StdRng,
     exclude: &[T],
 ) -> T {
     let mut value;
@@ -268,7 +268,7 @@ fn generate_other_primitive_value<T: ArrowNativeTypeOp + SampleUniform>(
 
 fn create_random_string_generator(
     length: Range<usize>,
-) -> impl Fn(&mut dyn RngCore, &[String]) -> String {
+) -> impl Fn(&mut StdRng, &[String]) -> String {
     assert!(length.end > length.start);
 
     move |rng, exclude| {

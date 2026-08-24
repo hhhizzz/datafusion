@@ -1676,9 +1676,7 @@ async fn roundtrip_logical_plan_prepared_statement_with_metadata() -> Result<()>
             "".to_string(),
             vec![
                 Field::new("", DataType::Int32, true)
-                    .with_metadata(
-                        [("some_key".to_string(), "some_value".to_string())].into(),
-                    )
+                    .with_metadata([("some_key".to_string(), "some_value".to_string())])
                     .into(),
             ],
         )

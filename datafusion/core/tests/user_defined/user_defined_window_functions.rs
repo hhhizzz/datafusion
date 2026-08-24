@@ -870,7 +870,7 @@ async fn test_metadata_based_window_fn() -> Result<()> {
         Field::new("no_metadata", DataType::UInt64, true),
         Field::new("with_metadata", DataType::UInt64, true).with_metadata(
             std::iter::once(("modify_values".to_string(), "double_output".to_string()))
-                .collect(),
+                .collect::<arrow::datatypes::Metadata>(),
         ),
     ]));
 

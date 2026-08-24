@@ -835,7 +835,7 @@ mod tests {
         let schema = test_cast_schema();
         let target_field = Arc::new(
             Field::new("cast_target", DataType::Int64, true)
-                .with_metadata([("target_meta".to_string(), "1".to_string())].into()),
+                .with_metadata([("target_meta".to_string(), "1".to_string())]),
         );
         let cast_expr = Expr::Cast(Cast::new_from_field(
             Box::new(col("a")),
@@ -873,9 +873,8 @@ mod tests {
     fn test_cast_lowering_preserves_same_type_field_semantics() -> Result<()> {
         let schema = test_cast_schema();
         let target_field = Arc::new(
-            Field::new("same_type_cast", DataType::Int32, true).with_metadata(
-                [("target_meta".to_string(), "same-type".to_string())].into(),
-            ),
+            Field::new("same_type_cast", DataType::Int32, true)
+                .with_metadata([("target_meta".to_string(), "same-type".to_string())]),
         );
         let cast_expr = Expr::Cast(Cast::new_from_field(
             Box::new(col("a")),

@@ -274,7 +274,7 @@ mod tests {
             .schema()
             .as_ref()
             .clone()
-            .with_metadata([("some_key".to_owned(), "some_value".to_owned())].into())
+            .with_metadata([("some_key".to_owned(), "some_value".to_owned())])
             .into();
 
         let rb = rb.with_schema(schema)?;

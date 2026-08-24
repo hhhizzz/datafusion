@@ -157,7 +157,7 @@ impl ScalarUDFImpl for WithMetadataFunc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::Field;
+    use arrow::datatypes::{Field, Metadata};
     use datafusion_common::ScalarValue;
     use std::sync::Arc;
 
@@ -203,7 +203,7 @@ mod tests {
                 ("unit".to_string(), "old".to_string()),
             ]
             .into_iter()
-            .collect(),
+            .collect::<Metadata>(),
         );
         let input: FieldRef = Arc::new(existing);
         let k = str_lit("unit");

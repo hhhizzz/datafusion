@@ -201,7 +201,7 @@ mod test {
         Arc::new(
             DFSchema::from_unqualified_fields(
                 vec![Field::new("x", DataType::Int32, true)].into(),
-                Default::default(),
+                arrow::datatypes::Metadata::default(),
             )
             .unwrap(),
         )
@@ -215,7 +215,7 @@ mod test {
                     Field::new("y", DataType::Int32, false),
                 ]
                 .into(),
-                Default::default(),
+                arrow::datatypes::Metadata::default(),
             )
             .unwrap(),
         )

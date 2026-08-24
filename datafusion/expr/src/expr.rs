@@ -3906,7 +3906,7 @@ mod test {
         let subquery_schema = Arc::new(
             DFSchema::from_unqualified_fields(
                 vec![subquery_field].into(),
-                Default::default(),
+                Metadata::default(),
             )
             .unwrap(),
         );
@@ -3954,7 +3954,7 @@ mod test {
         let subquery_schema = Arc::new(
             DFSchema::from_unqualified_fields(
                 vec![subquery_field].into(),
-                Default::default(),
+                Metadata::default(),
             )
             .unwrap(),
         );
@@ -4008,7 +4008,7 @@ mod test {
         let subquery_schema = Arc::new(
             DFSchema::from_unqualified_fields(
                 vec![subquery_field].into(),
-                Default::default(),
+                Metadata::default(),
             )
             .unwrap(),
         );
@@ -4061,7 +4061,7 @@ mod test {
         let subquery_schema = Arc::new(
             DFSchema::from_unqualified_fields(
                 vec![subquery_field].into(),
-                Default::default(),
+                Metadata::default(),
             )
             .unwrap(),
         );
@@ -4162,9 +4162,8 @@ mod test {
     fn infer_placeholder_with_metadata() {
         // name == $1, where name is a non-nullable string
         let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false).with_metadata(
-                [("some_key".to_string(), "some_value".to_string())].into(),
-            ),
+            Field::new("name", DataType::Utf8, false)
+                .with_metadata([("some_key".to_string(), "some_value".to_string())]),
         ]));
         let df_schema = DFSchema::try_from(schema).unwrap();
 
@@ -4598,53 +4597,62 @@ mod test {
 
     mod intersect_metadata_tests {
         use super::super::intersect_metadata_for_union;
-        use std::collections::HashMap;
+        use arrow::datatypes::Metadata;
 
         #[test]
         fn all_branches_same_metadata() {
-            let m1 = HashMap::from([("key".into(), "val".into())]);
-            let m2 = HashMap::from([("key".into(), "val".into())]);
+            let m1 = Metadata::from([("key".to_string(), "val".to_string())]);
+            let m2 = Metadata::from([("key".to_string(), "val".to_string())]);
             let result = intersect_metadata_for_union([&m1, &m2]);
-            assert_eq!(result, HashMap::from([("key".into(), "val".into())]));
+            assert_eq!(
+                result,
+                Metadata::from([("key".to_string(), "val".to_string())])
+            );
         }
 
         #[test]
         fn conflicting_metadata_dropped() {
-            let m1 = HashMap::from([("key".into(), "a".into())]);
-            let m2 = HashMap::from([("key".into(), "b".into())]);
+            let m1 = Metadata::from([("key".to_string(), "a".to_string())]);
+            let m2 = Metadata::from([("key".to_string(), "b".to_string())]);
             let result = intersect_metadata_for_union([&m1, &m2]);
             assert!(result.is_empty());
         }
 
         #[test]
         fn empty_metadata_branch_skipped() {
-            let m1 = HashMap::from([("key".into(), "val".into())]);
-            let m2 = HashMap::new(); // e.g. NULL literal
+            let m1 = Metadata::from([("key".to_string(), "val".to_string())]);
+            let m2 = Metadata::default(); // e.g. NULL literal
             let result = intersect_metadata_for_union([&m1, &m2]);
-            assert_eq!(result, HashMap::from([("key".into(), "val".into())]));
+            assert_eq!(
+                result,
+                Metadata::from([("key".to_string(), "val".to_string())])
+            );
         }
 
         #[test]
         fn empty_metadata_first_branch_skipped() {
-            let m1 = HashMap::new();
-            let m2 = HashMap::from([("key".into(), "val".into())]);
+            let m1 = Metadata::default();
+            let m2 = Metadata::from([("key".to_string(), "val".to_string())]);
             let result = intersect_metadata_for_union([&m1, &m2]);
-            assert_eq!(result, HashMap::from([("key".into(), "val".into())]));
+            assert_eq!(
+                result,
+                Metadata::from([("key".to_string(), "val".to_string())])
+            );
         }
 
         #[test]
         fn all_branches_empty_metadata() {
-            let m1: HashMap<String, String> = HashMap::new();
-            let m2: HashMap<String, String> = HashMap::new();
+            let m1 = Metadata::default();
+            let m2 = Metadata::default();
             let result = intersect_metadata_for_union([&m1, &m2]);
             assert!(result.is_empty());
         }
 
         #[test]
         fn mixed_empty_and_conflicting() {
-            let m1 = HashMap::from([("key".into(), "a".into())]);
-            let m2 = HashMap::new();
-            let m3 = HashMap::from([("key".into(), "b".into())]);
+            let m1 = Metadata::from([("key".to_string(), "a".to_string())]);
+            let m2 = Metadata::default();
+            let m3 = Metadata::from([("key".to_string(), "b".to_string())]);
             let result = intersect_metadata_for_union([&m1, &m2, &m3]);
             // m2 is skipped; m1 and m3 conflict → dropped
             assert!(result.is_empty());
@@ -4652,9 +4660,7 @@ mod test {
 
         #[test]
         fn no_inputs() {
-            let result = intersect_metadata_for_union(std::iter::empty::<
-                &HashMap<String, String>,
-            >());
+            let result = intersect_metadata_for_union(std::iter::empty::<&Metadata>());
             assert!(result.is_empty());
         }
     }

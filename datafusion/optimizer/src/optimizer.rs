@@ -962,8 +962,8 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (qualifier, field))| {
-                let metadata =
-                    std::iter::once(("key".into(), format!("value {i}"))).collect();
+                let metadata: arrow::datatypes::Metadata =
+                    std::iter::once(("key".to_string(), format!("value {i}"))).collect();
 
                 let new_arrow_field = field.as_ref().clone().with_metadata(metadata);
                 (qualifier.cloned(), Arc::new(new_arrow_field))

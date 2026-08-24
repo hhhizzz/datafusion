@@ -426,6 +426,23 @@ pub fn build_row_filter(
         return Ok(None);
     }
 
+    // EXPERIMENT ONLY: when every conjunct reads exactly the same Parquet
+    // leaves, evaluate the original conjunction as one ArrowPredicate. This
+    // avoids constructing an intermediate RowSelection between predicates
+    // without broadening the set of expressions eligible for pushdown.
+    if candidates.len() > 1
+        && candidates.windows(2).all(|pair| {
+            pair[0].read_plan.projection_mask == pair[1].read_plan.projection_mask
+        })
+    {
+        if let Some(candidate) =
+            FilterCandidateBuilder::new(Arc::clone(expr), Arc::clone(file_schema))
+                .build(metadata)?
+        {
+            candidates = vec![candidate];
+        }
+    }
+
     if reorder_predicates {
         candidates.sort_unstable_by_key(|c| c.required_bytes);
     }
@@ -672,6 +689,123 @@ mod test {
 
         let filtered = row_filter.evaluate(first_rb);
         assert!(matches!(filtered, Ok(a) if a == BooleanArray::from(vec![true; 8])));
+    }
+
+    fn build_same_projection_test_filter(
+        predicate_expr: Expr,
+    ) -> (
+        NamedTempFile,
+        RowFilter,
+        ParquetRecordBatchReaderBuilder<std::fs::File>,
+        SchemaRef,
+    ) {
+        let struct_fields: Fields =
+            vec![Arc::new(Field::new("value", DataType::Int32, false))].into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("s", DataType::Struct(struct_fields.clone()), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![Arc::new(Int32Array::from(vec![5, 6, 7, 8, 9])) as _],
+                    None,
+                )),
+            ],
+        )
+        .expect("record batch");
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), schema, None).expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let reader_file = file.reopen().expect("reopen file");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(reader_file)
+            .expect("reader builder");
+        let metadata = builder.metadata().clone();
+        let file_schema = builder.schema().clone();
+        let expr = logical2physical(&predicate_expr, &file_schema);
+
+        let metrics = ExecutionPlanMetricsSet::new();
+        let file_metrics =
+            ParquetFileMetrics::new(0, "same_projection.parquet", &metrics);
+        let row_filter =
+            build_row_filter(&expr, &file_schema, &metadata, false, &file_metrics)
+                .expect("building row filter")
+                .expect("row filter should exist");
+
+        (file, row_filter, builder, file_schema)
+    }
+
+    #[test]
+    fn same_projection_conjunction_coalesces_and_filters_equivalently() {
+        let predicate = col("a")
+            .gt(Expr::Literal(ScalarValue::Int32(Some(1)), None))
+            .and(col("a").lt(Expr::Literal(ScalarValue::Int32(Some(4)), None)));
+        let (_file, row_filter, builder, _file_schema) =
+            build_same_projection_test_filter(predicate);
+
+        assert_eq!(row_filter.predicates().len(), 1);
+
+        let reader = builder
+            .with_row_filter(row_filter)
+            .build()
+            .expect("build reader");
+        let mut actual = vec![];
+        for batch in reader {
+            let batch = batch.expect("record batch");
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("a should be Int32");
+            actual.extend(values.iter().map(|value| value.expect("non-null value")));
+        }
+
+        assert_eq!(actual, vec![2, 3]);
+    }
+
+    #[test]
+    fn same_projection_conjunction_keeps_different_projections_split() {
+        let predicate = col("a")
+            .gt(Expr::Literal(ScalarValue::Int32(Some(1)), None))
+            .and(col("b").lt(Expr::Literal(ScalarValue::Int32(Some(50)), None)));
+        let (_file, row_filter, _builder, _file_schema) =
+            build_same_projection_test_filter(predicate);
+
+        assert_eq!(row_filter.predicates().len(), 2);
+        assert_ne!(
+            row_filter.predicates()[0].projection(),
+            row_filter.predicates()[1].projection()
+        );
+    }
+
+    #[test]
+    fn same_projection_conjunction_unsupported_conjunct_keeps_fallback() {
+        let predicate = col("a")
+            .gt(Expr::Literal(ScalarValue::Int32(Some(1)), None))
+            .and(col("a").lt(Expr::Literal(ScalarValue::Int32(Some(4)), None)))
+            .and(col("s").is_not_null());
+        let (_file, row_filter, _builder, file_schema) =
+            build_same_projection_test_filter(predicate.clone());
+        let physical_expr = logical2physical(&predicate, &file_schema);
+
+        assert!(!can_expr_be_pushed_down_with_schemas(
+            &physical_expr,
+            &file_schema
+        ));
+        assert_eq!(row_filter.predicates().len(), 2);
+        assert_eq!(
+            row_filter.predicates()[0].projection(),
+            row_filter.predicates()[1].projection()
+        );
     }
 
     #[test]

@@ -20,6 +20,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::util::{BenchmarkRun, CommonOpt, QueryResult, print_memory_stats};
+use arrow::array::{Array, RecordBatch};
+use arrow::util::display::array_value_to_string;
 use clap::Args;
 use datafusion::logical_expr::{ExplainFormat, ExplainOption};
 use datafusion::{
@@ -28,6 +30,7 @@ use datafusion::{
 };
 use datafusion_common::exec_datafusion_err;
 use datafusion_common::instant::Instant;
+use serde::Serialize;
 
 /// SQL to create the hits view with proper EventDate casting.
 ///
@@ -86,6 +89,11 @@ pub struct RunOpt {
     /// If present, write results json here
     #[arg(short = 'o', long = "output")]
     output_path: Option<PathBuf>,
+
+    /// Capture the first iteration's complete ordered result next to `--output`.
+    /// This is a correctness sidecar and is not included in the measured time.
+    #[arg(long, requires = "output_path")]
+    capture_results: bool,
 
     /// Column name that the data is sorted by (e.g., "EventTime")
     /// If specified, DataFusion will be informed that the data has this sort order
@@ -258,6 +266,11 @@ impl RunOpt {
             let elapsed = start.elapsed();
             let ms = elapsed.as_secs_f64() * 1000.0;
             millis.push(ms);
+
+            if i == 0 && self.capture_results {
+                self.write_capture(query_id, &results)?;
+            }
+
             let row_count: usize = results.iter().map(|b| b.num_rows()).sum();
             println!(
                 "Query {query_id} iteration {i} took {ms:.1} ms and returned {row_count} rows"
@@ -280,6 +293,21 @@ impl RunOpt {
         print_memory_stats(&*ctx.runtime_env().memory_pool);
 
         Ok(query_results)
+    }
+
+    fn write_capture(&self, query_id: usize, results: &[RecordBatch]) -> Result<()> {
+        let output_path = self
+            .output_path
+            .as_ref()
+            .ok_or_else(|| exec_datafusion_err!("--capture-results requires --output"))?;
+        let capture_path =
+            output_path.with_file_name(format!("capture-q{query_id}.json"));
+        write_capture(&capture_path, query_id, results)?;
+        println!(
+            "Captured Q{query_id} ordered result to {}",
+            capture_path.display()
+        );
+        Ok(())
     }
 
     /// Registers the `hits.parquet` as a table named `hits`
@@ -350,4 +378,70 @@ impl RunOpt {
     fn iterations(&self) -> usize {
         self.common.iterations
     }
+}
+
+#[derive(Serialize)]
+struct CapturedField<'a> {
+    name: &'a str,
+    data_type: String,
+    nullable: bool,
+}
+
+#[derive(Serialize)]
+struct CapturedQuery<'a> {
+    query: usize,
+    schema: Vec<CapturedField<'a>>,
+    rows: Vec<Vec<Option<String>>>,
+}
+
+fn write_capture(path: &Path, query: usize, batches: &[RecordBatch]) -> Result<()> {
+    let schema = batches
+        .first()
+        .map(RecordBatch::schema)
+        .ok_or_else(|| exec_datafusion_err!("Q{query} produced no batches to capture"))?;
+
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| CapturedField {
+            name: field.name(),
+            data_type: field.data_type().to_string(),
+            nullable: field.is_nullable(),
+        })
+        .collect();
+    let mut rows = Vec::new();
+    for batch in batches {
+        if batch.schema() != schema {
+            return Err(exec_datafusion_err!(
+                "Q{query} produced batches with inconsistent schemas"
+            ));
+        }
+        for row_index in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(batch.num_columns());
+            for column in batch.columns() {
+                let value = if column.is_null(row_index) {
+                    None
+                } else {
+                    Some(array_value_to_string(column.as_ref(), row_index)?)
+                };
+                row.push(value);
+            }
+            rows.push(row);
+        }
+    }
+
+    let capture = CapturedQuery {
+        query,
+        schema: fields,
+        rows,
+    };
+    let mut encoded = serde_json::to_vec_pretty(&capture)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    encoded.push(b'\n');
+    fs::write(path, encoded)?;
+    fs::write(
+        path.with_file_name("effective-cargo-lock.txt"),
+        include_str!("../../Cargo.lock"),
+    )?;
+    Ok(())
 }

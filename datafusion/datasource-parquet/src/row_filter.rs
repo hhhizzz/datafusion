@@ -434,13 +434,11 @@ pub fn build_row_filter(
         && candidates.windows(2).all(|pair| {
             pair[0].read_plan.projection_mask == pair[1].read_plan.projection_mask
         })
-    {
-        if let Some(candidate) =
+        && let Some(candidate) =
             FilterCandidateBuilder::new(Arc::clone(expr), Arc::clone(file_schema))
                 .build(metadata)?
-        {
-            candidates = vec![candidate];
-        }
+    {
+        candidates = vec![candidate];
     }
 
     if reorder_predicates {

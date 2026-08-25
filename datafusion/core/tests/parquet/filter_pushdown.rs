@@ -623,7 +623,11 @@ async fn run_q25_shape(
     path: &Path,
     pushdown_filters: bool,
 ) -> datafusion_common::Result<(RecordBatch, MetricsSet)> {
-    let mut config = SessionConfig::new();
+    // Keep both physical row groups in the decoder so this test exercises the
+    // streaming hand-off after a row group whose predicate output is empty.
+    // With statistics pruning enabled, the all-null/empty first row group is
+    // correctly eliminated before it reaches the Arrow reader.
+    let mut config = SessionConfig::new().with_parquet_pruning(false);
     config.options_mut().execution.parquet.pushdown_filters = pushdown_filters;
     config.options_mut().execution.parquet.reorder_filters = true;
     config.options_mut().execution.parquet.enable_page_index = false;

@@ -556,6 +556,16 @@ impl PushDecoderStreamState {
     }
 }
 
+impl Drop for PushDecoderStreamState {
+    fn drop(&mut self) {
+        // Dropping the active reader first lets streaming direct output publish
+        // its final counters even when LIMIT or an early-stopping consumer ends
+        // the scan before row-group EOF.
+        self.active_reader.take();
+        self.copy_arrow_reader_metrics();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

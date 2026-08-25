@@ -348,6 +348,7 @@ impl PushDecoderStreamState {
                         // Reader exhausted: drop and fall through to per-RG
                         // boundary handling, then try_next_reader.
                         self.active_reader = None;
+                        self.copy_arrow_reader_metrics();
                     }
                 }
             }
@@ -459,7 +460,10 @@ impl PushDecoderStreamState {
                     }
                     self.active_reader = Some(reader);
                 }
-                Ok(DecodeResult::Finished) => return None,
+                Ok(DecodeResult::Finished) => {
+                    self.copy_arrow_reader_metrics();
+                    return None;
+                }
                 Err(e) => {
                     return Some((Err(DataFusionError::from(e)), self));
                 }

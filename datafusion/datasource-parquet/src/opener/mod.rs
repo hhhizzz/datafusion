@@ -1561,6 +1561,13 @@ impl RowGroupsPrunedParquetOpen {
             prepared.file_metrics.predicate_cache_inner_records.clone();
         let predicate_cache_records =
             prepared.file_metrics.predicate_cache_records.clone();
+        let direct_output_row_groups =
+            prepared.file_metrics.direct_output_row_groups.clone();
+        let direct_output_input_rows =
+            prepared.file_metrics.direct_output_input_rows.clone();
+        let direct_output_output_rows =
+            prepared.file_metrics.direct_output_output_rows.clone();
+        let direct_output_batches = prepared.file_metrics.direct_output_batches.clone();
 
         let files_ranges_pruned_statistics =
             prepared.file_metrics.files_ranges_pruned_statistics.clone();
@@ -1614,6 +1621,10 @@ impl RowGroupsPrunedParquetOpen {
             arrow_reader_metrics,
             predicate_cache_inner_records,
             predicate_cache_records,
+            direct_output_row_groups,
+            direct_output_input_rows,
+            direct_output_output_rows,
+            direct_output_batches,
             baseline_metrics: prepared.baseline_metrics,
             row_group_pruner,
             row_groups_pruned_dynamic,

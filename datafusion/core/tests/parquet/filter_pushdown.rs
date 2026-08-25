@@ -26,7 +26,9 @@
 //! select * from data limit 10;
 //! ```
 
+use arrow::array::{ArrayRef, StringViewArray};
 use arrow::compute::concat_batches;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::collect;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
@@ -36,6 +38,7 @@ use datafusion::prelude::{
 use datafusion::test_util::parquet::{ParquetScanOptions, TestParquetFile};
 use datafusion_expr::utils::{conjunction, disjunction, split_conjunction};
 use std::path::Path;
+use std::sync::Arc;
 
 use datafusion_common::test_util::parquet_test_data;
 use datafusion_execution::config::SessionConfig;
@@ -614,6 +617,90 @@ fn get_value(metrics: &MetricsSet, metric_name: &str) -> usize {
             "Expected metric not found. Looking for '{metric_name}' in\n\n{metrics:#?}"
         ),
     }
+}
+
+async fn run_q25_shape(
+    path: &Path,
+    pushdown_filters: bool,
+) -> datafusion_common::Result<(RecordBatch, MetricsSet)> {
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.parquet.pushdown_filters = pushdown_filters;
+    config.options_mut().execution.parquet.reorder_filters = true;
+    config.options_mut().execution.parquet.enable_page_index = false;
+    config.options_mut().execution.batch_size =
+        datafusion_common::config::ConfigNonZeroUsize::try_new(3)?;
+    let ctx = SessionContext::new_with_config(config);
+    let exec = ctx
+        .read_parquet(
+            path.to_string_lossy().to_string(),
+            ParquetReadOptions::default(),
+        )
+        .await?
+        .filter(
+            col("value")
+                .not_eq(lit(""))
+                .and(col("value").not_eq(lit("__never__"))),
+        )?
+        .select(vec![col("value")])?
+        .sort(vec![col("value").sort(true, true)])?
+        .create_physical_plan()
+        .await?;
+    let batches = collect(exec.clone(), ctx.task_ctx()).await?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let metrics = TestParquetFile::parquet_metrics(&exec).expect("found parquet metrics");
+    Ok((batch, metrics))
+}
+
+#[tokio::test]
+async fn q25_shape_direct_output_end_to_end() -> datafusion_common::Result<()> {
+    let values = StringViewArray::from(vec![
+        None,
+        Some(""),
+        Some("alpha"),
+        Some("beta"),
+        Some(""),
+        None,
+        Some("gamma"),
+        Some("delta"),
+        Some(""),
+        Some("epsilon"),
+        None,
+        Some("zeta"),
+        Some("eta"),
+        Some(""),
+        Some("theta"),
+        None,
+    ]);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Utf8View,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(values) as ArrayRef])?;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(8))
+        .set_offset_index_disabled(true)
+        .set_column_index_truncate_length(None)
+        .build();
+    let tempdir = TempDir::new_in(Path::new("."))?;
+    let file = TestParquetFile::try_new(
+        tempdir.path().join("q25_shape.parquet"),
+        props,
+        [batch],
+    )?;
+
+    let (off, off_metrics) = run_q25_shape(file.path(), false).await?;
+    let (on, on_metrics) = run_q25_shape(file.path(), true).await?;
+    assert_eq!(on, off);
+    assert_eq!(on.num_rows(), 8);
+    assert_eq!(get_value(&off_metrics, "direct_output_row_groups"), 0);
+    assert!(get_value(&on_metrics, "direct_output_candidates") > 0);
+    assert_eq!(get_value(&on_metrics, "direct_output_row_groups"), 2);
+    assert_eq!(get_value(&on_metrics, "direct_output_input_rows"), 16);
+    assert_eq!(get_value(&on_metrics, "direct_output_output_rows"), 8);
+    assert!(get_value(&on_metrics, "direct_output_batches") > 0);
+    assert_eq!(get_value(&on_metrics, "predicate_cache_records"), 0);
+    Ok(())
 }
 
 #[tokio::test]

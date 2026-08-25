@@ -126,6 +126,16 @@ pub struct ParquetFileMetrics {
     /// number of rows that were stored in the cache after evaluating predicates
     /// reused for the output.
     pub predicate_cache_records: Gauge,
+    /// Row groups using predicate direct output.
+    pub direct_output_row_groups: Gauge,
+    /// Input rows evaluated by predicate direct output.
+    pub direct_output_input_rows: Gauge,
+    /// Output rows emitted by predicate direct output.
+    pub direct_output_output_rows: Gauge,
+    /// Source-batch boundaries emitted by predicate direct output.
+    pub direct_output_batches: Gauge,
+    /// Combined predicates offered as direct-output candidates.
+    pub direct_output_candidates: Count,
 }
 
 /// Tracks how much of one file — or one byte range of a file — a scan has
@@ -289,8 +299,23 @@ impl ParquetFileMetrics {
             .gauge("predicate_cache_inner_records", partition);
 
         let predicate_cache_records = builder
+            .clone()
             .with_category(MetricCategory::Rows)
             .gauge("predicate_cache_records", partition);
+
+        let direct_output_row_groups =
+            builder.clone().gauge("direct_output_row_groups", partition);
+        let direct_output_input_rows = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .gauge("direct_output_input_rows", partition);
+        let direct_output_output_rows = builder
+            .clone()
+            .with_category(MetricCategory::Rows)
+            .gauge("direct_output_output_rows", partition);
+        let direct_output_batches = builder.gauge("direct_output_batches", partition);
+        let direct_output_candidates =
+            MetricBuilder::new(metrics).counter("direct_output_candidates", partition);
 
         let row_groups_pruned_dynamic_filter = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
@@ -317,6 +342,11 @@ impl ParquetFileMetrics {
             scan_efficiency_ratio,
             predicate_cache_inner_records,
             predicate_cache_records,
+            direct_output_row_groups,
+            direct_output_input_rows,
+            direct_output_output_rows,
+            direct_output_batches,
+            direct_output_candidates,
         }
     }
 

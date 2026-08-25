@@ -92,7 +92,8 @@ impl DecoderBuilderConfig<'_> {
         let mut builder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
             .with_projection(self.projection_mask.clone())
             .with_batch_size(self.batch_size)
-            .with_metrics(self.arrow_reader_metrics.clone());
+            .with_metrics(self.arrow_reader_metrics.clone())
+            .with_streaming_direct_output(true);
         if self.force_filter_selections {
             builder = builder.with_row_selection_policy(RowSelectionPolicy::Selectors);
         }
@@ -278,6 +279,10 @@ pub(crate) struct PushDecoderStreamState {
     pub(crate) arrow_reader_metrics: ArrowReaderMetrics,
     pub(crate) predicate_cache_inner_records: Gauge,
     pub(crate) predicate_cache_records: Gauge,
+    pub(crate) direct_output_row_groups: Gauge,
+    pub(crate) direct_output_input_rows: Gauge,
+    pub(crate) direct_output_output_rows: Gauge,
+    pub(crate) direct_output_batches: Gauge,
     pub(crate) baseline_metrics: BaselineMetrics,
     /// Dynamic row-group pruner consulted at every row-group boundary.
     ///
@@ -527,6 +532,18 @@ impl PushDecoderStreamState {
         }
         if let Some(v) = self.arrow_reader_metrics.records_read_from_cache() {
             self.predicate_cache_records.set(v);
+        }
+        if let Some(v) = self.arrow_reader_metrics.direct_output_row_groups() {
+            self.direct_output_row_groups.set(v);
+        }
+        if let Some(v) = self.arrow_reader_metrics.direct_output_input_rows() {
+            self.direct_output_input_rows.set(v);
+        }
+        if let Some(v) = self.arrow_reader_metrics.direct_output_output_rows() {
+            self.direct_output_output_rows.set(v);
+        }
+        if let Some(v) = self.arrow_reader_metrics.direct_output_batches() {
+            self.direct_output_batches.set(v);
         }
     }
 

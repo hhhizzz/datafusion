@@ -505,6 +505,8 @@ fn build_row_filter_for_output_projection(
         return Ok(Some(row_filter));
     }
 
+    file_metrics.direct_output_candidates.add(1);
+
     let predicate = DatafusionArrowPredicate::try_new(
         candidate,
         file_metrics.pushdown_rows_pruned.clone(),

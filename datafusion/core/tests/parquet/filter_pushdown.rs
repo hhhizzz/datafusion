@@ -656,20 +656,20 @@ async fn q25_shape_direct_output_end_to_end() -> datafusion_common::Result<()> {
     let values = StringViewArray::from(vec![
         None,
         Some(""),
+        None,
+        Some(""),
+        None,
+        Some(""),
+        None,
+        Some(""),
         Some("alpha"),
         Some("beta"),
-        Some(""),
         None,
+        Some(""),
         Some("gamma"),
         Some("delta"),
-        Some(""),
         Some("epsilon"),
-        None,
         Some("zeta"),
-        Some("eta"),
-        Some(""),
-        Some("theta"),
-        None,
     ]);
     let schema = Arc::new(Schema::new(vec![Field::new(
         "value",
@@ -692,12 +692,12 @@ async fn q25_shape_direct_output_end_to_end() -> datafusion_common::Result<()> {
     let (off, off_metrics) = run_q25_shape(file.path(), false).await?;
     let (on, on_metrics) = run_q25_shape(file.path(), true).await?;
     assert_eq!(on, off);
-    assert_eq!(on.num_rows(), 8);
+    assert_eq!(on.num_rows(), 6);
     assert_eq!(get_value(&off_metrics, "direct_output_row_groups"), 0);
     assert!(get_value(&on_metrics, "direct_output_candidates") > 0);
     assert_eq!(get_value(&on_metrics, "direct_output_row_groups"), 2);
     assert_eq!(get_value(&on_metrics, "direct_output_input_rows"), 16);
-    assert_eq!(get_value(&on_metrics, "direct_output_output_rows"), 8);
+    assert_eq!(get_value(&on_metrics, "direct_output_output_rows"), 6);
     assert!(get_value(&on_metrics, "direct_output_batches") > 0);
     assert_eq!(get_value(&on_metrics, "predicate_cache_records"), 0);
     Ok(())
